@@ -4,7 +4,14 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, mpsc};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
+use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection as WlConnection, Dispatch, QueueHandle};
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notification_v1::{
+    self, ExtIdleNotificationV1,
+};
+use wayland_protocols::ext::idle_notify::v1::client::ext_idle_notifier_v1::{
+    self, ExtIdleNotifierV1,
+};
 use x11rb::connection::Connection as X11Connection;
 
 use crate::paths::EnvSource;
@@ -38,30 +45,82 @@ trait MutterIdleMonitor {
 }
 
 #[derive(Default)]
-struct WaylandRegistryState {
+struct WaylandIdleState {
+    seat: Option<WlSeat>,
+    notifier: Option<ExtIdleNotifierV1>,
     has_ext_idle_v2: bool,
     has_ext_idle_v1: bool,
+    idled: bool,
+    resumed: bool,
 }
 
-impl Dispatch<WlRegistry, ()> for WaylandRegistryState {
+impl Dispatch<WlRegistry, ()> for WaylandIdleState {
     fn event(
         state: &mut Self,
-        _: &WlRegistry,
+        registry: &WlRegistry,
         event: wl_registry::Event,
+        _: &(),
+        _: &WlConnection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            if interface == "wl_seat" && state.seat.is_none() {
+                state.seat = Some(registry.bind(name, 1, qh, ()));
+            } else if interface == "ext_idle_notifier_v1" {
+                if version >= 2 {
+                    state.has_ext_idle_v2 = true;
+                    state.notifier = Some(registry.bind(name, 2, qh, ()));
+                } else {
+                    state.has_ext_idle_v1 = true;
+                    state.notifier = Some(registry.bind(name, 1, qh, ()));
+                }
+            }
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for WaylandIdleState {
+    fn event(
+        _: &mut Self,
+        _: &WlSeat,
+        _: wayland_client::protocol::wl_seat::Event,
         _: &(),
         _: &WlConnection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global {
-            interface, version, ..
-        } = event
-            && interface == "ext_idle_notifier_v1"
-        {
-            if version >= 2 {
-                state.has_ext_idle_v2 = true;
-            } else {
-                state.has_ext_idle_v1 = true;
-            }
+    }
+}
+
+impl Dispatch<ExtIdleNotifierV1, ()> for WaylandIdleState {
+    fn event(
+        _: &mut Self,
+        _: &ExtIdleNotifierV1,
+        _: ext_idle_notifier_v1::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ExtIdleNotificationV1, ()> for WaylandIdleState {
+    fn event(
+        state: &mut Self,
+        _: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &WlConnection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => state.idled = true,
+            ext_idle_notification_v1::Event::Resumed => state.resumed = true,
+            _ => {}
         }
     }
 }
@@ -126,6 +185,60 @@ impl SystemIdleProbe {
         }
     }
 
+    async fn mutter_idletime(&self) -> Result<u64, IdleProbeError> {
+        let conn = self
+            .session_bus()
+            .await
+            .map_err(|e| IdleProbeError::Connection(e.to_string()))?;
+        let proxy = MutterIdleMonitorProxy::new(&conn)
+            .await
+            .map_err(|e| IdleProbeError::Connection(e.to_string()))?;
+        proxy
+            .get_idletime()
+            .await
+            .map_err(|e| IdleProbeError::Protocol(e.to_string()))
+    }
+
+    async fn spawn_mutter_active_watch(
+        &self,
+        tx: mpsc::Sender<()>,
+        start: tokio::time::Instant,
+        settle_delay: Duration,
+    ) {
+        let Ok(conn) = self.session_bus().await else {
+            return;
+        };
+        let Ok(proxy) = MutterIdleMonitorProxy::new(&conn).await else {
+            return;
+        };
+        let Ok(mut watch_id) = proxy.add_user_active_watch().await else {
+            return;
+        };
+        let Ok(mut stream) = proxy.receive_watch_fired().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            while let Some(signal) = stream.next().await {
+                if let Ok(fired_id) = signal.args()
+                    && fired_id.id == watch_id
+                {
+                    if tokio::time::Instant::now().duration_since(start) >= settle_delay {
+                        let _ = tx.send(()).await;
+                        let _ = proxy.remove_watch(watch_id).await;
+                        break;
+                    } else {
+                        tracing::debug!(
+                            "Mutter user activity fired within settle delay; re-arming one-shot watch"
+                        );
+                        if let Ok(new_id) = proxy.add_user_active_watch().await {
+                            watch_id = new_id;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Detects system desktop idle capabilities across Wayland, GNOME Mutter, and X11 in strict priority order.
     pub async fn probe_system_capabilities(
         &self,
@@ -134,19 +247,20 @@ impl SystemIdleProbe {
         let mut caps = SystemCapabilities::default();
 
         // 1. Wayland probe
-        if let Some(ref _w_display) = display_env.wayland_display
-            && let Ok(conn) = WlConnection::connect_to_env()
-        {
-            let display = conn.display();
-            let mut event_queue = conn.new_event_queue();
-            let qh = event_queue.handle();
-            let _ = display.get_registry(&qh, ());
-            let mut state = WaylandRegistryState::default();
-            if event_queue.roundtrip(&mut state).is_ok() {
-                if state.has_ext_idle_v2 {
-                    caps.wayland_ext_idle_version = Some(2);
-                } else if state.has_ext_idle_v1 {
-                    caps.wayland_ext_idle_version = Some(1);
+        if let Some(ref w_display) = display_env.wayland_display {
+            tracing::debug!("probing Wayland compositor capabilities on {w_display}");
+            if let Ok(conn) = WlConnection::connect_to_env() {
+                let display = conn.display();
+                let mut event_queue = conn.new_event_queue();
+                let qh = event_queue.handle();
+                let _ = display.get_registry(&qh, ());
+                let mut state = WaylandIdleState::default();
+                if event_queue.roundtrip(&mut state).is_ok() {
+                    if state.has_ext_idle_v2 {
+                        caps.wayland_ext_idle_version = Some(2);
+                    } else if state.has_ext_idle_v1 {
+                        caps.wayland_ext_idle_version = Some(1);
+                    }
                 }
             }
         }
@@ -197,6 +311,10 @@ impl IdleProbe for SystemIdleProbe {
         IdleBackendKind::Degraded
     }
 
+    fn resolve_backend<'a>(&'a self) -> BoxFuture<'a, IdleBackendKind> {
+        Box::pin(async move { self.resolve_backend().await })
+    }
+
     fn is_user_active_trailing<'a>(
         &'a self,
         window: Duration,
@@ -205,27 +323,36 @@ impl IdleProbe for SystemIdleProbe {
             let backend = self.resolve_backend().await;
             match backend {
                 IdleBackendKind::WaylandExtIdleV2 | IdleBackendKind::WaylandExtIdleV1 => {
-                    // Wayland pre-gate check: query via Mutter if available, or pass pre-gate
-                    if let Ok(conn) = self.session_bus().await
-                        && let Ok(proxy) = MutterIdleMonitorProxy::new(&conn).await
-                        && let Ok(idle_ms) = proxy.get_idletime().await
-                    {
+                    // Try Mutter D-Bus first if available on this compositor
+                    if let Ok(idle_ms) = self.mutter_idletime().await {
                         return Ok(idle_ms < window.as_millis() as u64);
+                    }
+                    // Native Wayland ext-idle-notify-v1 probe
+                    if let Ok(conn) = WlConnection::connect_to_env() {
+                        let display = conn.display();
+                        let mut event_queue = conn.new_event_queue();
+                        let qh = event_queue.handle();
+                        let _ = display.get_registry(&qh, ());
+                        let mut state = WaylandIdleState::default();
+                        if event_queue.roundtrip(&mut state).is_ok()
+                            && let (Some(notifier), Some(seat)) =
+                                (state.notifier.take(), state.seat.take())
+                        {
+                            let window_ms = window.as_millis() as u32;
+                            let _notif = if backend == IdleBackendKind::WaylandExtIdleV2 {
+                                notifier.get_input_idle_notification(window_ms, &seat, &qh, ())
+                            } else {
+                                notifier.get_idle_notification(window_ms, &seat, &qh, ())
+                            };
+                            let _ = event_queue.roundtrip(&mut state);
+                            // If compositor delivers Idled, user was idle for >= window
+                            return Ok(!state.idled);
+                        }
                     }
                     Ok(false)
                 }
                 IdleBackendKind::GnomeMutter => {
-                    let conn = self
-                        .session_bus()
-                        .await
-                        .map_err(|e| IdleProbeError::Connection(e.to_string()))?;
-                    let proxy = MutterIdleMonitorProxy::new(&conn)
-                        .await
-                        .map_err(|e| IdleProbeError::Connection(e.to_string()))?;
-                    let idle_ms = proxy
-                        .get_idletime()
-                        .await
-                        .map_err(|e| IdleProbeError::Protocol(e.to_string()))?;
+                    let idle_ms = self.mutter_idletime().await?;
                     Ok(idle_ms < window.as_millis() as u64)
                 }
                 IdleBackendKind::X11 => {
@@ -259,37 +386,59 @@ impl IdleProbe for SystemIdleProbe {
 
             match backend {
                 IdleBackendKind::GnomeMutter => {
-                    let conn_res = self.session_bus().await;
-                    tokio::spawn(async move {
-                        let Ok(conn) = conn_res else {
-                            return;
-                        };
-                        let Ok(proxy) = MutterIdleMonitorProxy::new(&conn).await else {
-                            return;
-                        };
-                        let Ok(watch_id) = proxy.add_user_active_watch().await else {
-                            return;
-                        };
-                        let mut stream = match proxy.receive_watch_fired().await {
-                            Ok(s) => s,
-                            Err(_) => return,
-                        };
-                        while let Some(signal) = stream.next().await {
-                            if let Ok(fired_id) = signal.args()
-                                && fired_id.id == watch_id
-                            {
-                                if tokio::time::Instant::now().duration_since(start) >= settle_delay
-                                {
-                                    let _ = tx.send(()).await;
+                    self.spawn_mutter_active_watch(tx, start, settle_delay)
+                        .await;
+                    Ok(rx)
+                }
+                IdleBackendKind::WaylandExtIdleV2 | IdleBackendKind::WaylandExtIdleV1 => {
+                    // Mutter watch on GNOME Wayland if GNOME Mutter is present
+                    if let Ok(conn) = self.session_bus().await
+                        && let Ok(proxy) = MutterIdleMonitorProxy::new(&conn).await
+                        && proxy.get_idletime().await.is_ok()
+                    {
+                        self.spawn_mutter_active_watch(tx, start, settle_delay)
+                            .await;
+                    } else {
+                        // Native Wayland ext-idle-notify-v1 notification watch (Sway/Hyprland)
+                        tokio::task::spawn_blocking(move || {
+                            let Ok(conn) = WlConnection::connect_to_env() else {
+                                return;
+                            };
+                            let display = conn.display();
+                            let mut event_queue = conn.new_event_queue();
+                            let qh = event_queue.handle();
+                            let _ = display.get_registry(&qh, ());
+                            let mut state = WaylandIdleState::default();
+                            if event_queue.roundtrip(&mut state).is_err() {
+                                return;
+                            }
+                            let (Some(notifier), Some(seat)) =
+                                (state.notifier.take(), state.seat.take())
+                            else {
+                                return;
+                            };
+                            let _notif = if backend == IdleBackendKind::WaylandExtIdleV2 {
+                                notifier.get_input_idle_notification(1000, &seat, &qh, ())
+                            } else {
+                                notifier.get_idle_notification(1000, &seat, &qh, ())
+                            };
+                            loop {
+                                if event_queue.blocking_dispatch(&mut state).is_err() {
                                     break;
-                                } else {
-                                    tracing::debug!(
-                                        "Mutter activity fired within settle delay; ignoring"
-                                    );
+                                }
+                                if state.resumed {
+                                    if tokio::time::Instant::now().duration_since(start)
+                                        >= settle_delay
+                                    {
+                                        let _ = tx.blocking_send(());
+                                        break;
+                                    } else {
+                                        state.resumed = false;
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                     Ok(rx)
                 }
                 IdleBackendKind::X11 => {
@@ -301,6 +450,71 @@ impl IdleProbe for SystemIdleProbe {
                             return;
                         };
                         let root = conn.setup().roots[screen_num].root;
+
+                        use crate::idle::jitter::{InputEvent, PointerJitterFilter};
+                        use x11rb::protocol::Event;
+                        use x11rb::protocol::xinput::{
+                            ConnectionExt as _, Device, EventMask, XIEventMask,
+                        };
+
+                        let has_xi2 = conn.xinput_xi_query_version(2, 0).is_ok();
+                        if has_xi2 {
+                            let mask = vec![
+                                XIEventMask::RAW_MOTION,
+                                XIEventMask::RAW_BUTTON_PRESS,
+                                XIEventMask::RAW_KEY_PRESS,
+                            ];
+                            let em = EventMask {
+                                deviceid: Device::ALL_MASTER.into(),
+                                mask,
+                            };
+                            if conn.xinput_xi_select_events(root, &[em]).is_ok() {
+                                let mut filter =
+                                    PointerJitterFilter::new(25.0, Duration::from_secs(2));
+                                loop {
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                    while let Ok(Some(event)) = conn.poll_for_event() {
+                                        let now_ms = tokio::time::Instant::now()
+                                            .duration_since(start)
+                                            .as_millis()
+                                            as i64;
+                                        let is_active = match event {
+                                            Event::XinputRawKeyPress(_) => {
+                                                filter.record_event(InputEvent::RawKeyPress, now_ms)
+                                            }
+                                            Event::XinputRawButtonPress(_) => filter
+                                                .record_event(InputEvent::RawButtonPress, now_ms),
+                                            Event::XinputRawMotion(m) => {
+                                                let (dx, dy) = if m.axisvalues_raw.len() >= 2 {
+                                                    (
+                                                        m.axisvalues_raw[0].integral as f64,
+                                                        m.axisvalues_raw[1].integral as f64,
+                                                    )
+                                                } else if !m.axisvalues_raw.is_empty() {
+                                                    (m.axisvalues_raw[0].integral as f64, 0.0)
+                                                } else {
+                                                    (0.0, 0.0)
+                                                };
+                                                filter.record_event(
+                                                    InputEvent::RawMotion { dx, dy },
+                                                    now_ms,
+                                                )
+                                            }
+                                            _ => false,
+                                        };
+                                        if is_active
+                                            && tokio::time::Instant::now().duration_since(start)
+                                                >= settle_delay
+                                        {
+                                            let _ = tx.send(()).await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Fallback: 500 ms MIT-SCREEN-SAVER polling if XInput2 is unavailable
                         use x11rb::protocol::screensaver::ConnectionExt as _;
                         let mut prev_idle: Option<u32> = None;
                         loop {
@@ -321,33 +535,6 @@ impl IdleProbe for SystemIdleProbe {
                             prev_idle = Some(reply.ms_since_user_input);
                         }
                     });
-                    Ok(rx)
-                }
-                IdleBackendKind::WaylandExtIdleV2 | IdleBackendKind::WaylandExtIdleV1 => {
-                    // Mutter watch on Wayland if GNOME Mutter is present
-                    if let Ok(conn) = self.session_bus().await
-                        && let Ok(proxy) = MutterIdleMonitorProxy::new(&conn).await
-                    {
-                        tokio::spawn(async move {
-                            let Ok(watch_id) = proxy.add_user_active_watch().await else {
-                                return;
-                            };
-                            let mut stream = match proxy.receive_watch_fired().await {
-                                Ok(s) => s,
-                                Err(_) => return,
-                            };
-                            while let Some(signal) = stream.next().await {
-                                if let Ok(fired_id) = signal.args()
-                                    && fired_id.id == watch_id
-                                    && tokio::time::Instant::now().duration_since(start)
-                                        >= settle_delay
-                                {
-                                    let _ = tx.send(()).await;
-                                    break;
-                                }
-                            }
-                        });
-                    }
                     Ok(rx)
                 }
                 IdleBackendKind::Degraded => Ok(rx),

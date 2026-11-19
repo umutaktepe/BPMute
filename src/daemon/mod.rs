@@ -170,6 +170,7 @@ impl DaemonHandle {
         let idle_probe = opts
             .idle_probe
             .unwrap_or_else(|| Arc::new(crate::idle::FakeIdleProbe::default()));
+        idle_probe.resolve_backend().await;
 
         let core = Arc::new(DaemonCore::new(DaemonCoreInit {
             paths: opts.paths,

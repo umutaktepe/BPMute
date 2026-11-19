@@ -37,6 +37,7 @@ use super::clock::DaemonClock;
 const CONFIG_RELOAD_ALERT_ID: &str = "config_reload_failed";
 const PERSISTENT_SHIFT_ALERT_ID: &str = "calibration_persistent_shift";
 const DEGRADED_IDLE_ALERT_ID: &str = "idle_backend_degraded";
+const INHIBITOR_SENSITIVE_ALERT_ID: &str = "idle_backend_inhibitor_sensitive";
 const MAX_HR_RING_BUFFER_LEN: usize = 1_800; // 30 min at 1 Hz
 
 fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
@@ -149,7 +150,7 @@ impl DaemonCore {
         ));
         let mut alerts = Vec::new();
         sync_shift_alert_locked(&mut alerts, &initial_calibration);
-        sync_degraded_idle_alert_locked(
+        sync_idle_alerts_locked(
             &mut alerts,
             idle_probe.backend_kind(),
             loaded_config.config.actions.power_action,
@@ -276,6 +277,7 @@ impl DaemonCore {
             socket_path: self.paths.socket_path.display().to_string(),
             log_biometrics: guard.loaded_config.log_biometrics,
             alerts: guard.alerts.clone(),
+            idle_backend: Some(self.idle_probe.backend_kind().display_name().to_string()),
         }
     }
 
@@ -424,11 +426,7 @@ impl DaemonCore {
             let guard = self.inner.lock().unwrap();
             let mut cfg = guard.loaded_config.config.actions.clone();
             let raw_sec = grace_sec.unwrap_or_else(|| cfg.effective_grace_period_sec());
-            let eff_sec = compute_effective_grace_period(
-                raw_sec,
-                self.idle_probe.backend_kind(),
-                cfg.power_action,
-            );
+            let eff_sec = raw_sec;
             cfg.grace_period_sec = Some(eff_sec);
             let params = GraceRunParams {
                 session_id: "test-trigger-session".to_string(),
@@ -662,43 +660,39 @@ impl DaemonCore {
                                     .idle_probe
                                     .watch_post_trigger_activity(Duration::from_secs(300));
 
+                                let trigger_fp = |reason: &'static str| {
+                                    let c = Arc::clone(&c_watch);
+                                    let s = s_id.clone();
+                                    let w = w_id.clone();
+                                    async move {
+                                        tracing::info!("{reason}; recording FP");
+                                        let now_ms = c.clock.now_utc().timestamp_millis();
+                                        c.set_detector_phase(
+                                            DetectorState::Monitoring,
+                                            Some(s),
+                                            Some(w),
+                                        );
+                                        c.deliver_grace_outcome(GraceOutcome {
+                                            ts_ms: now_ms,
+                                            outcome: GraceResult::PostTriggerRapidWake,
+                                        })
+                                        .await;
+                                    }
+                                };
+
                                 tokio::select! {
                                     resumed = mpris_watch => {
                                         if resumed {
-                                            tracing::info!(
-                                                "MPRIS player resumed playback within 5-min post-trigger watch; recording FP"
-                                            );
-                                            let now_ms = c_watch.clock.now_utc().timestamp_millis();
-                                            c_watch.set_detector_phase(
-                                                DetectorState::Monitoring,
-                                                Some(s_id),
-                                                Some(w_id),
-                                            );
-                                            c_watch
-                                                .deliver_grace_outcome(GraceOutcome {
-                                                    ts_ms: now_ms,
-                                                    outcome: GraceResult::PostTriggerRapidWake,
-                                                })
-                                                .await;
+                                            trigger_fp(
+                                                "MPRIS player resumed playback within 5-min post-trigger watch"
+                                            ).await;
                                         }
                                     }
                                     activity = idle_watch => {
                                         if activity {
-                                            tracing::info!(
-                                                "desktop user activity detected within 5-min post-trigger watch; recording FP"
-                                            );
-                                            let now_ms = c_watch.clock.now_utc().timestamp_millis();
-                                            c_watch.set_detector_phase(
-                                                DetectorState::Monitoring,
-                                                Some(s_id),
-                                                Some(w_id),
-                                            );
-                                            c_watch
-                                                .deliver_grace_outcome(GraceOutcome {
-                                                    ts_ms: now_ms,
-                                                    outcome: GraceResult::PostTriggerRapidWake,
-                                                })
-                                                .await;
+                                            trigger_fp(
+                                                "desktop user activity detected within 5-min post-trigger watch"
+                                            ).await;
                                         }
                                     }
                                 }
@@ -1496,12 +1490,12 @@ impl DaemonCore {
 
             let cleared_alert = clear_reload_alert(&mut guard.alerts);
             let power_action = guard.loaded_config.config.actions.power_action;
-            let degraded_idle_changed = sync_degraded_idle_alert_locked(
+            let idle_alerts_changed = sync_idle_alerts_locked(
                 &mut guard.alerts,
                 self.idle_probe.backend_kind(),
                 power_action,
             );
-            let alerts_opt = (cleared_alert || degraded_idle_changed).then(|| guard.alerts.clone());
+            let alerts_opt = (cleared_alert || idle_alerts_changed).then(|| guard.alerts.clone());
 
             let new_armed = is_armed_locked(&guard, self.clock.as_ref());
             let status_opt = (old_armed != new_armed || old_dry_run != guard.dry_run)
@@ -1601,15 +1595,17 @@ fn sync_shift_alert_locked(alerts: &mut Vec<DaemonAlert>, state: &CalibrationSta
     }
 }
 
-fn sync_degraded_idle_alert_locked(
+fn sync_idle_alerts_locked(
     alerts: &mut Vec<DaemonAlert>,
     backend: IdleBackendKind,
     power_action: PowerAction,
 ) -> bool {
-    let needs_alert = backend.is_degraded()
+    let mut changed = false;
+
+    let needs_degraded = backend.is_degraded()
         && matches!(power_action, PowerAction::Suspend | PowerAction::Poweroff);
-    if needs_alert {
-        upsert_alert(
+    if needs_degraded {
+        changed |= upsert_alert(
             alerts,
             DaemonAlert {
                 id: DEGRADED_IDLE_ALERT_ID.to_string(),
@@ -1618,12 +1614,31 @@ fn sync_degraded_idle_alert_locked(
                 message: "No desktop idle backend available. Destructive power actions run in degraded mode with a 90s Grace Period safety floor.".to_string(),
                 dismissible: false,
             },
-        )
+        );
     } else {
         let before = alerts.len();
         alerts.retain(|a| a.id != DEGRADED_IDLE_ALERT_ID);
-        alerts.len() != before
+        changed |= alerts.len() != before;
     }
+
+    if backend.is_inhibitor_sensitive() {
+        changed |= upsert_alert(
+            alerts,
+            DaemonAlert {
+                id: INHIBITOR_SENSITIVE_ALERT_ID.to_string(),
+                kind: INHIBITOR_SENSITIVE_ALERT_ID.to_string(),
+                severity: AlertSeverity::Info,
+                message: "Idle detection using Wayland ext-idle-notify-v1 v1 (inhibitor-sensitive: media playback idle inhibitors may suppress idle detection).".to_string(),
+                dismissible: false,
+            },
+        );
+    } else {
+        let before = alerts.len();
+        alerts.retain(|a| a.id != INHIBITOR_SENSITIVE_ALERT_ID);
+        changed |= alerts.len() != before;
+    }
+
+    changed
 }
 
 fn upsert_alert(alerts: &mut Vec<DaemonAlert>, next: DaemonAlert) -> bool {

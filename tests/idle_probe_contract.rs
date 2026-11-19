@@ -184,7 +184,7 @@ fn test_systemd_environment_lazy_display_discovery() {
     assert_eq!(empty_discovered.display, None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_fake_idle_probe_pre_gate_and_settle_delay() {
     use bpmute::idle::fake::FakeIdleProbe;
     use bpmute::idle::traits::{IdleBackendKind, IdleProbe};
@@ -228,7 +228,7 @@ async fn test_fake_idle_probe_pre_gate_and_settle_delay() {
     assert!(rx.try_recv().is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_system_idle_probe_degraded_fallback_headless() {
     use bpmute::idle::SystemIdleProbe;
     use bpmute::idle::traits::{IdleBackendKind, IdleProbe};

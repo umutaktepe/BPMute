@@ -166,6 +166,11 @@ pub trait IdleProbe: Send + Sync {
     /// Returns the active backend kind.
     fn backend_kind(&self) -> IdleBackendKind;
 
+    /// Eagerly resolves and caches the active idle backend kind.
+    fn resolve_backend<'a>(&'a self) -> BoxFuture<'a, IdleBackendKind> {
+        Box::pin(async move { self.backend_kind() })
+    }
+
     /// Checks whether user activity occurred in the trailing `window` (e.g. 2 minutes = 120s).
     /// Used by the pre-trigger gate to suppress entering Grace Period.
     fn is_user_active_trailing<'a>(

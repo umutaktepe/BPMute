@@ -286,6 +286,10 @@ async fn test_virtual_time_degraded_fallback_grace_floor_alert_and_strict_refusa
 
     // 1. Status alerts must contain degraded idle backend warning for destructive power actions
     let status = daemon.core().status();
+    assert_eq!(
+        status.idle_backend.as_deref(),
+        Some("Degraded (no idle backend available)")
+    );
     assert!(
         status
             .alerts
@@ -346,6 +350,34 @@ async fn test_virtual_time_degraded_fallback_grace_floor_alert_and_strict_refusa
             .events()
             .contains(&"power_action:suspend".to_string()),
         "destructive power action must be refused when strict_idle_backend is true on degraded backend"
+    );
+
+    // 4. Test that start_test_trigger honors explicit testing grace (e.g. 10s) without forcing 90s floor
+    let test_grace = daemon.core().start_test_trigger(Some(10)).await.unwrap();
+    assert_eq!(
+        test_grace, 10,
+        "start_test_trigger must honor explicit test grace"
+    );
+    daemon.core().cancel_grace().await.unwrap();
+
+    // 5. Test inhibitor-sensitive alert when switching to WaylandExtIdleV1
+    idle_probe.set_backend_kind(IdleBackendKind::WaylandExtIdleV1);
+    daemon
+        .core()
+        .handle_op("config.reload", serde_json::Value::Null, 2)
+        .await
+        .unwrap();
+    let status_v1 = daemon.core().status();
+    assert_eq!(
+        status_v1.idle_backend.as_deref(),
+        Some("Wayland (ext-idle-notify-v1 v1, inhibitor-sensitive)")
+    );
+    assert!(
+        status_v1
+            .alerts
+            .iter()
+            .any(|a| a.id == "idle_backend_inhibitor_sensitive"),
+        "status alerts must include idle_backend_inhibitor_sensitive alert for v1"
     );
 
     daemon.shutdown().await;

@@ -67,18 +67,18 @@ async fn spawn_test_daemon(
 
     let clock = Arc::new(VirtualClock::starting_at(start_utc));
 
-    let handle = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: cli,
-        clock: Arc::clone(&clock) as Arc<dyn bpmute::daemon::DaemonClock>,
-        wearable_source: Some(source),
-        install_signals: false,
-        action_executor: Some(executor as Arc<dyn bpmute::actions::traits::ActionExecutor>),
-        notifier: Some(notifier as Arc<dyn bpmute::actions::traits::Notifier>),
-        idle_probe: None,
-    })
+    let handle = DaemonHandle::spawn(
+        DaemonOptions::for_testing(
+            paths.clone(),
+            loaded,
+            Arc::new(env),
+            Arc::clone(&clock) as Arc<dyn bpmute::daemon::DaemonClock>,
+        )
+        .with_cli_overrides(cli)
+        .with_wearable_source(source)
+        .with_action_executor(executor as Arc<dyn bpmute::actions::traits::ActionExecutor>)
+        .with_notifier(notifier as Arc<dyn bpmute::actions::traits::Notifier>),
+    )
     .await
     .expect("daemon should start");
 
@@ -477,18 +477,12 @@ grace_period_sec = 10
     .unwrap();
 
     let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: CliOverrides::default(),
-        clock: clock.clone(),
-        wearable_source: Some(Arc::new(source)),
-        install_signals: false,
-        action_executor: Some(executor),
-        notifier: Some(notifier),
-        idle_probe: None,
-    })
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock.clone())
+            .with_wearable_source(Arc::new(source))
+            .with_action_executor(executor)
+            .with_notifier(notifier),
+    )
     .await
     .unwrap();
 

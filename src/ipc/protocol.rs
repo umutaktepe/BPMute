@@ -278,6 +278,8 @@ pub struct DaemonStatus {
     pub socket_path: String,
     pub log_biometrics: bool,
     pub alerts: Vec<DaemonAlert>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_backend: Option<String>,
 }
 
 /// Offline `bpmute status --json` payload (ADR-0002, ADR-0009).
