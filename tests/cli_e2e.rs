@@ -114,6 +114,7 @@ async fn virtual_time_cli_pause_resume_and_config_reload_e2e() {
         env: Arc::new(env.clone()),
         cli_overrides: CliOverrides::default(),
         clock,
+        wearable_source: None,
         install_signals: false,
     })
     .await

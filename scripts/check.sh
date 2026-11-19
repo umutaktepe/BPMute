@@ -14,10 +14,11 @@ if cargo tree -e normal --prefix none | grep -Eq '^(rand|rand_chacha|rand_core) 
   exit 1
 fi
 
-if find src/sleep_engine -name '*.rs' -print0 | xargs -0 awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }'; then
-  echo "error: forbidden async, wall-clock, I/O, or RNG usage inside pure-sync src/sleep_engine (ADR-0007)" >&2
+if find src/sleep_engine src/calibration -name '*.rs' -print0 | xargs -0 awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rusqlite|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }'; then
+  echo "error: forbidden async, wall-clock, I/O, SQLite, or RNG usage inside pure-sync core (ADR-0007)" >&2
   exit 1
 fi
 
 timeout 60 cargo test
 timeout 5 cargo test --test sleep_engine
+timeout 5 cargo test --test calibration_ledger

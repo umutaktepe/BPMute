@@ -3,19 +3,26 @@ use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
-use serde_json::json;
+use chrono::Utc;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
 
-use crate::config::{CliOverrides, LoadedConfig, Sensitivity, init_config_file};
+use crate::calibration::{CalibrationState, validate_sleep_hr_bpm};
+use crate::config::{CliOverrides, LoadedConfig, PatchField, Sensitivity, init_config_file};
 use crate::daemon::{DaemonError, DaemonHandle, DaemonOptions, SystemClock};
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::ConfigSnapshotPayload;
 use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus};
-use crate::logging::init_logging;
+use crate::logging::{format_wearable_label, init_logging};
 use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
-use crate::replay::{ReplayOptions, replay_file};
+use crate::replay::{ReplayFidelity, ReplayOptions, replay_file, replay_stored_session};
 use crate::sleep_engine::{CalibrationPriors, WearableFloor};
+use crate::storage::{
+    AcceptShiftResult, LedgerStore, SessionFullDetail, SessionListPage, SetFeedbackRequest,
+    StorageError, db_exists, db_path_in_data_dir, lock_path_in_data_dir,
+};
 
-use super::args::{Cli, Command, ConfigCommand};
+use super::args::{CalibrationCommand, Cli, Command, ConfigCommand, SessionsCommand};
 use super::duration::{PauseTarget, parse_pause_target};
 
 /// Executes a parsed CLI command using injected environment and output streams.
@@ -50,12 +57,14 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
         Command::Resume => run_resume(&paths, stdout, stderr).await,
         Command::Replay {
             file,
+            session,
             preset,
             cold_start,
             json,
         } => run_replay(
             ReplayCliArgs {
-                file: &file,
+                file: file.as_deref(),
+                session: session.as_deref(),
                 preset,
                 cold_start,
                 as_json: json,
@@ -66,6 +75,8 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
             stdout,
             stderr,
         ),
+        Command::Sessions { action } => run_sessions(action, &paths, stdout, stderr).await,
+        Command::Calibration { action } => run_calibration(action, &paths, stdout, stderr).await,
         Command::Config { action } => {
             run_config(action, &paths, env, &cli_overrides, stdout, stderr).await
         }
@@ -108,6 +119,7 @@ async fn run_daemon<WErr: Write>(
         env: env_arc,
         cli_overrides,
         clock: Arc::new(SystemClock),
+        wearable_source: None,
         install_signals: true,
     })
     .await
@@ -117,6 +129,7 @@ async fn run_daemon<WErr: Write>(
             tracing::error!(error = %err, "failed to start bpmute daemon");
             let _ = writeln!(stderr, "error: {err}");
             return match err {
+                DaemonError::Storage(ref s) => s.exit_code(),
                 DaemonError::Io(ref io_err) if io_err.kind() == io::ErrorKind::PermissionDenied => {
                     ExitCode::PermissionOrBackendRefusal
                 }
@@ -236,7 +249,8 @@ async fn run_resume<WOut: Write, WErr: Write>(
 }
 
 struct ReplayCliArgs<'a> {
-    file: &'a Path,
+    file: Option<&'a Path>,
+    session: Option<&'a str>,
     preset: Option<Sensitivity>,
     cold_start: bool,
     as_json: bool,
@@ -258,15 +272,32 @@ fn run_replay<WOut: Write, WErr: Write>(
         }
     };
 
-    let options = ReplayOptions {
-        preset: args.preset,
-        cold_start: args.cold_start,
-        grace_period_sec: loaded.config.actions.effective_grace_period_sec(),
-        priors: CalibrationPriors::cold_start(),
-        wearable_floor: WearableFloor::default(),
+    let grace_sec = loaded.config.actions.effective_grace_period_sec();
+    let report = if let Some(session_id) = args.session {
+        let db_path = db_path_in_data_dir(&args.paths.data_dir);
+        replay_stored_session(
+            &db_path,
+            session_id,
+            loaded.config.detection,
+            args.preset,
+            args.cold_start,
+            grace_sec,
+        )
+    } else if let Some(file) = args.file {
+        let options = ReplayOptions {
+            preset: args.preset,
+            cold_start: args.cold_start,
+            grace_period_sec: grace_sec,
+            priors: CalibrationPriors::cold_start(),
+            wearable_floor: WearableFloor::default(),
+        };
+        replay_file(file, loaded.config.detection, options)
+    } else {
+        let _ = writeln!(stderr, "error: either <FILE> or --session <ID> is required");
+        return ExitCode::UsageOrConfigError;
     };
 
-    let report = match replay_file(args.file, loaded.config.detection, options) {
+    let report = match report {
         Ok(report) => report,
         Err(err) => {
             let _ = writeln!(stderr, "error: {err}");
@@ -283,10 +314,16 @@ fn run_replay<WOut: Write, WErr: Write>(
         return ExitCode::Success;
     }
 
+    let fidelity_desc = match report.fidelity {
+        ReplayFidelity::RawSamples => "raw_samples (full 4-stage filter + HMM pipeline)",
+        ReplayFidelity::SessionEpochs => {
+            "session_epochs (fallback: raw_samples unavailable; post-filter HMM + state machine)"
+        }
+    };
     let _ = writeln!(
         stdout,
         "Replay fidelity: {} (read-only) | format: {} | preset: {} | cold_start: {}",
-        report.fidelity.as_str(),
+        fidelity_desc,
         report.format.as_str(),
         report.preset,
         report.cold_start
@@ -320,6 +357,544 @@ fn run_replay<WOut: Write, WErr: Write>(
     }
 
     ExitCode::Success
+}
+
+enum OnlineOrOffline {
+    Online(IpcClient),
+    Offline,
+}
+
+async fn connect_online_or_offline<WErr: Write>(
+    paths: &ResolvedPaths,
+    stderr: &mut WErr,
+) -> Result<OnlineOrOffline, ExitCode> {
+    match IpcClient::connect(&paths.socket_path).await {
+        Ok(client) => Ok(OnlineOrOffline::Online(client)),
+        Err(IpcClientError::DaemonOffline { .. }) => Ok(OnlineOrOffline::Offline),
+        Err(IpcClientError::PermissionDenied { .. }) => {
+            let _ = writeln!(
+                stderr,
+                "error: permission denied accessing daemon socket {}",
+                paths.socket_path.display()
+            );
+            Err(ExitCode::PermissionOrBackendRefusal)
+        }
+        Err(err) => {
+            let _ = writeln!(stderr, "error: {err}");
+            Err(ExitCode::RuntimeError)
+        }
+    }
+}
+
+fn report_storage_error<WErr: Write>(err: StorageError, stderr: &mut WErr) -> ExitCode {
+    let _ = writeln!(stderr, "error: {err}");
+    err.exit_code()
+}
+
+async fn ipc_request_typed<T: DeserializeOwned, WErr: Write>(
+    client: &mut IpcClient,
+    op: &str,
+    params: Value,
+    stderr: &mut WErr,
+) -> Result<T, ExitCode> {
+    match client.request(op, params).await {
+        Ok(val) => serde_json::from_value(val).map_err(|err| {
+            let _ = writeln!(stderr, "error: invalid IPC response: {err}");
+            ExitCode::RuntimeError
+        }),
+        Err(err) => Err(report_ipc_error(err, stderr)),
+    }
+}
+
+fn open_existing_store_rw<WErr: Write>(
+    db_path: &Path,
+    lock_path: &Path,
+    missing_exit: ExitCode,
+    missing_msg: &str,
+    stderr: &mut WErr,
+) -> Result<LedgerStore, ExitCode> {
+    match db_exists(db_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = writeln!(stderr, "{missing_msg}");
+            return Err(missing_exit);
+        }
+        Err(err) => return Err(report_storage_error(err, stderr)),
+    }
+    LedgerStore::open_read_write(db_path, lock_path)
+        .map_err(|err| report_storage_error(err, stderr))
+}
+
+fn write_json_line<WOut: Write, WErr: Write>(
+    value: &impl serde::Serialize,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> ExitCode {
+    if let Err(err) = serde_json::to_writer(&mut *stdout, value) {
+        let _ = writeln!(stderr, "error: failed to serialize JSON output: {err}");
+        return ExitCode::RuntimeError;
+    }
+    let _ = writeln!(stdout);
+    ExitCode::Success
+}
+
+async fn run_sessions<WOut: Write, WErr: Write>(
+    action: SessionsCommand,
+    paths: &ResolvedPaths,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> ExitCode {
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    match action {
+        SessionsCommand::List { limit, json } => {
+            if limit == 0 {
+                let _ = writeln!(stderr, "error: --limit must be >= 1");
+                return ExitCode::UsageOrConfigError;
+            }
+            let page: SessionListPage = match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match ipc_request_typed(
+                        &mut client,
+                        "session.list",
+                        json!({ "limit": limit, "offset": 0 }),
+                        stderr,
+                    )
+                    .await
+                    {
+                        Ok(page) => page,
+                        Err(code) => return code,
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => match LedgerStore::open_read_only(&db_path) {
+                    Ok(Some(store)) => match store.list_sessions(limit, 0) {
+                        Ok(page) => page,
+                        Err(err) => return report_storage_error(err, stderr),
+                    },
+                    Ok(None) => SessionListPage {
+                        sessions: Vec::new(),
+                        total_count: 0,
+                        limit,
+                        offset: 0,
+                    },
+                    Err(err) => return report_storage_error(err, stderr),
+                },
+                Err(code) => return code,
+            };
+
+            if json {
+                return write_json_line(&page, stdout, stderr);
+            }
+            let _ = writeln!(
+                stdout,
+                "Monitoring Sessions ({} shown of {} total):",
+                page.sessions.len(),
+                page.total_count
+            );
+            for s in &page.sessions {
+                let wearable_label = format_wearable_label(
+                    s.wearable_alias.as_deref(),
+                    &s.wearable_mac_masked,
+                    false,
+                );
+                let end_str = s
+                    .end_reason
+                    .map(|r| r.as_str())
+                    .unwrap_or(s.status.as_str());
+                let fb_tag = s
+                    .feedback
+                    .as_ref()
+                    .and_then(|f| f.verdict)
+                    .map(|v| format!(" verdict={v}"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    stdout,
+                    "  {} | {} | {}..{} ms | {} | epochs={} | wake={:?} | sleep={:?}{}",
+                    s.id,
+                    wearable_label,
+                    s.start_ts_ms,
+                    s.end_ts_ms,
+                    end_str,
+                    s.epochs_count,
+                    s.warmup_mu_hr,
+                    s.sleep_mu_hr,
+                    fb_tag
+                );
+            }
+            ExitCode::Success
+        }
+        SessionsCommand::Show { id, json } => {
+            if id.trim().is_empty() {
+                let _ = writeln!(stderr, "error: session ID must not be empty");
+                return ExitCode::UsageOrConfigError;
+            }
+            let detail: SessionFullDetail = match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match ipc_request_typed(&mut client, "session.get", json!({ "id": id }), stderr)
+                        .await
+                    {
+                        Ok(detail) => detail,
+                        Err(code) => return code,
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => match LedgerStore::open_read_only(&db_path) {
+                    Ok(Some(store)) => match store.get_session(&id) {
+                        Ok(detail) => detail,
+                        Err(err) => return report_storage_error(err, stderr),
+                    },
+                    Ok(None) => {
+                        let _ = writeln!(
+                            stderr,
+                            "error: session '{id}' not found (no ledger database)"
+                        );
+                        return ExitCode::RuntimeError;
+                    }
+                    Err(err) => return report_storage_error(err, stderr),
+                },
+                Err(code) => return code,
+            };
+
+            if json {
+                return write_json_line(&detail, stdout, stderr);
+            }
+            let wearable_label = format_wearable_label(
+                detail.wearable.alias.as_deref(),
+                &detail.wearable.mac_masked,
+                false,
+            );
+            let _ = writeln!(stdout, "Session {} ({})", detail.session.id, detail.status);
+            let _ = writeln!(stdout, "  Wearable: {wearable_label}");
+            let _ = writeln!(
+                stdout,
+                "  Window: {}..{} ms ({})",
+                detail.session.start_ts_ms,
+                detail.session.end_ts_ms,
+                detail.session.end_reason.as_str()
+            );
+            let _ = writeln!(
+                stdout,
+                "  Metrics: warmup_mu={:?}, sleep_mu={:?}, delta_hr={:?}, post_trigger_sleep_sec={}, anomalous={}",
+                detail.session.warmup_mu_hr,
+                detail.session.sleep_mu_hr,
+                detail.session.delta_hr_onset,
+                detail.session.post_trigger_sleep_sec,
+                detail.session.auto_anomalous
+            );
+            let _ = writeln!(
+                stdout,
+                "  Data: epochs={}, raw_samples={} (retained={})",
+                detail.epochs.len(),
+                detail.session.raw_samples_count,
+                detail.has_raw_samples
+            );
+            if let Some(ref fb) = detail.feedback {
+                let _ = writeln!(
+                    stdout,
+                    "  Feedback: verdict={:?}, manual_onset_ts_ms={:?}, manual_avg_sleep_hr={:?}",
+                    fb.verdict, fb.manual_onset_ts_ms, fb.manual_avg_sleep_hr
+                );
+            }
+            ExitCode::Success
+        }
+        SessionsCommand::Feedback {
+            id,
+            verdict,
+            onset,
+            avg_sleep_hr,
+            clear,
+        } => {
+            if id.trim().is_empty() {
+                let _ = writeln!(stderr, "error: session ID must not be empty");
+                return ExitCode::UsageOrConfigError;
+            }
+            if !clear && verdict.is_none() && onset.is_none() && avg_sleep_hr.is_none() {
+                let _ = writeln!(
+                    stderr,
+                    "error: specify at least one of --verdict, --onset, --avg-sleep-hr, or --clear"
+                );
+                return ExitCode::UsageOrConfigError;
+            }
+            if let Some(hr) = avg_sleep_hr
+                && let Err(msg) = validate_sleep_hr_bpm("--avg-sleep-hr", hr)
+            {
+                let _ = writeln!(stderr, "error: {msg}");
+                return ExitCode::UsageOrConfigError;
+            }
+
+            match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    let mut map = Map::new();
+                    map.insert("session_id".to_string(), Value::String(id.clone()));
+                    if clear {
+                        map.insert("clear".to_string(), Value::Bool(true));
+                    } else {
+                        if let Some(v) = verdict {
+                            map.insert("verdict".to_string(), json!(v));
+                        }
+                        if let Some(t) = onset {
+                            map.insert("onset_hhmm".to_string(), json!(t));
+                        }
+                        if let Some(hr) = avg_sleep_hr {
+                            map.insert("avg_sleep_hr".to_string(), json!(hr));
+                        }
+                    }
+                    match client
+                        .request("session.set_feedback", Value::Object(map))
+                        .await
+                    {
+                        Ok(val) => {
+                            let sid = val["session"]["id"].as_str().unwrap_or(&id);
+                            let _ = writeln!(
+                                stdout,
+                                "Updated feedback for session {sid} and recomputed calibration."
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_ipc_error(err, stderr),
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => {
+                    let mut store = match open_existing_store_rw(
+                        &db_path,
+                        &lock_path,
+                        ExitCode::RuntimeError,
+                        &format!("error: session '{id}' not found (no ledger database)"),
+                        stderr,
+                    ) {
+                        Ok(s) => s,
+                        Err(code) => return code,
+                    };
+                    let req = SetFeedbackRequest {
+                        session_id_or_prefix: id,
+                        verdict: verdict.map_or(PatchField::Unchanged, PatchField::Set),
+                        onset_hhmm: onset.map_or(PatchField::Unchanged, PatchField::Set),
+                        avg_sleep_hr: avg_sleep_hr.map_or(PatchField::Unchanged, PatchField::Set),
+                        clear_all: clear,
+                    };
+                    let now_ms = Utc::now().timestamp_millis();
+                    match store.set_feedback_and_recompute(&req, now_ms) {
+                        Ok((detail, _)) => {
+                            let _ = writeln!(
+                                stdout,
+                                "Updated feedback for session {} and recomputed calibration.",
+                                detail.session.id
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_storage_error(err, stderr),
+                    }
+                }
+                Err(code) => code,
+            }
+        }
+    }
+}
+
+async fn run_calibration<WOut: Write, WErr: Write>(
+    action: CalibrationCommand,
+    paths: &ResolvedPaths,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> ExitCode {
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    match action {
+        CalibrationCommand::Status { json } => {
+            let state: CalibrationState = match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match ipc_request_typed(&mut client, "calibration.status", json!({}), stderr)
+                        .await
+                    {
+                        Ok(st) => st,
+                        Err(code) => return code,
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => match LedgerStore::open_read_only(&db_path) {
+                    Ok(Some(store)) => match store.get_calibration_state() {
+                        Ok(st) => st,
+                        Err(err) => return report_storage_error(err, stderr),
+                    },
+                    Ok(None) => CalibrationState::default(),
+                    Err(err) => return report_storage_error(err, stderr),
+                },
+                Err(code) => return code,
+            };
+
+            if json {
+                return write_json_line(&state, stdout, stderr);
+            }
+            let _ = writeln!(
+                stdout,
+                "Calibration Maturity: {:?} (valid={}, quarantined={})",
+                state.maturity, state.valid_sessions, state.quarantined_sessions
+            );
+            let _ = writeln!(
+                stdout,
+                "  mu_wake={:?}, sigma_wake={:?}, mu_sleep={:?}, delta_hr_onset={:?}, tau_offset={:.4}, dwell_adjust={}s",
+                state.mu_wake,
+                state.sigma_wake,
+                state.mu_sleep,
+                state.delta_hr_onset,
+                state.tau_p_sleep_offset,
+                state.dwell_adjust_sec
+            );
+            if let Some(seed) = state.day1_seed_sleep_hr {
+                let _ = writeln!(stdout, "  day1_seed_sleep_hr={seed:.1} bpm");
+            }
+            if let Some(ref alert) = state.pending_shift_alert {
+                let _ = writeln!(
+                    stdout,
+                    "  ALERT: persistent {} shift across {} consecutive sessions (run `bpmute calibration accept-shift` or `dismiss-shift`)",
+                    alert.direction, alert.session_count
+                );
+            }
+            for w in state.wearables.values() {
+                let _ = writeln!(
+                    stdout,
+                    "  Wearable {}: hr_var_floor={:.3}, supports_rr={}, typical_sqi={:?}, sessions={}",
+                    w.wearable_id, w.hr_var_floor, w.supports_rr, w.typical_sqi, w.sessions_count
+                );
+            }
+            ExitCode::Success
+        }
+        CalibrationCommand::Seed { bpm, clear } => {
+            if let Some(hr) = bpm
+                && let Err(msg) = validate_sleep_hr_bpm("Day-1 sleeping HR seed", hr)
+            {
+                let _ = writeln!(stderr, "error: {msg}");
+                return ExitCode::UsageOrConfigError;
+            }
+            let target_seed = if clear { None } else { bpm };
+
+            match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match client
+                        .request("calibration.set_seed", json!({ "sleep_hr": target_seed }))
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Some(hr) = target_seed {
+                                let _ =
+                                    writeln!(stdout, "Set Day-1 sleeping-HR seed to {hr:.1} bpm.");
+                            } else {
+                                let _ = writeln!(stdout, "Cleared Day-1 sleeping-HR seed.");
+                            }
+                            ExitCode::Success
+                        }
+                        Err(err) => report_ipc_error(err, stderr),
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => {
+                    match db_exists(&db_path) {
+                        Ok(false) if target_seed.is_none() => {
+                            let _ = writeln!(stdout, "Cleared Day-1 sleeping-HR seed.");
+                            return ExitCode::Success;
+                        }
+                        Ok(_) => {}
+                        Err(err) => return report_storage_error(err, stderr),
+                    }
+                    let mut store = match LedgerStore::open_read_write(&db_path, &lock_path) {
+                        Ok(s) => s,
+                        Err(err) => return report_storage_error(err, stderr),
+                    };
+                    let now_ms = Utc::now().timestamp_millis();
+                    match store.set_day1_seed_and_recompute(target_seed, now_ms) {
+                        Ok(_) => {
+                            if let Some(hr) = target_seed {
+                                let _ =
+                                    writeln!(stdout, "Set Day-1 sleeping-HR seed to {hr:.1} bpm.");
+                            } else {
+                                let _ = writeln!(stdout, "Cleared Day-1 sleeping-HR seed.");
+                            }
+                            ExitCode::Success
+                        }
+                        Err(err) => report_storage_error(err, stderr),
+                    }
+                }
+                Err(code) => code,
+            }
+        }
+        CalibrationCommand::AcceptShift => match connect_online_or_offline(paths, stderr).await {
+            Ok(OnlineOrOffline::Online(mut client)) => {
+                match client.request("calibration.accept_shift", json!({})).await {
+                    Ok(val) => match serde_json::from_value::<AcceptShiftResult>(val) {
+                        Ok(res) => {
+                            let _ = writeln!(
+                                stdout,
+                                "Accepted persistent shift; created Calibration Boundary {} (effective_ts_ms={}).",
+                                res.boundary.id, res.boundary.effective_ts_ms
+                            );
+                            ExitCode::Success
+                        }
+                        Err(_) => {
+                            let _ = writeln!(stdout, "Accepted persistent shift.");
+                            ExitCode::Success
+                        }
+                    },
+                    Err(err) => report_ipc_error(err, stderr),
+                }
+            }
+            Ok(OnlineOrOffline::Offline) => {
+                let mut store = match open_existing_store_rw(
+                    &db_path,
+                    &lock_path,
+                    ExitCode::PreconditionConflict,
+                    "error: precondition conflict: no pending 5-session persistent-shift alert to accept",
+                    stderr,
+                ) {
+                    Ok(s) => s,
+                    Err(code) => return code,
+                };
+                let now_ms = Utc::now().timestamp_millis();
+                match store.accept_shift_and_recompute(now_ms) {
+                    Ok(res) => {
+                        let _ = writeln!(
+                            stdout,
+                            "Accepted persistent shift; created Calibration Boundary {} (effective_ts_ms={}).",
+                            res.boundary.id, res.boundary.effective_ts_ms
+                        );
+                        ExitCode::Success
+                    }
+                    Err(err) => report_storage_error(err, stderr),
+                }
+            }
+            Err(code) => code,
+        },
+        CalibrationCommand::DismissShift => match connect_online_or_offline(paths, stderr).await {
+            Ok(OnlineOrOffline::Online(mut client)) => {
+                match client.request("calibration.dismiss_shift", json!({})).await {
+                    Ok(_) => {
+                        let _ = writeln!(stdout, "Dismissed persistent-shift prompt.");
+                        ExitCode::Success
+                    }
+                    Err(err) => report_ipc_error(err, stderr),
+                }
+            }
+            Ok(OnlineOrOffline::Offline) => {
+                let mut store = match open_existing_store_rw(
+                    &db_path,
+                    &lock_path,
+                    ExitCode::PreconditionConflict,
+                    "error: precondition conflict: no pending 5-session persistent-shift alert to dismiss",
+                    stderr,
+                ) {
+                    Ok(s) => s,
+                    Err(code) => return code,
+                };
+                let now_ms = Utc::now().timestamp_millis();
+                match store.dismiss_shift_and_recompute(now_ms) {
+                    Ok(_) => {
+                        let _ = writeln!(stdout, "Dismissed persistent-shift prompt.");
+                        ExitCode::Success
+                    }
+                    Err(err) => report_storage_error(err, stderr),
+                }
+            }
+            Err(code) => code,
+        },
+    }
 }
 
 async fn run_config<WOut: Write, WErr: Write>(

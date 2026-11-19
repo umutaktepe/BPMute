@@ -37,6 +37,7 @@ async fn start_virtual_daemon(
         env: std::sync::Arc::new(env),
         cli_overrides: cli,
         clock,
+        wearable_source: None,
         install_signals: false,
     })
     .await
@@ -77,6 +78,7 @@ async fn daemon_socket_permissions_ping_status_and_framing_guards() {
         env: std::sync::Arc::new(MapEnv::new()),
         cli_overrides: CliOverrides::default(),
         clock: std::sync::Arc::new(VirtualClock::starting_at(start_utc)),
+        wearable_source: None,
         install_signals: false,
     })
     .await;

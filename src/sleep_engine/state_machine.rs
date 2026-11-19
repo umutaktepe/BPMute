@@ -1,14 +1,15 @@
 //! Deterministic outer sleep-onset state machine and `Monitoring Session` lifecycle.
 
+use crate::config::DetectionConfig;
 use crate::sleep_engine::baseline::QuietWakeBaseline;
 use crate::sleep_engine::hmm::{HmmFilter, STATE_ACTIVE_WAKE, STATE_QUIET_WAKE, STATE_SLEEP_NREM};
 use crate::sleep_engine::ppg::{
-    MIN_EPOCH_COVERAGE, PpgPipeline, RawEpochMetrics, SIGMA_MIN_BPM, normalize_features,
+    MIN_EPOCH_COVERAGE, PpgPipeline, RawEpochMetrics, SIGMA_MIN_BPM, normalize_features, quantile,
 };
 use crate::sleep_engine::types::{
-    CalibrationMaturity, DetectorState, EngineConfig, EngineEvent, EngineOutput, Epoch,
-    EpochFeatures, GapTier, GraceAbortReason, GraceResult, HrPacket, PresetParams,
-    SessionEndReason, SessionSummary, StreamStatus,
+    CalibrationMaturity, CalibrationPriors, DetectorState, EngineConfig, EngineEvent, EngineOutput,
+    Epoch, EpochFeatures, GapTier, GraceAbortReason, GraceResult, HrPacket, PresetParams,
+    SessionEndReason, SessionSummary, StreamStatus, WearableFloor,
 };
 
 const WARMUP_EPOCHS_COLD_OR_LEARNING: u32 = 32; // 8 min
@@ -46,12 +47,25 @@ pub struct SleepEngine {
     confirmed_ts_ms: Option<i64>,
     sleeping_ts_ms: Option<i64>,
     warmup_mu_hr: Option<f64>,
+    warmup_sigma_hr: Option<f64>,
+    warmup_ln_rmssd: Option<f64>,
+    onset_hr_bpm: Option<f64>,
     epochs_count: usize,
     warmup_clean_epochs: u32,
     stabilization_remaining_epochs: u32,
     anomalous: bool,
     fp_recorded_this_session: bool,
     fp_count: u8,
+    grace_cancel_count: u8,
+    rapid_wake_fp_count: u8,
+    snooze_count: u8,
+    had_rr: bool,
+    post_trigger_sleep_sec: u32,
+    sleep_hr_samples: Vec<f64>,
+    sleep_ln_rmssd_samples: Vec<f64>,
+    sleep_var_ratio_samples: Vec<f64>,
+    sqi_sum: f64,
+    sqi_count: usize,
 
     suppress_candidate_until_ms: Option<i64>,
     gap_started_ms: Option<i64>,
@@ -92,12 +106,25 @@ impl SleepEngine {
             confirmed_ts_ms: None,
             sleeping_ts_ms: None,
             warmup_mu_hr: None,
+            warmup_sigma_hr: None,
+            warmup_ln_rmssd: None,
+            onset_hr_bpm: None,
             epochs_count: 0,
             warmup_clean_epochs: 0,
             stabilization_remaining_epochs: 0,
             anomalous: false,
             fp_recorded_this_session: false,
             fp_count: 0,
+            grace_cancel_count: 0,
+            rapid_wake_fp_count: 0,
+            snooze_count: 0,
+            had_rr: false,
+            post_trigger_sleep_sec: 0,
+            sleep_hr_samples: Vec::new(),
+            sleep_ln_rmssd_samples: Vec::new(),
+            sleep_var_ratio_samples: Vec::new(),
+            sqi_sum: 0.0,
+            sqi_count: 0,
             suppress_candidate_until_ms: None,
             gap_started_ms: None,
             last_any_packet_ts_ms: None,
@@ -118,6 +145,32 @@ impl SleepEngine {
             baseline: QuietWakeBaseline::new(),
             hmm: HmmFilter::new(),
         }
+    }
+
+    /// Updates detection preset/advanced config live while preserving active session state.
+    pub fn update_detection_config(&mut self, detection: DetectionConfig) {
+        self.config.detection = detection;
+        self.preset = PresetParams::resolve(&self.config.detection, &self.config.priors);
+    }
+
+    /// Updates personal calibration priors and per-Wearable variance floor live.
+    pub fn update_calibration(&mut self, priors: CalibrationPriors, wearable_floor: WearableFloor) {
+        self.config.priors = priors;
+        self.config.wearable_floor = wearable_floor;
+        self.preset = PresetParams::resolve(&self.config.detection, &self.config.priors);
+    }
+
+    /// Force-closes any active `Monitoring Session` (for daemon shutdown or Wearable switches).
+    pub fn force_close_session(
+        &mut self,
+        ts_ms: i64,
+        reason: SessionEndReason,
+    ) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        if self.state != DetectorState::Idle {
+            self.close_session(ts_ms, reason, &mut outputs);
+        }
+        outputs
     }
 
     /// Processes one explicit timestamped input event synchronously.
@@ -194,6 +247,9 @@ impl SleepEngine {
         self.last_any_packet_ts_ms = Some(pkt.ts_ms);
         if pkt_valid {
             self.last_valid_packet_ts_ms = Some(pkt.ts_ms);
+            if !pkt.rr_ms.is_empty() {
+                self.had_rr = true;
+            }
         }
 
         if let Some(raw) = self.ppg.ingest_packet(&pkt) {
@@ -320,6 +376,17 @@ impl SleepEngine {
         if let Some(ln_r) = features.ln_rmssd_60s {
             self.last_ln_rmssd = Some(ln_r);
         }
+        if hrv_valid || features.ln_rmssd_60s.is_some() {
+            self.had_rr = true;
+        }
+        let epoch_sqi = (coverage * (1.0 - rr_artifact_frac)).clamp(0.0, 1.0);
+        if epoch_sqi.is_finite() {
+            self.sqi_sum += epoch_sqi;
+            self.sqi_count += 1;
+        }
+        let unclamped_var_ratio = raw_opt
+            .map(|r| r.local_mad_120s / sigma_hr.max(SIGMA_MIN_BPM))
+            .unwrap_or(features.r_var_120s);
 
         let mut split_reason: Option<SessionEndReason> = None;
 
@@ -352,7 +419,7 @@ impl SleepEngine {
                     }
                     self.warmup_clean_epochs += 1;
                     if self.warmup_clean_epochs >= self.required_warmup_epochs() {
-                        self.warmup_mu_hr = self.baseline.mu_hr();
+                        self.snapshot_warmup_baseline();
                         self.evaluate_warmup_anomaly();
                         self.transition_to(
                             ts_ms,
@@ -405,10 +472,19 @@ impl SleepEngine {
                 }
                 DetectorState::Sleeping => {
                     self.baseline.set_frozen(true);
+                    self.sleep_hr_samples.push(features.hr_bpm_60s);
+                    if hrv_valid && let Some(ln_r) = features.ln_rmssd_60s {
+                        self.sleep_ln_rmssd_samples.push(ln_r);
+                    }
+                    if unclamped_var_ratio.is_finite() {
+                        self.sleep_var_ratio_samples.push(unclamped_var_ratio);
+                    }
                     if p_sleep < 0.30 {
                         self.post_sleep_wake_sec += 15;
                     } else {
                         self.post_sleep_wake_sec = 0;
+                        self.post_trigger_sleep_sec =
+                            self.post_trigger_sleep_sec.saturating_add(15);
                     }
 
                     let recent_desktop_wake = self
@@ -517,6 +593,7 @@ impl SleepEngine {
 
         if self.candidate_dwell_sec >= required_dwell {
             self.confirmed_ts_ms = Some(ts_ms);
+            self.onset_hr_bpm = Some(features.hr_bpm_60s);
             self.confirmed_arousal_streak = 0;
             self.transition_to(
                 ts_ms,
@@ -582,6 +659,7 @@ impl SleepEngine {
             }
             GraceResult::Cancelled => {
                 if self.state == DetectorState::Confirmed {
+                    self.grace_cancel_count = self.grace_cancel_count.saturating_add(1);
                     self.apply_false_positive_cooldown(ts_ms, outputs);
                     self.return_to_monitoring(
                         ts_ms,
@@ -594,6 +672,7 @@ impl SleepEngine {
             }
             GraceResult::Snoozed { duration_sec } => {
                 if self.state == DetectorState::Confirmed {
+                    self.snooze_count = self.snooze_count.saturating_add(1);
                     let until = ts_ms.saturating_add(i64::from(duration_sec).saturating_mul(1000));
                     self.suppress_candidate_until_ms = Some(until);
                     self.baseline.on_desktop_wake_hint();
@@ -623,10 +702,9 @@ impl SleepEngine {
                     self.state,
                     DetectorState::Confirmed | DetectorState::Sleeping
                 ) {
+                    self.rapid_wake_fp_count = self.rapid_wake_fp_count.saturating_add(1);
                     self.apply_false_positive_cooldown(ts_ms, outputs);
-                    self.post_sleep_wake_sec = 0;
-                    self.sleeping_ts_ms = None;
-                    self.sleeping_hr_anchor = None;
+                    self.clear_sleeping_accumulators();
                     self.return_to_monitoring(
                         ts_ms,
                         true,
@@ -652,6 +730,7 @@ impl SleepEngine {
         if clear_onset_marks {
             self.candidate_ts_ms = None;
             self.confirmed_ts_ms = None;
+            self.onset_hr_bpm = None;
         }
         self.transition_to(ts_ms, DetectorState::Monitoring, p_sleep, reason, outputs);
     }
@@ -700,20 +779,28 @@ impl SleepEngine {
     }
 
     fn evaluate_warmup_anomaly(&mut self) {
-        if let (Some(mu_wake), Some(wake_mad), Some(session_mu)) = (
-            self.config.priors.mu_wake,
+        if let (Some(wake_ref), Some(wake_mad), Some(session_mu)) = (
+            self.config
+                .priors
+                .wake_median
+                .or(self.config.priors.mu_wake),
             self.config.priors.wake_mad_s,
             self.baseline.mu_hr(),
         ) {
             let scale = wake_mad.max(SIGMA_MIN_BPM);
-            if (session_mu - mu_wake).abs() > 2.5 * scale {
+            if (session_mu - wake_ref).abs() > 2.5 * scale {
                 self.anomalous = true;
             }
         }
     }
 
     fn expected_z_sleep(&self, baseline_mu_hr: f64, baseline_sigma_hr: f64) -> f64 {
-        if self.anomalous || self.config.priors.maturity == CalibrationMaturity::ColdStart {
+        if self.anomalous {
+            return DEFAULT_EXPECTED_Z_SLEEP;
+        }
+        if self.config.priors.maturity == CalibrationMaturity::ColdStart
+            && self.config.priors.mu_sleep.is_none()
+        {
             return DEFAULT_EXPECTED_Z_SLEEP;
         }
         let denom = baseline_sigma_hr.max(SIGMA_MIN_BPM);
@@ -736,12 +823,67 @@ impl SleepEngine {
         };
 
         let weight = match self.config.priors.maturity {
-            CalibrationMaturity::ColdStart => 0.0,
+            CalibrationMaturity::ColdStart => 0.25,
             CalibrationMaturity::Learning => 0.5,
             CalibrationMaturity::Calibrated => 0.8,
         };
         let blended = (1.0 - weight) * DEFAULT_EXPECTED_Z_SLEEP + weight * personal;
         blended.clamp(-3.5, -1.6)
+    }
+
+    fn snapshot_warmup_baseline(&mut self) {
+        self.warmup_mu_hr = self.baseline.mu_hr();
+        self.warmup_sigma_hr = Some(self.baseline.sigma_hr());
+        self.warmup_ln_rmssd = self.baseline.mu_ln_rmssd();
+    }
+
+    fn clear_sleeping_accumulators(&mut self) {
+        self.post_sleep_wake_sec = 0;
+        self.sleeping_ts_ms = None;
+        self.sleeping_hr_anchor = None;
+        self.last_sleeping_desktop_activity_ms = None;
+        self.post_trigger_sleep_sec = 0;
+        self.sleep_hr_samples.clear();
+        self.sleep_ln_rmssd_samples.clear();
+        self.sleep_var_ratio_samples.clear();
+    }
+
+    fn reset_session_accumulators(&mut self, ts_ms: i64) {
+        self.session_start_ts_ms = Some(ts_ms);
+        self.candidate_ts_ms = None;
+        self.confirmed_ts_ms = None;
+        self.warmup_mu_hr = None;
+        self.warmup_sigma_hr = None;
+        self.warmup_ln_rmssd = None;
+        self.onset_hr_bpm = None;
+        self.epochs_count = 0;
+        self.warmup_clean_epochs = 0;
+        self.stabilization_remaining_epochs = 0;
+        self.anomalous = false;
+        self.fp_recorded_this_session = false;
+        self.fp_count = 0;
+        self.grace_cancel_count = 0;
+        self.rapid_wake_fp_count = 0;
+        self.snooze_count = 0;
+        self.had_rr = false;
+        self.sqi_sum = 0.0;
+        self.sqi_count = 0;
+        self.suppress_candidate_until_ms = None;
+        self.gap_started_ms = None;
+        self.last_any_packet_ts_ms = None;
+        self.last_valid_packet_ts_ms = None;
+        self.reset_candidate_counters();
+        self.confirmed_arousal_streak = 0;
+        self.clear_sleeping_accumulators();
+        self.last_hr_bpm_60s = None;
+        self.last_z_hr = None;
+        self.last_local_mad = None;
+        self.last_ln_rmssd = None;
+
+        self.ppg = PpgPipeline::new();
+        self.ppg.set_epoch_anchor(ts_ms);
+        self.baseline = QuietWakeBaseline::new();
+        self.hmm.reset();
     }
 
     fn transition_to(
@@ -770,35 +912,7 @@ impl SleepEngine {
     fn open_session(&mut self, ts_ms: i64, reason: &str, outputs: &mut Vec<EngineOutput>) {
         let next_idx = self.session_index.unwrap_or(0) + 1;
         self.session_index = Some(next_idx);
-        self.session_start_ts_ms = Some(ts_ms);
-        self.candidate_ts_ms = None;
-        self.confirmed_ts_ms = None;
-        self.sleeping_ts_ms = None;
-        self.warmup_mu_hr = None;
-        self.epochs_count = 0;
-        self.warmup_clean_epochs = 0;
-        self.stabilization_remaining_epochs = 0;
-        self.anomalous = false;
-        self.fp_recorded_this_session = false;
-        self.fp_count = 0;
-        self.suppress_candidate_until_ms = None;
-        self.gap_started_ms = None;
-        self.last_any_packet_ts_ms = None;
-        self.last_valid_packet_ts_ms = None;
-        self.reset_candidate_counters();
-        self.confirmed_arousal_streak = 0;
-        self.post_sleep_wake_sec = 0;
-        self.sleeping_hr_anchor = None;
-        self.last_sleeping_desktop_activity_ms = None;
-        self.last_hr_bpm_60s = None;
-        self.last_z_hr = None;
-        self.last_local_mad = None;
-        self.last_ln_rmssd = None;
-
-        self.ppg = PpgPipeline::new();
-        self.ppg.set_epoch_anchor(ts_ms);
-        self.baseline = QuietWakeBaseline::new();
-        self.hmm.reset();
+        self.reset_session_accumulators(ts_ms);
 
         let prev = self.state;
         self.state = DetectorState::Warmup;
@@ -825,6 +939,10 @@ impl SleepEngine {
         let Some(session_index) = self.session_index else {
             return;
         };
+        let sleep_mu_hr = quantile(&self.sleep_hr_samples, 0.5);
+        let sleep_ln_rmssd = quantile(&self.sleep_ln_rmssd_samples, 0.5);
+        let observed_hr_var_ratio = quantile(&self.sleep_var_ratio_samples, 0.5);
+        let typical_sqi = (self.sqi_count > 0).then(|| self.sqi_sum / self.sqi_count as f64);
         let summary = SessionSummary {
             session_index,
             start_ts_ms: self.session_start_ts_ms.unwrap_or(end_ts_ms),
@@ -836,6 +954,20 @@ impl SleepEngine {
             anomalous: self.anomalous,
             fp_count: self.fp_count,
             warmup_mu_hr: self.warmup_mu_hr.or_else(|| self.baseline.mu_hr()),
+            warmup_sigma_hr: self
+                .warmup_sigma_hr
+                .or_else(|| (self.epochs_count > 0).then(|| self.baseline.sigma_hr())),
+            warmup_ln_rmssd: self.warmup_ln_rmssd.or_else(|| self.baseline.mu_ln_rmssd()),
+            onset_hr_bpm: self.onset_hr_bpm,
+            sleep_mu_hr,
+            sleep_ln_rmssd,
+            observed_hr_var_ratio,
+            typical_sqi,
+            post_trigger_sleep_sec: self.post_trigger_sleep_sec,
+            had_rr: self.had_rr,
+            grace_cancel_count: self.grace_cancel_count,
+            rapid_wake_fp_count: self.rapid_wake_fp_count,
+            snooze_count: self.snooze_count,
             epochs_count: self.epochs_count,
         };
         let prev = self.state;
@@ -880,8 +1012,17 @@ impl SleepEngine {
         let mut outputs = Vec::new();
         if self.state == DetectorState::Idle {
             self.open_session(ts_ms, "epoch feature replay started", &mut outputs);
+        } else if let Some(prev_ts) = self.last_any_packet_ts_ms
+            && ts_ms - prev_ts > SHORT_GAP_MAX_MS
+        {
+            self.gap_started_ms = Some(prev_ts);
+            self.resolve_active_gap(ts_ms, true, &mut outputs);
         }
         let frozen = flatline_stale || coverage < MIN_EPOCH_COVERAGE;
+        self.last_any_packet_ts_ms = Some(ts_ms);
+        if !frozen {
+            self.last_valid_packet_ts_ms = Some(ts_ms);
+        }
         self.process_features_step(
             EpochStepInput {
                 ts_ms,

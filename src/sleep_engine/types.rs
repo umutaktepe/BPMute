@@ -1,6 +1,7 @@
 //! Core input, configuration, calibration prior, and output types for [`crate::sleep_engine`].
 
 use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,36 @@ pub enum ContactStatus {
     NoContact,
     /// Contact detection supported, skin contact detected (`0b11`).
     Contact,
+}
+
+impl ContactStatus {
+    /// Returns the canonical lowercase identifier stored in SQLite and JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::NoContact => "no_contact",
+            Self::Contact => "contact",
+        }
+    }
+}
+
+impl fmt::Display for ContactStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ContactStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "unsupported" => Ok(Self::Unsupported),
+            "no_contact" => Ok(Self::NoContact),
+            "contact" => Ok(Self::Contact),
+            other => Err(format!("unknown contact_status `{other}`")),
+        }
+    }
 }
 
 /// Incoming heart-rate packet with explicit millisecond timestamp.
@@ -118,6 +149,8 @@ pub enum CalibrationMaturity {
 pub struct CalibrationPriors {
     pub maturity: CalibrationMaturity,
     pub mu_wake: Option<f64>,
+    #[serde(default)]
+    pub wake_median: Option<f64>,
     pub sigma_wake: Option<f64>,
     pub mu_sleep: Option<f64>,
     pub delta_hr_onset: Option<f64>,
@@ -133,6 +166,7 @@ impl CalibrationPriors {
         Self {
             maturity: CalibrationMaturity::ColdStart,
             mu_wake: None,
+            wake_median: None,
             sigma_wake: None,
             mu_sleep: None,
             delta_hr_onset: None,
@@ -277,6 +311,22 @@ impl fmt::Display for DetectorState {
     }
 }
 
+impl FromStr for DetectorState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "idle" => Ok(Self::Idle),
+            "warmup" => Ok(Self::Warmup),
+            "monitoring" => Ok(Self::Monitoring),
+            "candidate" => Ok(Self::Candidate),
+            "confirmed" => Ok(Self::Confirmed),
+            "sleeping" => Ok(Self::Sleeping),
+            other => Err(format!("unknown detector_state `{other}`")),
+        }
+    }
+}
+
 /// Tiered `Signal Lost` / BLE disconnect gap classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -297,6 +347,44 @@ pub enum SessionEndReason {
     SustainedWakefulness,
     DesktopWakeRebound,
     StreamEnded,
+    HostSuspend,
+    HostPoweroff,
+}
+
+impl SessionEndReason {
+    /// Returns the canonical lowercase snake_case identifier.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GapExceeded => "gap_exceeded",
+            Self::SustainedWakefulness => "sustained_wakefulness",
+            Self::DesktopWakeRebound => "desktop_wake_rebound",
+            Self::StreamEnded => "stream_ended",
+            Self::HostSuspend => "host_suspend",
+            Self::HostPoweroff => "host_poweroff",
+        }
+    }
+}
+
+impl fmt::Display for SessionEndReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SessionEndReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gap_exceeded" => Ok(Self::GapExceeded),
+            "sustained_wakefulness" => Ok(Self::SustainedWakefulness),
+            "desktop_wake_rebound" => Ok(Self::DesktopWakeRebound),
+            "stream_ended" => Ok(Self::StreamEnded),
+            "host_suspend" => Ok(Self::HostSuspend),
+            "host_poweroff" => Ok(Self::HostPoweroff),
+            _ => Err(format!("invalid session end reason '{s}'")),
+        }
+    }
 }
 
 /// Reason the engine requested aborting an active `Grace Period`.
@@ -351,6 +439,30 @@ pub struct SessionSummary {
     pub anomalous: bool,
     pub fp_count: u8,
     pub warmup_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub warmup_sigma_hr: Option<f64>,
+    #[serde(default)]
+    pub warmup_ln_rmssd: Option<f64>,
+    #[serde(default)]
+    pub onset_hr_bpm: Option<f64>,
+    #[serde(default)]
+    pub sleep_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub sleep_ln_rmssd: Option<f64>,
+    #[serde(default)]
+    pub observed_hr_var_ratio: Option<f64>,
+    #[serde(default)]
+    pub typical_sqi: Option<f64>,
+    #[serde(default)]
+    pub post_trigger_sleep_sec: u32,
+    #[serde(default)]
+    pub had_rr: bool,
+    #[serde(default)]
+    pub grace_cancel_count: u8,
+    #[serde(default)]
+    pub rapid_wake_fp_count: u8,
+    #[serde(default)]
+    pub snooze_count: u8,
     pub epochs_count: usize,
 }
 

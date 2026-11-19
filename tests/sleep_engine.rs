@@ -316,6 +316,7 @@ fn slice3_warmup_durations_hmm_baseline_freeze_and_hrv_marginalization() {
         priors: CalibrationPriors {
             maturity: CalibrationMaturity::Calibrated,
             mu_wake: Some(68.0),
+            wake_median: None,
             sigma_wake: Some(2.2),
             mu_sleep: Some(60.0),
             delta_hr_onset: Some(-5.5),
@@ -728,6 +729,7 @@ fn slice4_presets_dwell_grace_outcomes_cooldown_and_anomalous_detection() {
         priors: CalibrationPriors {
             maturity: CalibrationMaturity::Calibrated,
             mu_wake: Some(62.0),
+            wake_median: None,
             sigma_wake: Some(2.2),
             mu_sleep: Some(55.0),
             delta_hr_onset: Some(-5.5),
@@ -1019,6 +1021,7 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
             CalibrationPriors {
                 maturity: CalibrationMaturity::Learning,
                 mu_wake: Some(50.0),
+                wake_median: None,
                 sigma_wake: Some(2.1),
                 mu_sleep: Some(44.0),
                 delta_hr_onset: Some(-6.0),
@@ -1035,6 +1038,7 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
             CalibrationPriors {
                 maturity: CalibrationMaturity::Calibrated,
                 mu_wake: Some(80.0),
+                wake_median: None,
                 sigma_wake: Some(2.3),
                 mu_sleep: Some(71.0),
                 delta_hr_onset: Some(-8.5),

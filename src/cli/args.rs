@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::{LogFormat, Sensitivity};
+use crate::calibration::FeedbackVerdict;
+use crate::config::{ClockTime, LogFormat, Sensitivity};
 
 /// BPMute — BLE Heart-Rate Sleep-Onset Daemon & CLI.
 #[derive(Debug, Parser)]
@@ -61,10 +62,18 @@ pub enum Command {
     },
     /// Resume Sleep Action Pipeline triggers after a pause.
     Resume,
-    /// Replay a canonical CSV or JSONL heart-rate trace read-only through the sleep-onset engine.
+    /// Replay a recorded session (--session <id>) or canonical CSV/JSONL trace read-only through the sleep-onset engine.
     Replay {
         /// Path to canonical CSV or JSONL trace file.
-        file: PathBuf,
+        #[arg(
+            value_name = "FILE",
+            required_unless_present = "session",
+            conflicts_with = "session"
+        )]
+        file: Option<PathBuf>,
+        /// Replay a stored Monitoring Session UUID (or unambiguous prefix) from the local SQLite ledger.
+        #[arg(long, value_name = "ID", conflicts_with = "file")]
+        session: Option<String>,
         /// Override sensitivity preset for what-if comparison.
         #[arg(long, value_enum, value_name = "NAME")]
         preset: Option<Sensitivity>,
@@ -75,11 +84,86 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect Monitoring Sessions and edit calibration feedback verdicts or Wearable-app overrides.
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsCommand,
+    },
+    /// Inspect and manage adaptive per-user calibration state.
+    Calibration {
+        #[command(subcommand)]
+        action: CalibrationCommand,
+    },
     /// Manage declarative TOML configuration (`config.toml`).
     Config {
         #[command(subcommand)]
         action: ConfigCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionsCommand {
+    /// List recorded Monitoring Sessions newest-first.
+    List {
+        /// Maximum number of sessions to display.
+        #[arg(long, default_value_t = 20, value_name = "N")]
+        limit: u32,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show detailed metadata, feedback, and 15-second Epochs for a Monitoring Session.
+    Show {
+        /// Session UUIDv7 or unambiguous ID prefix.
+        id: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record or clear feedback (`--verdict`, `--onset`, `--avg-sleep-hr`, or `--clear`) on a closed session.
+    Feedback {
+        /// Session UUIDv7 or unambiguous ID prefix.
+        id: String,
+        /// Feedback verdict (`false_positive`, `missed_sleep`, or `anomalous_exclude`).
+        #[arg(long, value_enum, conflicts_with = "clear")]
+        verdict: Option<FeedbackVerdict>,
+        /// Wearable-app reported sleep-onset local time (`HH:MM`).
+        #[arg(long, value_name = "HH:MM", conflicts_with = "clear")]
+        onset: Option<ClockTime>,
+        /// Wearable-app reported overnight average sleeping HR (`30..=140` bpm).
+        #[arg(long, value_name = "BPM", conflicts_with = "clear")]
+        avg_sleep_hr: Option<f64>,
+        /// Clear all stored feedback overrides for this session.
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CalibrationCommand {
+    /// Show Calibration Maturity, learned personal priors, and per-Wearable signal floors.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set or clear the optional Day-1 average sleeping-HR seed (`30..=140` bpm).
+    Seed {
+        /// Overnight average sleeping HR in BPM (`+2.5 bpm` onset nadir offset applied automatically).
+        #[arg(
+            value_name = "BPM",
+            required_unless_present = "clear",
+            conflicts_with = "clear"
+        )]
+        bpm: Option<f64>,
+        /// Clear the Day-1 sleeping-HR seed.
+        #[arg(long, conflicts_with = "bpm")]
+        clear: bool,
+    },
+    /// Accept a pending 5-session persistent-shift prompt by inserting a reversible Calibration Boundary.
+    AcceptShift,
+    /// Dismiss a pending 5-session persistent-shift prompt (`Keep ignoring`).
+    DismissShift,
 }
 
 #[derive(Debug, Subcommand)]

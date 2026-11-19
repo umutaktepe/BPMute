@@ -191,7 +191,7 @@ async fn process_line(
                 .await;
         }
         other => {
-            let resp = match core.handle_op(other, req.params) {
+            let resp = match core.handle_op(other, req.params).await {
                 Ok(data) => ResponseEnvelope::ok(req.id, data),
                 Err(err) => ResponseEnvelope::err(req.id, err.code, err.message),
             };

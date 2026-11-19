@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,23 +7,38 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
-use crate::config::{CliOverrides, ClockTime, ConfigPatch, LoadedConfig, patch_config_file};
+use crate::calibration::CalibrationState;
+use crate::config::{
+    CliOverrides, ClockTime, ConfigPatch, DetectionConfig, LoadedConfig, RawSamplesRetention,
+    patch_config_file,
+};
 use crate::ipc::protocol::{
-    AlertSeverity, ConfigSnapshotPayload, DaemonAlert, DaemonStatus, ErrorPayload, MonitoringState,
-    PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope, SetDryRunParams, error_codes,
+    AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
+    EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode,
+    PauseParams, PushEventEnvelope, SessionClosedEvent, SessionGetParams, SessionListParams,
+    SetDryRunParams, SetFeedbackParams, SetSeedParams, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
+use crate::sleep_engine::DetectorState;
+use crate::storage::worker::PersistenceHandle;
+use crate::storage::{SessionFullDetail, SetFeedbackRequest, StorageError};
 
 use super::clock::DaemonClock;
 
 const CONFIG_RELOAD_ALERT_ID: &str = "config_reload_failed";
+const PERSISTENT_SHIFT_ALERT_ID: &str = "calibration_persistent_shift";
+const MAX_HR_RING_BUFFER_LEN: usize = 1_800; // 30 min at 1 Hz
 
 fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: code.to_string(),
         message: message.into(),
     }
+}
+
+fn storage_to_ipc_err(err: StorageError) -> ErrorPayload {
+    ipc_err(err.ipc_code(), err.to_string())
 }
 
 fn serialize_json(value: impl Serialize) -> Result<Value, ErrorPayload> {
@@ -37,6 +53,9 @@ pub struct DaemonCore {
     pub clock: Arc<dyn DaemonClock>,
     pub broker: Arc<EventBroker>,
     pub shutdown_rx: watch::Receiver<bool>,
+    pub persistence: PersistenceHandle,
+    calibration_tx: watch::Sender<CalibrationState>,
+    config_tx: watch::Sender<(DetectionConfig, RawSamplesRetention)>,
     inner: Mutex<InnerState>,
 }
 
@@ -47,23 +66,52 @@ struct InnerState {
     paused_until: Option<DateTime<Local>>,
     pause_mode: Option<PauseMode>,
     pause_generation: u64,
+    detector_state: DetectorState,
+    active_session_id: Option<String>,
+    active_wearable_id: Option<String>,
+    calibration_state: CalibrationState,
+    hr_ring_buffer: VecDeque<HrSampleEvent>,
     alerts: Vec<DaemonAlert>,
     started_at: tokio::time::Instant,
 }
 
+/// Initialization parameters for [`DaemonCore::new`].
+pub struct DaemonCoreInit {
+    pub paths: ResolvedPaths,
+    pub loaded_config: LoadedConfig,
+    pub env: Arc<dyn EnvSource>,
+    pub cli_overrides: CliOverrides,
+    pub clock: Arc<dyn DaemonClock>,
+    pub broker: Arc<EventBroker>,
+    pub shutdown_rx: watch::Receiver<bool>,
+    pub persistence: PersistenceHandle,
+    pub initial_calibration: CalibrationState,
+}
+
 impl DaemonCore {
-    /// Initializes daemon state from validated startup configuration.
-    pub fn new(
-        paths: ResolvedPaths,
-        loaded_config: LoadedConfig,
-        env: Arc<dyn EnvSource>,
-        cli_overrides: CliOverrides,
-        clock: Arc<dyn DaemonClock>,
-        broker: Arc<EventBroker>,
-        shutdown_rx: watch::Receiver<bool>,
-    ) -> Self {
+    /// Initializes daemon state from validated startup configuration and persisted calibration state.
+    pub fn new(init: DaemonCoreInit) -> Self {
+        let DaemonCoreInit {
+            paths,
+            loaded_config,
+            env,
+            cli_overrides,
+            clock,
+            broker,
+            shutdown_rx,
+            persistence,
+            initial_calibration,
+        } = init;
         let dry_run = loaded_config.config.actions.dry_run;
         let started_at = clock.now_instant();
+        let (calibration_tx, _) = watch::channel(initial_calibration.clone());
+        let (config_tx, _) = watch::channel((
+            loaded_config.config.detection.clone(),
+            loaded_config.config.retention.raw_samples_days,
+        ));
+        let mut alerts = Vec::new();
+        sync_shift_alert_locked(&mut alerts, &initial_calibration);
+
         Self {
             paths,
             env,
@@ -71,6 +119,9 @@ impl DaemonCore {
             clock,
             broker,
             shutdown_rx,
+            persistence,
+            calibration_tx,
+            config_tx,
             inner: Mutex::new(InnerState {
                 loaded_config,
                 dry_run,
@@ -78,10 +129,43 @@ impl DaemonCore {
                 paused_until: None,
                 pause_mode: None,
                 pause_generation: 0,
-                alerts: Vec::new(),
+                detector_state: DetectorState::Idle,
+                active_session_id: None,
+                active_wearable_id: None,
+                calibration_state: initial_calibration,
+                hr_ring_buffer: VecDeque::with_capacity(MAX_HR_RING_BUFFER_LEN),
+                alerts,
                 started_at,
             }),
         }
+    }
+
+    /// Subscribes to live calibration state updates (for the monitoring loop).
+    pub fn subscribe_calibration(&self) -> watch::Receiver<CalibrationState> {
+        self.calibration_tx.subscribe()
+    }
+
+    /// Subscribes to live detection/retention config updates (for the monitoring loop).
+    pub fn subscribe_config(&self) -> watch::Receiver<(DetectionConfig, RawSamplesRetention)> {
+        self.config_tx.subscribe()
+    }
+
+    /// Returns a snapshot of whether biometric telemetry logging is enabled.
+    pub fn log_biometrics(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("daemon state mutex poisoned")
+            .loaded_config
+            .log_biometrics
+    }
+
+    /// Returns a snapshot of the current in-memory [`CalibrationState`].
+    pub fn calibration_state(&self) -> CalibrationState {
+        self.inner
+            .lock()
+            .expect("daemon state mutex poisoned")
+            .calibration_state
+            .clone()
     }
 
     /// Computes a consistent snapshot of `DaemonStatus`.
@@ -101,7 +185,7 @@ impl DaemonCore {
         let monitoring_state = if guard.paused {
             MonitoringState::Paused
         } else {
-            MonitoringState::Idle
+            MonitoringState::from(guard.detector_state)
         };
 
         DaemonStatus {
@@ -143,20 +227,28 @@ impl DaemonCore {
         (sub_id, queue, status)
     }
 
-    /// Builds a `Snapshot` push envelope with current status and alerts.
+    /// Builds a `Snapshot` push envelope with current status, rolling 30-min HR ring buffer, and alerts.
     pub fn make_snapshot_event(&self, status: &DaemonStatus) -> PushEventEnvelope {
+        let ring: Vec<HrSampleEvent> = {
+            let guard = self.inner.lock().expect("daemon state mutex poisoned");
+            guard.hr_ring_buffer.iter().cloned().collect()
+        };
         self.broker.make_event(
             "Snapshot",
             json!({
                 "status": status,
-                "hr_ring_buffer": [],
+                "hr_ring_buffer": ring,
                 "alerts": status.alerts,
             }),
         )
     }
 
-    /// Dispatches an IPC command belonging to the `#15` tracer bullet surface.
-    pub fn handle_op(self: &Arc<Self>, op: &str, params: Value) -> Result<Value, ErrorPayload> {
+    /// Dispatches an IPC command over the Unix domain socket.
+    pub async fn handle_op(
+        self: &Arc<Self>,
+        op: &str,
+        params: Value,
+    ) -> Result<Value, ErrorPayload> {
         match op {
             "daemon.ping" => Ok(json!({ "pong": true, "v": PROTOCOL_VERSION })),
             "daemon.status" => serialize_json(self.status()),
@@ -193,10 +285,171 @@ impl DaemonCore {
                 serialize_json(self.update_config(&patch)?)
             }
             "config.reload" => serialize_json(self.reload_from_disk()?),
+            "session.list" => {
+                let parsed: SessionListParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session.list params: {e}"),
+                    )
+                })?;
+                let limit = parsed.limit.unwrap_or(20);
+                let offset = parsed.offset.unwrap_or(0);
+                let page = self
+                    .persistence
+                    .list_sessions(limit, offset)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                serialize_json(page)
+            }
+            "session.get" => {
+                let parsed: SessionGetParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session.get params: {e}"),
+                    )
+                })?;
+                let detail = self
+                    .persistence
+                    .get_session(parsed.id)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                serialize_json(detail)
+            }
+            "session.set_feedback" => {
+                let parsed: SetFeedbackParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session.set_feedback params: {e}"),
+                    )
+                })?;
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let req = SetFeedbackRequest {
+                    session_id_or_prefix: parsed.session_id,
+                    verdict: parsed.verdict,
+                    onset_hhmm: parsed.onset_hhmm,
+                    avg_sleep_hr: parsed.avg_sleep_hr,
+                    clear_all: parsed.clear,
+                };
+                let (detail, cal_state) = self
+                    .persistence
+                    .set_feedback_and_recompute(req, now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state);
+                serialize_json(detail)
+            }
+            "calibration.status" => serialize_json(self.calibration_state()),
+            "calibration.set_seed" => {
+                let parsed: SetSeedParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid calibration.set_seed params: {e}"),
+                    )
+                })?;
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let cal_state = self
+                    .persistence
+                    .set_day1_seed_and_recompute(parsed.sleep_hr, now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state.clone());
+                serialize_json(cal_state)
+            }
+            "calibration.accept_shift" => {
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let accepted = self
+                    .persistence
+                    .accept_shift_and_recompute(now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(accepted.calibration.clone());
+                serialize_json(accepted)
+            }
+            "calibration.dismiss_shift" => {
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let cal_state = self
+                    .persistence
+                    .dismiss_shift_and_recompute(now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state.clone());
+                serialize_json(cal_state)
+            }
             _ => Err(ipc_err(
                 error_codes::UNKNOWN_OP,
                 format!("unknown IPC operation '{op}'"),
             )),
+        }
+    }
+
+    /// Records a live `HrSampleEvent` into the 30-minute ring buffer and pushes `HrSample`.
+    pub fn record_hr_sample(&self, sample: HrSampleEvent) {
+        {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            if guard.hr_ring_buffer.len() >= MAX_HR_RING_BUFFER_LEN {
+                guard.hr_ring_buffer.pop_front();
+            }
+            guard.hr_ring_buffer.push_back(sample.clone());
+        }
+        if let Ok(val) = serde_json::to_value(sample) {
+            self.broker.publish_stream("HrSample", val);
+        }
+    }
+
+    /// Updates active session/wearable tracking and detector state, publishing `StateChanged` if changed.
+    pub fn set_detector_phase(
+        &self,
+        detector_state: DetectorState,
+        active_session_id: Option<String>,
+        active_wearable_id: Option<String>,
+    ) {
+        let status_opt = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            let changed = guard.detector_state != detector_state;
+            guard.detector_state = detector_state;
+            guard.active_session_id = active_session_id;
+            guard.active_wearable_id = active_wearable_id;
+            changed.then(|| self.build_status_locked(&guard))
+        };
+        if let Some(status) = status_opt {
+            self.publish_state_changed(&status);
+        }
+    }
+
+    /// Publishes an `EpochUpdate` control event for a recorded 15-second `Epoch`.
+    pub fn publish_epoch_update(&self, payload: EpochUpdateEvent) {
+        if let Ok(val) = serde_json::to_value(payload) {
+            self.broker.publish_control("EpochUpdate", val);
+        }
+    }
+
+    /// Publishes `SessionClosed` and refreshes calibration state + shift alerts.
+    pub fn on_session_closed(&self, detail: SessionFullDetail, cal_state: CalibrationState) {
+        if let Ok(val) = serde_json::to_value(SessionClosedEvent { session: detail }) {
+            self.broker.publish_control("SessionClosed", val);
+        }
+        self.apply_calibration_update(cal_state);
+    }
+
+    /// Updates in-memory calibration state, syncs shift alerts, notifies the engine loop, and pushes IPC events.
+    pub fn apply_calibration_update(&self, new_cal: CalibrationState) {
+        let alerts_opt = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            guard.calibration_state = new_cal.clone();
+            let changed = sync_shift_alert_locked(&mut guard.alerts, &new_cal);
+            changed.then(|| guard.alerts.clone())
+        };
+
+        let _ = self.calibration_tx.send(new_cal.clone());
+
+        if let Some(alerts) = alerts_opt {
+            self.broker
+                .publish_control("AlertChanged", json!({ "alerts": alerts }));
+        }
+        if let Ok(val) = serde_json::to_value(CalibrationUpdatedEvent {
+            calibration: new_cal,
+        }) {
+            self.broker.publish_control("CalibrationUpdated", val);
         }
     }
 
@@ -387,7 +640,7 @@ impl DaemonCore {
         explicit_dry_run_patch: bool,
         log_msg: &str,
     ) -> ConfigSnapshotPayload {
-        let (snapshot, state_changed_status, alerts_changed) = {
+        let (snapshot, state_changed_status, alerts_changed, cfg_watch) = {
             let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
             let old_armed = is_armed_locked(&guard, self.clock.as_ref());
             let old_dry_run = guard.dry_run;
@@ -409,8 +662,14 @@ impl DaemonCore {
                 .then(|| self.build_status_locked(&guard));
 
             let snapshot = self.build_config_snapshot_locked(&guard);
-            (snapshot, status_opt, alerts_opt)
+            let cfg_watch = (
+                guard.loaded_config.config.detection.clone(),
+                guard.loaded_config.config.retention.raw_samples_days,
+            );
+            (snapshot, status_opt, alerts_opt, cfg_watch)
         };
+
+        let _ = self.config_tx.send(cfg_watch);
 
         if let Some(alerts) = alerts_changed {
             self.broker
@@ -433,7 +692,7 @@ impl DaemonCore {
         }
     }
 
-    /// Publishes an `HrSample` stream event through the drop-oldest broker lane.
+    /// Publishes a raw JSON `HrSample` stream event through the drop-oldest broker lane.
     pub fn publish_hr_sample(&self, sample: Value) {
         self.broker.publish_stream("HrSample", sample);
     }
@@ -461,20 +720,49 @@ fn clear_reload_alert(alerts: &mut Vec<DaemonAlert>) -> bool {
 
 fn upsert_reload_alert(alerts: &mut Vec<DaemonAlert>, err_msg: &str) -> bool {
     let message = format!("Configuration reload failed (keeping last valid config): {err_msg}");
-    if let Some(existing) = alerts.iter_mut().find(|a| a.id == CONFIG_RELOAD_ALERT_ID) {
-        if existing.message == message {
+    upsert_alert(
+        alerts,
+        DaemonAlert {
+            id: CONFIG_RELOAD_ALERT_ID.to_string(),
+            kind: CONFIG_RELOAD_ALERT_ID.to_string(),
+            severity: AlertSeverity::Error,
+            message,
+            dismissible: true,
+        },
+    )
+}
+
+fn sync_shift_alert_locked(alerts: &mut Vec<DaemonAlert>, state: &CalibrationState) -> bool {
+    if let Some(ref shift) = state.pending_shift_alert {
+        let message = format!(
+            "Persistent {} baseline shift detected across {} consecutive sessions; accept or dismiss via calibration controls",
+            shift.direction, shift.session_count
+        );
+        upsert_alert(
+            alerts,
+            DaemonAlert {
+                id: PERSISTENT_SHIFT_ALERT_ID.to_string(),
+                kind: PERSISTENT_SHIFT_ALERT_ID.to_string(),
+                severity: AlertSeverity::Warn,
+                message,
+                dismissible: true,
+            },
+        )
+    } else {
+        let before = alerts.len();
+        alerts.retain(|a| a.id != PERSISTENT_SHIFT_ALERT_ID);
+        alerts.len() != before
+    }
+}
+
+fn upsert_alert(alerts: &mut Vec<DaemonAlert>, next: DaemonAlert) -> bool {
+    if let Some(existing) = alerts.iter_mut().find(|a| a.id == next.id) {
+        if *existing == next {
             return false;
         }
-        existing.message = message;
+        *existing = next;
         return true;
     }
-
-    alerts.push(DaemonAlert {
-        id: CONFIG_RELOAD_ALERT_ID.to_string(),
-        kind: CONFIG_RELOAD_ALERT_ID.to_string(),
-        severity: AlertSeverity::Error,
-        message,
-        dismissible: true,
-    });
+    alerts.push(next);
     true
 }

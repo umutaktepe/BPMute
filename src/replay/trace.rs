@@ -11,15 +11,17 @@ use crate::sleep_engine::{
     ContactStatus, DesktopActivity, DesktopActivityKind, EngineEvent, GraceOutcome, GraceResult,
     HrPacket, StreamState, StreamStatus,
 };
+use crate::storage::StorageError;
 
 const DEFAULT_SNOOZE_DURATION_SEC: u32 = 1800;
 
-/// Supported canonical trace file formats.
+/// Supported canonical trace file formats and ledger source marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceFormat {
     Csv,
     Jsonl,
+    SqliteLedger,
 }
 
 impl TraceFormat {
@@ -28,11 +30,12 @@ impl TraceFormat {
         match self {
             Self::Csv => "csv",
             Self::Jsonl => "jsonl",
+            Self::SqliteLedger => "sqlite_ledger",
         }
     }
 }
 
-/// Errors produced when reading, parsing, or validating a replay trace.
+/// Errors produced when reading, parsing, or validating a replay trace or ledger session.
 #[derive(Debug, Error)]
 pub enum ReplayError {
     #[error("I/O error reading trace: {0}")]
@@ -41,6 +44,12 @@ pub enum ReplayError {
     Parse(String),
     #[error("invalid trace data: {0}")]
     Validation(String),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("precondition conflict: {0}")]
+    NoReplayData(String),
+    #[error("ledger storage error: {0}")]
+    Storage(#[from] StorageError),
 }
 
 impl ReplayError {
@@ -50,8 +59,10 @@ impl ReplayError {
             Self::Io(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                 ExitCode::PermissionOrBackendRefusal
             }
-            Self::Io(_) => ExitCode::RuntimeError,
+            Self::Io(_) | Self::NotFound(_) => ExitCode::RuntimeError,
             Self::Parse(_) | Self::Validation(_) => ExitCode::UsageOrConfigError,
+            Self::NoReplayData(_) => ExitCode::PreconditionConflict,
+            Self::Storage(err) => err.exit_code(),
         }
     }
 }
@@ -84,6 +95,11 @@ pub fn parse_trace_str(
     let events = match format {
         TraceFormat::Csv => parse_csv_trace(content)?,
         TraceFormat::Jsonl => parse_jsonl_trace(content)?,
+        TraceFormat::SqliteLedger => {
+            return Err(ReplayError::Validation(
+                "sqlite_ledger is not a text trace file format".to_string(),
+            ));
+        }
     };
     if events.is_empty() {
         return Err(ReplayError::Validation(

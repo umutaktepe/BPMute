@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Config, LogFormat, ScheduleConfig};
+use crate::calibration::{CalibrationState, FeedbackVerdict};
+use crate::config::{ClockTime, Config, LogFormat, PatchField, ScheduleConfig};
+use crate::sleep_engine::{ContactStatus, DetectorState, Epoch};
+use crate::storage::SessionFullDetail;
 
 /// Current NDJSON IPC protocol version (ADR-0002).
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -16,7 +19,10 @@ pub mod error_codes {
     pub const UNKNOWN_OP: &str = "UNKNOWN_OP";
     pub const INVALID_PARAMS: &str = "INVALID_PARAMS";
     pub const INVALID_CONFIG: &str = "INVALID_CONFIG";
+    pub const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
     pub const PRECONDITION_FAILED: &str = "PRECONDITION_FAILED";
+    pub const NOT_FOUND: &str = "NOT_FOUND";
+    pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
     pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 }
 
@@ -136,15 +142,39 @@ pub struct DaemonAlert {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MonitoringState {
     Idle,
+    Warmup,
+    Monitoring,
+    Candidate,
+    Confirmed,
+    Sleeping,
     Paused,
+}
+
+impl From<DetectorState> for MonitoringState {
+    fn from(value: DetectorState) -> Self {
+        match value {
+            DetectorState::Idle => Self::Idle,
+            DetectorState::Warmup => Self::Warmup,
+            DetectorState::Monitoring => Self::Monitoring,
+            DetectorState::Candidate => Self::Candidate,
+            DetectorState::Confirmed => Self::Confirmed,
+            DetectorState::Sleeping => Self::Sleeping,
+        }
+    }
 }
 
 impl std::fmt::Display for MonitoringState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Idle => f.write_str("Idle"),
-            Self::Paused => f.write_str("Paused"),
-        }
+        let label = match self {
+            Self::Idle => "Idle",
+            Self::Warmup => "Warmup",
+            Self::Monitoring => "Monitoring",
+            Self::Candidate => "Candidate",
+            Self::Confirmed => "Confirmed",
+            Self::Sleeping => "Sleeping",
+            Self::Paused => "Paused",
+        };
+        f.write_str(label)
     }
 }
 
@@ -196,4 +226,73 @@ pub struct ConfigSnapshotPayload {
     pub log_filter: String,
     pub log_format: LogFormat,
     pub log_biometrics: bool,
+}
+
+/// Parameters accepted by `session.list`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionListParams {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// Parameters accepted by `session.get`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionGetParams {
+    pub id: String,
+}
+
+/// Parameters accepted by `session.set_feedback`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetFeedbackParams {
+    pub session_id: String,
+    #[serde(default)]
+    pub verdict: PatchField<FeedbackVerdict>,
+    #[serde(default)]
+    pub onset_hhmm: PatchField<ClockTime>,
+    #[serde(default)]
+    pub avg_sleep_hr: PatchField<f64>,
+    #[serde(default)]
+    pub clear: bool,
+}
+
+/// Parameters accepted by `calibration.set_seed`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSeedParams {
+    pub sleep_hr: Option<f64>,
+}
+
+/// Stream event payload pushed as `HrSample` (and buffered for `Snapshot`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HrSampleEvent {
+    pub ts_ms: i64,
+    pub bpm: f64,
+    #[serde(default)]
+    pub rr_ms: Vec<f64>,
+    pub contact_status: ContactStatus,
+    pub wearable_id: String,
+    pub session_id: Option<String>,
+}
+
+/// Control event payload pushed as `EpochUpdate` every 15-second `Epoch`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpochUpdateEvent {
+    pub session_id: String,
+    pub wearable_id: String,
+    pub epoch: Epoch,
+}
+
+/// Control event payload pushed as `SessionClosed` when a `Monitoring Session` finalizes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionClosedEvent {
+    pub session: SessionFullDetail,
+}
+
+/// Control event payload pushed as `CalibrationUpdated` after any ledger recompute.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationUpdatedEvent {
+    pub calibration: CalibrationState,
 }
