@@ -21,12 +21,13 @@ use crate::idle::{
 use crate::ipc::protocol::{
     AlertSeverity, CalibrationSetBoundaryParams, CalibrationUpdatedEvent, ConfigSnapshotPayload,
     DaemonAlert, DaemonStatus, DataBackupSqliteParams, DataExportBundleParams, DataHardWipeParams,
-    DataImportBundleParams, DiscoveredWearable, EnrollAuthResponseParams, EnrollSelectParams,
-    EnrollStartParams, EnrolledWearableStatus, EpochUpdateEvent, ErrorPayload, HrSampleEvent,
-    MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope,
-    SessionClosedEvent, SessionDeleteParams, SessionExportTraceParams, SessionGetParams,
-    SessionListParams, SetDryRunParams, SetFeedbackParams, SetSeedParams, WearableConnectParams,
-    WearableRenameParams, WearableUnenrollParams, error_codes,
+    DataImportBundleParams, DiscoveredWearable, EnrollAuthReply, EnrollAuthResponseParams,
+    EnrollSelectParams, EnrollStartParams, EnrolledWearableStatus, EnrollmentUpdateEvent,
+    EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION,
+    PairingPrompt, PauseMode, PauseParams, PushEventEnvelope, SessionClosedEvent,
+    SessionDeleteParams, SessionExportTraceParams, SessionGetParams, SessionListParams,
+    SetDryRunParams, SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableRenameParams,
+    WearableUnenrollParams, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -101,6 +102,7 @@ struct InnerState {
     discovered_wearables: Vec<DiscoveredWearable>,
     wearable_statuses: HashMap<String, StreamStatus>,
     wearable_batteries: HashMap<String, u8>,
+    active_auth_reply: Option<tokio::sync::oneshot::Sender<EnrollAuthReply>>,
 }
 
 struct EnrollmentLock {
@@ -210,6 +212,7 @@ impl DaemonCore {
                 discovered_wearables: Vec::new(),
                 wearable_statuses: HashMap::new(),
                 wearable_batteries: HashMap::new(),
+                active_auth_reply: None,
             }),
         }
     }
@@ -1349,6 +1352,23 @@ impl DaemonCore {
                     "hints": hints,
                 }))
             }
+            "alert.dismiss" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ipc_err(error_codes::INVALID_PARAMS, "missing 'id' param"))?;
+                let (changed, alerts) = {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    let before = guard.alerts.len();
+                    guard.alerts.retain(|a| a.id != id);
+                    (guard.alerts.len() != before, guard.alerts.clone())
+                };
+                if changed {
+                    self.broker
+                        .publish_control("AlertChanged", json!({ "alerts": alerts }));
+                }
+                Ok(json!({ "dismissed": changed }))
+            }
             "wearable.enroll_cancel" => {
                 if let Some(conn) = try_system_conn().await {
                     let _ =
@@ -1358,16 +1378,24 @@ impl DaemonCore {
                 let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                 guard.enrollment = None;
                 guard.discovered_wearables.clear();
+                guard.active_auth_reply = None;
                 Ok(json!({ "ok": true }))
             }
             "wearable.enroll_auth_response" => {
-                let _parsed: EnrollAuthResponseParams =
+                let parsed: EnrollAuthResponseParams =
                     serde_json::from_value(params).map_err(|e| {
                         ipc_err(
                             error_codes::INVALID_PARAMS,
                             format!("invalid wearable.enroll_auth_response params: {e}"),
                         )
                     })?;
+                let reply_tx = {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    guard.active_auth_reply.take()
+                };
+                if let Some(tx) = reply_tx {
+                    let _ = tx.send(parsed.into());
+                }
                 Ok(json!({ "ok": true }))
             }
             _ => Err(ipc_err(
@@ -1387,7 +1415,30 @@ impl DaemonCore {
             );
             guard.enrollment = None;
             guard.discovered_wearables.clear();
+            guard.active_auth_reply = None;
         }
+    }
+
+    /// Triggers an interactive Agent1 pairing prompt pushed over IPC for testing or BlueZ bridging.
+    pub fn trigger_pairing_prompt(
+        &self,
+        prompt: PairingPrompt,
+    ) -> tokio::sync::oneshot::Receiver<EnrollAuthReply> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let devices = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            guard.active_auth_reply = Some(tx);
+            guard.discovered_wearables.clone()
+        };
+        let event = EnrollmentUpdateEvent {
+            devices,
+            pairing_prompt: Some(prompt),
+            remaining_sec: Some(30),
+        };
+        if let Ok(v) = serde_json::to_value(event) {
+            self.broker.publish_control("EnrollmentUpdate", v);
+        }
+        rx
     }
 
     /// Records a live `HrSampleEvent` into the 30-minute ring buffer and pushes `HrSample`.

@@ -272,7 +272,9 @@ async fn test_cli_cancel_and_snooze_commands_e2e() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Cancel,
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Cancel),
     };
     let code = execute_cli(cli_cancel, &env, &mut stdout, &mut stderr).await;
     assert_eq!(code, ExitCode::PreconditionConflict);
@@ -287,9 +289,11 @@ async fn test_cli_cancel_and_snooze_commands_e2e() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::TestTrigger {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::TestTrigger {
             grace_sec: Some(25),
-        },
+        }),
     };
     let code = execute_cli(cli_test_trig, &env, &mut stdout, &mut stderr).await;
     assert_eq!(code, ExitCode::Success);
@@ -306,7 +310,9 @@ async fn test_cli_cancel_and_snooze_commands_e2e() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Cancel,
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Cancel),
     };
     let code = execute_cli(cli_cancel_ok, &env, &mut stdout, &mut stderr).await;
     assert_eq!(code, ExitCode::Success);
@@ -323,7 +329,9 @@ async fn test_cli_cancel_and_snooze_commands_e2e() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::TestTrigger { grace_sec: None },
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::TestTrigger { grace_sec: None }),
     };
     let code = execute_cli(cli_test_trig2, &env, &mut stdout, &mut stderr).await;
     assert_eq!(code, ExitCode::Success);
@@ -337,9 +345,11 @@ async fn test_cli_cancel_and_snooze_commands_e2e() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Snooze {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Snooze {
             duration: Some("45m".to_string()),
-        },
+        }),
     };
     let code = execute_cli(cli_snooze, &env, &mut stdout, &mut stderr).await;
     assert_eq!(code, ExitCode::Success);

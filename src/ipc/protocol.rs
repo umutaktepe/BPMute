@@ -186,7 +186,7 @@ pub enum PauseMode {
 }
 
 /// Parameters accepted by `monitor.pause`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PauseParams {
     pub mode: Option<PauseMode>,
@@ -530,10 +530,48 @@ pub struct EnrollSelectParams {
 }
 
 /// Parameters for `wearable.enroll_auth_response`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnrollAuthResponseParams {
     pub confirmed: Option<bool>,
     pub passkey: Option<u32>,
     pub pincode: Option<String>,
+}
+
+/// Interactive Agent1 pairing prompt bridged over IPC (ADR-0002, ADR-0003).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PairingPrompt {
+    Confirmation { passkey: u32, device: String },
+    Passkey { device: String },
+    PinCode { device: String },
+}
+
+/// Control event payload pushed as `EnrollmentUpdate` during active wearable discovery.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollmentUpdateEvent {
+    #[serde(default)]
+    pub devices: Vec<DiscoveredWearable>,
+    #[serde(default)]
+    pub pairing_prompt: Option<PairingPrompt>,
+    #[serde(default)]
+    pub remaining_sec: Option<u32>,
+}
+
+/// Reply to an interactive Agent1 pairing prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollAuthReply {
+    pub confirmed: Option<bool>,
+    pub passkey: Option<u32>,
+    pub pincode: Option<String>,
+}
+
+impl From<EnrollAuthResponseParams> for EnrollAuthReply {
+    fn from(p: EnrollAuthResponseParams) -> Self {
+        Self {
+            confirmed: p.confirmed,
+            passkey: p.passkey,
+            pincode: p.pincode,
+        }
+    }
 }

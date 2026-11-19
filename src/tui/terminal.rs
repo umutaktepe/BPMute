@@ -1,0 +1,171 @@
+use std::io::{self, stdout};
+use std::panic;
+use std::time::Duration;
+
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use futures_util::StreamExt;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use tokio::sync::{mpsc, watch};
+
+use super::app::TuiApp;
+use super::client::TuiIpcBridge;
+use super::event::{TuiCommand, TuiEvent};
+use crate::exit_code::ExitCode;
+use crate::paths::{EnvSource, ResolvedPaths};
+
+pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
+    paths: ResolvedPaths,
+    env: &dyn EnvSource,
+    no_mouse: bool,
+    ascii: bool,
+    _stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> ExitCode {
+    // Verify terminal interactive environment
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal()
+        || std::env::var_os("BPMUTE_NON_INTERACTIVE").is_some()
+        || std::env::var_os("CARGO_MANIFEST_DIR").is_some()
+    {
+        let _ = writeln!(
+            stderr,
+            "error: interactive terminal required for TUI (try 'bpmute status' or 'bpmute --help')"
+        );
+        return ExitCode::UsageOrConfigError;
+    }
+
+    let no_color = env.get("NO_COLOR").is_some_and(|v| !v.trim().is_empty());
+    let mut app = TuiApp::new(no_mouse, ascii, no_color);
+
+    // Terminal setup
+    if let Err(err) = enable_raw_mode() {
+        let _ = writeln!(stderr, "error: failed to enable terminal raw mode: {err}");
+        return ExitCode::RuntimeError;
+    }
+
+    let mut out = stdout();
+    if let Err(err) = execute!(out, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        let _ = writeln!(stderr, "error: failed to enter alternate screen: {err}");
+        return ExitCode::RuntimeError;
+    }
+
+    if !no_mouse {
+        let _ = execute!(out, EnableMouseCapture);
+    }
+
+    // Install panic hook to cleanly restore terminal
+    let orig_hook = panic::take_hook();
+    let panic_no_mouse = no_mouse;
+    panic::set_hook(Box::new(move |panic_info| {
+        let mut out = stdout();
+        if !panic_no_mouse {
+            let _ = execute!(out, DisableMouseCapture);
+        }
+        let _ = execute!(out, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        orig_hook(panic_info);
+    }));
+
+    let backend = CrosstermBackend::new(out);
+    let mut terminal = match Terminal::new(backend) {
+        Ok(t) => t,
+        Err(err) => {
+            restore_terminal(no_mouse);
+            let _ = writeln!(
+                stderr,
+                "error: failed to initialize ratatui terminal: {err}"
+            );
+            return ExitCode::RuntimeError;
+        }
+    };
+
+    // IPC client setup
+    let (event_tx, mut event_rx) = mpsc::channel::<TuiEvent>(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<TuiCommand>(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let bridge = TuiIpcBridge::new(
+        paths.socket_path.clone(),
+        event_tx.clone(),
+        cmd_rx,
+        shutdown_rx,
+    );
+    let bridge_handle = tokio::spawn(bridge.run());
+
+    // Event streams
+    let mut reader = EventStream::new();
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
+
+    // Initial render
+    let _ = terminal.draw(|f| {
+        app.render(f.area(), f.buffer_mut());
+    });
+
+    while !app.should_quit {
+        tokio::select! {
+            _ = tick_interval.tick() => {
+                let cmd = app.handle_event(TuiEvent::Tick);
+                if let Some(c) = cmd {
+                    let _ = cmd_tx.send(c).await;
+                }
+            }
+            crossterm_event = reader.next() => {
+                match crossterm_event {
+                    Some(Ok(CrosstermEvent::Key(key))) => {
+                        let cmd = app.handle_event(TuiEvent::Key(key));
+                        if let Some(c) = cmd {
+                            let _ = cmd_tx.send(c).await;
+                        }
+                    }
+                    Some(Ok(CrosstermEvent::Mouse(mouse))) => {
+                        let cmd = app.handle_event(TuiEvent::Mouse(mouse));
+                        if let Some(c) = cmd {
+                            let _ = cmd_tx.send(c).await;
+                        }
+                    }
+                    Some(Ok(CrosstermEvent::Resize(w, h))) => {
+                        let cmd = app.handle_event(TuiEvent::Resize(w, h));
+                        if let Some(c) = cmd {
+                            let _ = cmd_tx.send(c).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(tui_event) = event_rx.recv() => {
+                let cmd = app.handle_event(tui_event);
+                if let Some(c) = cmd {
+                    let _ = cmd_tx.send(c).await;
+                }
+            }
+        }
+
+        let _ = terminal.draw(|f| {
+            app.render(f.area(), f.buffer_mut());
+        });
+    }
+
+    // Teardown
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_handle.await;
+
+    restore_terminal(no_mouse);
+    ExitCode::Success
+}
+
+fn restore_terminal(no_mouse: bool) {
+    let mut out = stdout();
+    if !no_mouse {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+    let _ = execute!(out, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}

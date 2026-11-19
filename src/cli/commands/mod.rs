@@ -52,27 +52,30 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
     let cli_overrides = build_cli_overrides(&cli, None);
 
     match cli.command {
-        Command::Daemon { dry_run } => {
+        None => crate::tui::run_tui(paths, env, cli.no_mouse, cli.ascii, stdout, stderr).await,
+        Some(Command::Daemon { dry_run }) => {
             let daemon_overrides = build_cli_overrides(&cli, dry_run.then_some(true));
             run_daemon(paths, env, daemon_overrides, stderr).await
         }
-        Command::Status { json } => run_status(&paths, json, stdout, stderr).await,
-        Command::Pause { target } => run_pause(&paths, target.as_deref(), stdout, stderr).await,
-        Command::Resume => run_resume(&paths, stdout, stderr).await,
-        Command::Cancel => run_cancel(&paths.socket_path, stdout, stderr).await,
-        Command::Snooze { duration } => {
+        Some(Command::Status { json }) => run_status(&paths, json, stdout, stderr).await,
+        Some(Command::Pause { target }) => {
+            run_pause(&paths, target.as_deref(), stdout, stderr).await
+        }
+        Some(Command::Resume) => run_resume(&paths, stdout, stderr).await,
+        Some(Command::Cancel) => run_cancel(&paths.socket_path, stdout, stderr).await,
+        Some(Command::Snooze { duration }) => {
             run_snooze(&paths.socket_path, duration.as_deref(), stdout, stderr).await
         }
-        Command::TestTrigger { grace_sec } => {
+        Some(Command::TestTrigger { grace_sec }) => {
             run_test_trigger(&paths.socket_path, grace_sec, stdout, stderr).await
         }
-        Command::Replay {
+        Some(Command::Replay {
             file,
             session,
             preset,
             cold_start,
             json,
-        } => run_replay(
+        }) => run_replay(
             ReplayCliArgs {
                 file: file.as_deref(),
                 session: session.as_deref(),
@@ -86,14 +89,16 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
             stdout,
             stderr,
         ),
-        Command::Sessions { action } => run_sessions(action, &paths, stdout, stderr).await,
-        Command::Calibration { action } => run_calibration(action, &paths, stdout, stderr).await,
-        Command::Data { action } => run_data(action, &paths, stdout, stderr).await,
-        Command::Wearables { action } => run_wearables(action, &paths, stdout, stderr).await,
-        Command::Enroll { address, alias } => {
+        Some(Command::Sessions { action }) => run_sessions(action, &paths, stdout, stderr).await,
+        Some(Command::Calibration { action }) => {
+            run_calibration(action, &paths, stdout, stderr).await
+        }
+        Some(Command::Data { action }) => run_data(action, &paths, stdout, stderr).await,
+        Some(Command::Wearables { action }) => run_wearables(action, &paths, stdout, stderr).await,
+        Some(Command::Enroll { address, alias }) => {
             run_enroll(address.as_deref(), alias.as_deref(), &paths, stdout, stderr).await
         }
-        Command::Config { action } => {
+        Some(Command::Config { action }) => {
             run_config(action, &paths, env, &cli_overrides, stdout, stderr).await
         }
     }

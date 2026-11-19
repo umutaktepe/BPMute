@@ -12,3 +12,4 @@ pub mod paths;
 pub mod replay;
 pub mod sleep_engine;
 pub mod storage;
+pub mod tui;

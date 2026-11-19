@@ -69,9 +69,11 @@ async fn wearables_cli_offline_flock_parity_list_rename_unenroll() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::List { json: true },
-        },
+        }),
     };
     let mut stdout = Cursor::new(Vec::new());
     let mut stderr = Cursor::new(Vec::new());
@@ -94,12 +96,14 @@ async fn wearables_cli_offline_flock_parity_list_rename_unenroll() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::Rename {
                 id: prefix.to_string(),
                 alias: "Renamed Strap".to_string(),
             },
-        },
+        }),
     };
     let mut stdout2 = Cursor::new(Vec::new());
     let mut stderr2 = Cursor::new(Vec::new());
@@ -121,11 +125,13 @@ async fn wearables_cli_offline_flock_parity_list_rename_unenroll() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::Connect {
                 id: prefix.to_string(),
             },
-        },
+        }),
     };
     let mut stdout3 = Cursor::new(Vec::new());
     let mut stderr3 = Cursor::new(Vec::new());
@@ -140,13 +146,15 @@ async fn wearables_cli_offline_flock_parity_list_rename_unenroll() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::Unenroll {
                 id: prefix.to_string(),
                 forget_bluez: false,
                 delete_sessions: false,
             },
-        },
+        }),
     };
     let mut stdout4 = Cursor::new(Vec::new());
     let mut stderr4 = Cursor::new(Vec::new());
@@ -187,9 +195,11 @@ async fn wearables_cli_online_end_to_end() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::List { json: false },
-        },
+        }),
     };
     let mut stdout = Cursor::new(Vec::new());
     let mut stderr = Cursor::new(Vec::new());
@@ -206,10 +216,12 @@ async fn wearables_cli_online_end_to_end() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Enroll {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Enroll {
             address: Some("C0:00:11:22:33:44".to_string()),
             alias: Some("Live Strap".to_string()),
-        },
+        }),
     };
     let mut stdout2 = Cursor::new(Vec::new());
     let mut stderr2 = Cursor::new(Vec::new());
@@ -226,9 +238,11 @@ async fn wearables_cli_online_end_to_end() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::List { json: true },
-        },
+        }),
     };
     let mut stdout3 = Cursor::new(Vec::new());
     let mut stderr3 = Cursor::new(Vec::new());
@@ -249,9 +263,11 @@ async fn wearables_cli_online_end_to_end() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::Connect { id: w_id.clone() },
-        },
+        }),
     };
     let mut stdout4 = Cursor::new(Vec::new());
     let mut stderr4 = Cursor::new(Vec::new());
@@ -266,12 +282,14 @@ async fn wearables_cli_online_end_to_end() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::Rename {
                 id: w_id.clone(),
                 alias: "Updated Live Strap".to_string(),
             },
-        },
+        }),
     };
     let mut stdout5 = Cursor::new(Vec::new());
     let mut stderr5 = Cursor::new(Vec::new());
@@ -286,13 +304,15 @@ async fn wearables_cli_online_end_to_end() {
         log_level: None,
         log_format: None,
         log_biometrics: false,
-        command: Command::Wearables {
+        no_mouse: false,
+        ascii: false,
+        command: Some(Command::Wearables {
             action: WearablesCommand::Unenroll {
                 id: w_id.clone(),
                 forget_bluez: false,
                 delete_sessions: false,
             },
-        },
+        }),
     };
     let mut stdout6 = Cursor::new(Vec::new());
     let mut stderr6 = Cursor::new(Vec::new());
