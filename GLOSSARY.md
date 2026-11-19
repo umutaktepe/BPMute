@@ -47,3 +47,11 @@ _Avoid_: Trigger, automation, macro, action list
 **Snooze**:
 A temporary user-initiated suppression of sleep triggers during a Grace Period that pauses automation without recording a false-positive calibration penalty.
 _Avoid_: Postpone, mute, cancel (reserve cancellation for waking false positives)
+
+**Calibration Boundary**:
+A reversible point-in-time marker in the calibration ledger that resets personal physiological calibration to `Cold Start` (folding only subsequent Monitoring Sessions) while preserving historical sessions and per-Wearable signal floors.
+_Avoid_: Soft reset, reset epoch, baseline wipe, cutoff
+
+**Ledger Bundle**:
+A portable, schema-versioned export of a user's Monitoring Sessions, feedback verdicts, Calibration Boundaries, and optionally Epochs and enrolled Wearables used for cross-machine migration and deterministic calibration recomputation.
+_Avoid_: Dump, snapshot, archive
