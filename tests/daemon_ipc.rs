@@ -65,7 +65,7 @@ async fn daemon_socket_permissions_ping_status_and_framing_guards() {
     assert_eq!(dir_mode, 0o700);
     assert_eq!(sock_mode, 0o600);
     assert!(
-        !paths.config_file.exists(),
+        !paths.config_file.try_exists().unwrap(),
         "startup must not create config.toml"
     );
 
@@ -151,7 +151,10 @@ async fn daemon_socket_permissions_ping_status_and_framing_guards() {
     assert_eq!(eof, 0, "oversized frame should close connection");
 
     daemon.shutdown().await;
-    assert!(!paths.socket_path.exists(), "socket should be cleaned up");
+    assert!(
+        !paths.socket_path.try_exists().unwrap(),
+        "socket should be cleaned up"
+    );
 }
 
 #[tokio::test(start_paused = true)]

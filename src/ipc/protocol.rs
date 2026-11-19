@@ -1,3 +1,6 @@
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -12,18 +15,95 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum NDJSON line length in bytes (`1 MiB`).
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 
+/// Standardized IPC error code identifiers (ADR-0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IpcErrorCode {
+    UnsupportedVersion,
+    FrameTooLarge,
+    InvalidJson,
+    UnknownOp,
+    InvalidParams,
+    InvalidConfig,
+    ValidationError,
+    PreconditionFailed,
+    NotFound,
+    PermissionDenied,
+    InternalError,
+    Conflict,
+    BackendRefused,
+    EnrollmentInProgress,
+}
+
+impl IpcErrorCode {
+    /// Returns the canonical SCREAMING_SNAKE_CASE identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
+            Self::FrameTooLarge => "FRAME_TOO_LARGE",
+            Self::InvalidJson => "INVALID_JSON",
+            Self::UnknownOp => "UNKNOWN_OP",
+            Self::InvalidParams => "INVALID_PARAMS",
+            Self::InvalidConfig => "INVALID_CONFIG",
+            Self::ValidationError => "VALIDATION_ERROR",
+            Self::PreconditionFailed => "PRECONDITION_FAILED",
+            Self::NotFound => "NOT_FOUND",
+            Self::PermissionDenied => "PERMISSION_DENIED",
+            Self::InternalError => "INTERNAL_ERROR",
+            Self::Conflict => "CONFLICT",
+            Self::BackendRefused => "BACKEND_REFUSED",
+            Self::EnrollmentInProgress => "ENROLLMENT_IN_PROGRESS",
+        }
+    }
+}
+
+impl fmt::Display for IpcErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IpcErrorCode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "UNSUPPORTED_VERSION" => Ok(Self::UnsupportedVersion),
+            "FRAME_TOO_LARGE" => Ok(Self::FrameTooLarge),
+            "INVALID_JSON" => Ok(Self::InvalidJson),
+            "UNKNOWN_OP" => Ok(Self::UnknownOp),
+            "INVALID_PARAMS" => Ok(Self::InvalidParams),
+            "INVALID_CONFIG" => Ok(Self::InvalidConfig),
+            "VALIDATION_ERROR" => Ok(Self::ValidationError),
+            "PRECONDITION_FAILED" => Ok(Self::PreconditionFailed),
+            "NOT_FOUND" => Ok(Self::NotFound),
+            "PERMISSION_DENIED" => Ok(Self::PermissionDenied),
+            "INTERNAL_ERROR" => Ok(Self::InternalError),
+            "CONFLICT" => Ok(Self::Conflict),
+            "BACKEND_REFUSED" => Ok(Self::BackendRefused),
+            "ENROLLMENT_IN_PROGRESS" => Ok(Self::EnrollmentInProgress),
+            other => Err(format!("unknown IPC error code `{other}`")),
+        }
+    }
+}
+
 pub mod error_codes {
-    pub const UNSUPPORTED_VERSION: &str = "UNSUPPORTED_VERSION";
-    pub const FRAME_TOO_LARGE: &str = "FRAME_TOO_LARGE";
-    pub const INVALID_JSON: &str = "INVALID_JSON";
-    pub const UNKNOWN_OP: &str = "UNKNOWN_OP";
-    pub const INVALID_PARAMS: &str = "INVALID_PARAMS";
-    pub const INVALID_CONFIG: &str = "INVALID_CONFIG";
-    pub const VALIDATION_ERROR: &str = "VALIDATION_ERROR";
-    pub const PRECONDITION_FAILED: &str = "PRECONDITION_FAILED";
-    pub const NOT_FOUND: &str = "NOT_FOUND";
-    pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
-    pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+    use super::IpcErrorCode;
+
+    pub const UNSUPPORTED_VERSION: &str = IpcErrorCode::UnsupportedVersion.as_str();
+    pub const FRAME_TOO_LARGE: &str = IpcErrorCode::FrameTooLarge.as_str();
+    pub const INVALID_JSON: &str = IpcErrorCode::InvalidJson.as_str();
+    pub const UNKNOWN_OP: &str = IpcErrorCode::UnknownOp.as_str();
+    pub const INVALID_PARAMS: &str = IpcErrorCode::InvalidParams.as_str();
+    pub const INVALID_CONFIG: &str = IpcErrorCode::InvalidConfig.as_str();
+    pub const VALIDATION_ERROR: &str = IpcErrorCode::ValidationError.as_str();
+    pub const PRECONDITION_FAILED: &str = IpcErrorCode::PreconditionFailed.as_str();
+    pub const NOT_FOUND: &str = IpcErrorCode::NotFound.as_str();
+    pub const PERMISSION_DENIED: &str = IpcErrorCode::PermissionDenied.as_str();
+    pub const INTERNAL_ERROR: &str = IpcErrorCode::InternalError.as_str();
+    pub const CONFLICT: &str = IpcErrorCode::Conflict.as_str();
+    pub const BACKEND_REFUSED: &str = IpcErrorCode::BackendRefused.as_str();
+    pub const ENROLLMENT_IN_PROGRESS: &str = IpcErrorCode::EnrollmentInProgress.as_str();
 }
 
 /// Incoming client NDJSON request envelope.

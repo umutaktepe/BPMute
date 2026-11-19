@@ -95,7 +95,7 @@ impl LoadedConfig {
 
 /// Initializes `config.toml` with `0700`/`0600` permissions using the commented template.
 pub fn init_config_file(path: &Path, force: bool) -> Result<(), ConfigError> {
-    if path.exists() && !force {
+    if path.try_exists().map_err(ConfigError::Io)? && !force {
         return Err(ConfigError::AlreadyExists(path.to_path_buf()));
     }
     write_private_file_atomic(path, DEFAULT_CONFIG_TEMPLATE.as_bytes())?;

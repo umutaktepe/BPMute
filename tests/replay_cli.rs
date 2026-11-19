@@ -257,9 +257,9 @@ async fn replay_csv_and_jsonl_matches_direct_engine_parity_and_stays_read_only()
     assert!(resp_conf < cons_conf);
 
     // 3) Zero XDG filesystem mutation during read-only replay
-    assert!(!temp.path().join("cfg").exists());
-    assert!(!temp.path().join("data").exists());
-    assert!(!temp.path().join("run").exists());
+    assert!(!temp.path().join("cfg").try_exists().unwrap());
+    assert!(!temp.path().join("data").try_exists().unwrap());
+    assert!(!temp.path().join("run").try_exists().unwrap());
 
     // 4) Quoted JSON array rr_ms + contact_status=0b10 + config preset override behavior
     let cfg_dir = temp.path().join("cfg/bpmute");

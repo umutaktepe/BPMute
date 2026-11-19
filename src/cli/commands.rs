@@ -1008,11 +1008,22 @@ fn run_config_edit<WOut: Write, WErr: Write>(
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> ExitCode {
-    if !paths.config_file.exists()
-        && let Err(err) = init_config_file(&paths.config_file, false)
-    {
-        let _ = writeln!(stderr, "error: failed to initialize config file: {err}");
-        return err.exit_code();
+    match paths.config_file.try_exists() {
+        Ok(false) => {
+            if let Err(err) = init_config_file(&paths.config_file, false) {
+                let _ = writeln!(stderr, "error: failed to initialize config file: {err}");
+                return err.exit_code();
+            }
+        }
+        Ok(true) => {}
+        Err(err) => {
+            let _ = writeln!(stderr, "error: failed to inspect config file: {err}");
+            return if err.kind() == io::ErrorKind::PermissionDenied {
+                ExitCode::PermissionOrBackendRefusal
+            } else {
+                ExitCode::RuntimeError
+            };
+        }
     }
 
     let editor_raw = env

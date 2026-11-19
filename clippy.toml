@@ -3,3 +3,8 @@ await-holding-invalid-types = [
   { path = "std::io::StderrLock", reason = "Holding StderrLock across .await deadlocks Tokio workers logging via tracing to stderr" },
   { path = "std::io::StdinLock", reason = "Holding StdinLock across .await blocks concurrent stdin access" },
 ]
+
+disallowed-methods = [
+  { path = "std::path::Path::exists", reason = "Path::exists() swallows EACCES into false (violating ADR-0009 exit code 5); use Path::try_exists() instead" },
+]
+

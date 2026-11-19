@@ -72,7 +72,9 @@ async fn run_inproc_cli(args: &[&str], env: &MapEnv) -> (ExitCode, String, Strin
 
 fn wait_for_socket(socket_path: &Path) {
     for _ in 0..100 {
-        if socket_path.exists() && std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+        if socket_path.try_exists().unwrap_or(false)
+            && std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+        {
             return;
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -284,7 +286,7 @@ async fn real_daemon_cli_config_edit_and_sighup_live_reload_without_dropping_sub
     wait_for_socket(&socket_path);
 
     // Config file must NOT exist on startup.
-    assert!(!config_path.exists());
+    assert!(!config_path.try_exists().unwrap());
 
     // `bpmute status --json` online check.
     let status_out = base_cli_cmd(&temp)
@@ -457,7 +459,7 @@ async fn real_daemon_cli_config_edit_and_sighup_live_reload_without_dropping_sub
     let mut child = daemon_guard.into_inner();
     let status = child.wait().unwrap();
     assert!(status.success() || status.code() == Some(0));
-    assert!(!socket_path.exists());
+    assert!(!socket_path.try_exists().unwrap());
 }
 
 #[test]

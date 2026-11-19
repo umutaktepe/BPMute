@@ -687,18 +687,18 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
     assert_eq!(code, ExitCode::Success, "stderr: {err}");
     let empty_list: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(empty_list["total_count"], 0);
-    assert!(!db_path.exists());
+    assert!(!db_path.try_exists().unwrap());
 
     let (code, out, err) =
         run_inproc_cli(&["bpmute", "calibration", "status", "--json"], &env).await;
     assert_eq!(code, ExitCode::Success, "stderr: {err}");
     let empty_cal: CalibrationState = serde_json::from_str(&out).unwrap();
     assert_eq!(empty_cal.maturity, CalibrationMaturity::ColdStart);
-    assert!(!db_path.exists());
+    assert!(!db_path.try_exists().unwrap());
 
     let (code, _, _) = run_inproc_cli(&["bpmute", "sessions", "show", "missing"], &env).await;
     assert_eq!(code, ExitCode::RuntimeError);
-    assert!(!db_path.exists());
+    assert!(!db_path.try_exists().unwrap());
 
     // 2) Real binary CLI validation & semantic exit codes (2, 4, 1)
     assert_eq!(

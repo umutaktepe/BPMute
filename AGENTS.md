@@ -12,6 +12,10 @@ Issues and specs are tracked in GitHub Issues (`umutaktepe/BPMute`) via the `gh`
 
 Single-context layout (`GLOSSARY.md` and `docs/adr/` at the repo root). See `docs/agents/domain.md`.
 
+### Testing
+
+Testing conventions, concurrency pitfalls, and virtual-time execution. See `docs/agents/testing.md`.
+
 ## Verification
 
-Run `./scripts/check.sh` before finishing any change.
+Wrap iterative test runs in `timeout 30` (or `./scripts/test.sh`); run `./scripts/check.sh` before finishing any change.

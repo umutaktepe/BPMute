@@ -1,3 +1,5 @@
+use crate::ipc::protocol::error_codes;
+
 /// Semantic CLI exit codes defined in ADR-0009.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,11 +27,15 @@ impl ExitCode {
     /// Maps an IPC error code string to the corresponding semantic CLI exit code.
     pub fn from_ipc_error_code(code: &str) -> Self {
         match code {
-            "INVALID_PARAMS" | "INVALID_CONFIG" | "VALIDATION_ERROR" => Self::UsageOrConfigError,
-            "PRECONDITION_FAILED" | "CONFLICT" | "ENROLLMENT_IN_PROGRESS" => {
-                Self::PreconditionConflict
+            error_codes::INVALID_PARAMS
+            | error_codes::INVALID_CONFIG
+            | error_codes::VALIDATION_ERROR => Self::UsageOrConfigError,
+            error_codes::PRECONDITION_FAILED
+            | error_codes::CONFLICT
+            | error_codes::ENROLLMENT_IN_PROGRESS => Self::PreconditionConflict,
+            error_codes::PERMISSION_DENIED | error_codes::BACKEND_REFUSED => {
+                Self::PermissionOrBackendRefusal
             }
-            "PERMISSION_DENIED" | "BACKEND_REFUSED" => Self::PermissionOrBackendRefusal,
             _ => Self::RuntimeError,
         }
     }

@@ -22,8 +22,8 @@ fn missing_config_uses_defaults_without_creating_file_or_dir() {
         .expect("missing config should load defaults");
 
     assert!(!loaded.file_present);
-    assert!(!config_path.exists());
-    assert!(!config_path.parent().unwrap().exists());
+    assert!(!config_path.try_exists().unwrap());
+    assert!(!config_path.parent().unwrap().try_exists().unwrap());
 
     assert_eq!(loaded.config.schema_version, 1);
     assert_eq!(loaded.config.detection.sensitivity, Sensitivity::Balanced);
@@ -51,7 +51,7 @@ fn init_config_creates_0700_dir_and_0600_file_and_respects_force() {
     let config_path = config_dir.join("config.toml");
 
     init_config_file(&config_path, false).expect("initial config init succeeds");
-    assert!(config_path.exists());
+    assert!(config_path.try_exists().unwrap());
 
     let dir_mode = fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
     let file_mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
