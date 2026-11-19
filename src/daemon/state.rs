@@ -439,9 +439,24 @@ impl DaemonCore {
                             format!("invalid wearable.connect params: {e}"),
                         )
                     })?;
-                Ok(
-                    json!({ "ok": true, "message": format!("connection requested for {}", parsed.id) }),
-                )
+                let list = self
+                    .persistence
+                    .list_wearables()
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                let w = list
+                    .into_iter()
+                    .find(|w| w.id == parsed.id || w.id.starts_with(&parsed.id))
+                    .ok_or_else(|| {
+                        ipc_err(
+                            error_codes::NOT_FOUND,
+                            format!("wearable '{}' not found", parsed.id),
+                        )
+                    })?;
+                if let Some(conn) = try_system_conn().await {
+                    let _ = crate::bluetooth::operations::connect_device(&conn, &w.mac).await;
+                }
+                Ok(json!({ "ok": true, "message": format!("connection requested for {}", w.id) }))
             }
             "wearable.unenroll" => {
                 let parsed: WearableUnenrollParams =
@@ -461,6 +476,16 @@ impl DaemonCore {
                     guard.wearable_statuses.remove(&unenrolled.mac);
                     guard.wearable_batteries.remove(&unenrolled.mac);
                 }
+                if parsed.forget_bluez
+                    && let Some(conn) = try_system_conn().await
+                {
+                    let _ = crate::bluetooth::operations::remove_device(
+                        &conn,
+                        "/org/bluez/hci0",
+                        &unenrolled.mac,
+                    )
+                    .await;
+                }
                 Ok(json!({ "wearable": unenrolled }))
             }
             "wearable.enroll_start" => {
@@ -473,6 +498,18 @@ impl DaemonCore {
                 let now_ms = self.clock.now_utc().timestamp_millis();
                 let timeout_sec = parsed.timeout_sec.unwrap_or(30).clamp(5, 120);
                 let timeout_ms = (timeout_sec as i64) * 1000;
+
+                if let Some(conn) = try_system_conn().await {
+                    let _ =
+                        crate::bluetooth::operations::start_le_discovery(&conn, "/org/bluez/hci0")
+                            .await;
+                    if let Ok(discovered) =
+                        crate::bluetooth::operations::list_heart_rate_devices(&conn).await
+                    {
+                        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                        guard.discovered_wearables = discovered;
+                    }
+                }
 
                 let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                 if let Some(ref lock) = guard.enrollment {
@@ -490,7 +527,7 @@ impl DaemonCore {
                     timeout_ms,
                 });
                 let devices = guard.discovered_wearables.clone();
-                Ok(json!({ "devices": devices }))
+                Ok(json!({ "devices": devices, "wearables": devices }))
             }
             "wearable.enroll_select" => {
                 let parsed: EnrollSelectParams = serde_json::from_value(params).map_err(|e| {
@@ -500,7 +537,8 @@ impl DaemonCore {
                     )
                 })?;
                 let now_ms = self.clock.now_utc().timestamp_millis();
-                {
+                let norm_mac = parsed.address.trim().to_ascii_uppercase();
+                let (discovered, is_rpa, address_type, advertised_name) = {
                     let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                     match guard.enrollment {
                         Some(ref lock) if lock.client_id == client_id => {
@@ -519,21 +557,48 @@ impl DaemonCore {
                             ));
                         }
                     }
-                }
-                let norm_mac = parsed.address.trim().to_ascii_uppercase();
-                let is_rpa =
-                    crate::bluetooth::dbus::is_resolvable_private_address(&norm_mac, "random");
+                    let discovered = guard
+                        .discovered_wearables
+                        .iter()
+                        .find(|d| d.address.eq_ignore_ascii_case(&norm_mac))
+                        .cloned();
+
+                    let address_type = discovered
+                        .as_ref()
+                        .map(|d| d.address_type.clone())
+                        .unwrap_or_else(|| {
+                            if crate::bluetooth::dbus::is_resolvable_private_address(
+                                &norm_mac, "random",
+                            ) {
+                                "random".to_string()
+                            } else {
+                                "public".to_string()
+                            }
+                        });
+                    let is_rpa = crate::bluetooth::dbus::is_resolvable_private_address(
+                        &norm_mac,
+                        &address_type,
+                    );
+                    let advertised_name = discovered.as_ref().and_then(|d| d.name.clone());
+                    (discovered, is_rpa, address_type, advertised_name)
+                };
+
                 let mut warnings = Vec::new();
-                let hints: Vec<String> = Vec::new();
+                let mut hints = Vec::new();
                 if is_rpa {
                     warnings.push("Wearable uses a rotating Resolvable Private Address (RPA). Bonding ensures auto-reconnection persists.".to_string());
                 }
+                if let Some(ref d) = discovered
+                    && crate::bluetooth::dbus::is_dual_mode_bredr_candidate(&d.uuids)
+                {
+                    hints.push("Dual-mode BR/EDR wearable detected; classic profiles (A2DP/HFP) may share this adapter.".to_string());
+                }
 
                 let desc = WearableDescriptor {
-                    mac: norm_mac,
-                    address_type: "random".to_string(),
+                    mac: norm_mac.clone(),
+                    address_type,
                     alias: parsed.alias,
-                    advertised_name: None,
+                    advertised_name,
                     supports_rr: false,
                     supports_contact: true,
                 };
@@ -553,6 +618,17 @@ impl DaemonCore {
                         "failed to load newly enrolled wearable",
                     )
                 })?;
+
+                if let Some(conn) = try_system_conn().await {
+                    let _ =
+                        crate::bluetooth::operations::stop_le_discovery(&conn, "/org/bluez/hci0")
+                            .await;
+                    let _ = crate::bluetooth::operations::bond_and_trust_device(
+                        &conn, &norm_mac, is_rpa,
+                    )
+                    .await;
+                }
+
                 Ok(json!({
                     "wearable": enrolled,
                     "warnings": warnings,
@@ -560,6 +636,11 @@ impl DaemonCore {
                 }))
             }
             "wearable.enroll_cancel" => {
+                if let Some(conn) = try_system_conn().await {
+                    let _ =
+                        crate::bluetooth::operations::stop_le_discovery(&conn, "/org/bluez/hci0")
+                            .await;
+                }
                 let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                 guard.enrollment = None;
                 guard.discovered_wearables.clear();
@@ -978,4 +1059,8 @@ fn upsert_alert(alerts: &mut Vec<DaemonAlert>, next: DaemonAlert) -> bool {
     }
     alerts.push(next);
     true
+}
+
+async fn try_system_conn() -> Option<zbus::Connection> {
+    zbus::connection::Builder::system().ok()?.build().await.ok()
 }

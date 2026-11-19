@@ -386,6 +386,8 @@ pub struct DiscoveredWearable {
     pub rssi: Option<i16>,
     pub paired: bool,
     pub already_enrolled: bool,
+    #[serde(default)]
+    pub uuids: Vec<String>,
 }
 
 /// Enrolled wearable status including live connectivity and battery percentage.

@@ -70,7 +70,8 @@ impl EnrollmentAgent {
     }
 
     fn display_pin_code(&self, device: OwnedObjectPath, pincode: &str) {
-        tracing::info!(device = %device.as_str(), pincode = %pincode, "BlueZ requested PIN display");
+        let masked_device = mask_device_path(device.as_str());
+        tracing::info!(device = %masked_device, pincode = %pincode, "BlueZ requested PIN display");
     }
 
     async fn request_passkey(&self, device: OwnedObjectPath) -> fdo::Result<u32> {
@@ -90,8 +91,9 @@ impl EnrollmentAgent {
     }
 
     fn display_passkey(&self, device: OwnedObjectPath, passkey: u32, entered: u16) {
+        let masked_device = mask_device_path(device.as_str());
         tracing::info!(
-            device = %device.as_str(),
+            device = %masked_device,
             passkey = passkey,
             entered = entered,
             "BlueZ requested passkey display"
@@ -137,5 +139,30 @@ impl EnrollmentAgent {
 
     fn cancel(&self) {
         tracing::debug!("BlueZ Agent1 cancelled pairing");
+    }
+}
+
+fn mask_device_path(path: &str) -> String {
+    if let Some(pos) = path.rfind("/dev_") {
+        let dev_part = &path[pos + 5..];
+        let mac_str = dev_part.replace('_', ":");
+        let masked = crate::logging::mask_mac(&mac_str);
+        format!("{}/dev_{}", &path[..pos], masked.replace(':', "_"))
+    } else {
+        crate::logging::mask_mac(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_device_path_redacts_mac_in_bluez_object_path() {
+        assert_eq!(
+            mask_device_path("/org/bluez/hci0/dev_12_34_56_78_9A_BC"),
+            "/org/bluez/hci0/dev_.._9A_BC"
+        );
+        assert_eq!(mask_device_path("12:34:56:78:9A:BC"), "..:9A:BC");
     }
 }

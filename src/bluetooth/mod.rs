@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod dbus;
+pub mod operations;
 pub mod packet;
 pub mod profile;
 pub mod service;

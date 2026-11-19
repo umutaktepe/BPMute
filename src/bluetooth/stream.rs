@@ -166,13 +166,7 @@ impl StreamTracker {
                 self.connected.insert(norm.clone());
 
                 if self.active_mac.is_none() {
-                    self.active_mac = Some(norm.clone());
-                    self.active_status = Some(StreamStatus::Connecting);
-                    actions.push(LifecycleAction::StatusTransition {
-                        mac: norm,
-                        status: StreamStatus::Connecting,
-                        ts_ms,
-                    });
+                    self.transition_status(&norm, StreamStatus::Connecting, ts_ms, &mut actions);
                 } else if self.active_mac.as_ref() != Some(&norm)
                     && !self.standby_macs.contains(&norm)
                 {
@@ -183,17 +177,7 @@ impl StreamTracker {
             StreamEvent::NotifyStarted { mac, ts_ms } => {
                 let norm = mac.to_ascii_uppercase();
                 if self.active_mac.as_ref() == Some(&norm) {
-                    self.active_status = Some(StreamStatus::Acquiring);
-                    self.acquiring_started_ts_ms = Some(ts_ms);
-                    self.last_valid_packet_ts_ms = None;
-                    self.last_any_packet_ts_ms = None;
-                    self.notifying_checked = false;
-
-                    actions.push(LifecycleAction::StatusTransition {
-                        mac: norm.clone(),
-                        status: StreamStatus::Acquiring,
-                        ts_ms,
-                    });
+                    self.transition_status(&norm, StreamStatus::Acquiring, ts_ms, &mut actions);
 
                     let name = self.wearable_name(&norm);
                     let battery = self.batteries.get(&norm).copied();
@@ -220,24 +204,24 @@ impl StreamTracker {
                 if is_valid {
                     self.last_valid_packet_ts_ms = Some(packet.ts_ms);
                     if self.active_status != Some(StreamStatus::Streaming) {
-                        self.active_status = Some(StreamStatus::Streaming);
-                        actions.push(LifecycleAction::StatusTransition {
-                            mac: norm,
-                            status: StreamStatus::Streaming,
-                            ts_ms: packet.ts_ms,
-                        });
+                        self.transition_status(
+                            &norm,
+                            StreamStatus::Streaming,
+                            packet.ts_ms,
+                            &mut actions,
+                        );
                     }
                 } else {
                     // Invalid reading (0 BPM or lost skin contact) -> SignalLost
                     if self.active_status == Some(StreamStatus::Streaming)
                         || self.active_status == Some(StreamStatus::Acquiring)
                     {
-                        self.active_status = Some(StreamStatus::SignalLost);
-                        actions.push(LifecycleAction::StatusTransition {
-                            mac: norm,
-                            status: StreamStatus::SignalLost,
-                            ts_ms: packet.ts_ms,
-                        });
+                        self.transition_status(
+                            &norm,
+                            StreamStatus::SignalLost,
+                            packet.ts_ms,
+                            &mut actions,
+                        );
                     }
                 }
             }
@@ -253,18 +237,7 @@ impl StreamTracker {
                 self.standby_macs.retain(|m| m != &norm);
 
                 if self.active_mac.as_ref() == Some(&norm) {
-                    self.active_mac = None;
-                    self.active_status = Some(StreamStatus::Disconnected);
-                    self.acquiring_started_ts_ms = None;
-                    self.last_valid_packet_ts_ms = None;
-                    self.last_any_packet_ts_ms = None;
-                    self.notifying_checked = false;
-
-                    actions.push(LifecycleAction::StatusTransition {
-                        mac: norm.clone(),
-                        status: StreamStatus::Disconnected,
-                        ts_ms,
-                    });
+                    self.transition_status(&norm, StreamStatus::Disconnected, ts_ms, &mut actions);
 
                     let name = self.wearable_name(&norm);
 
@@ -286,7 +259,7 @@ impl StreamTracker {
                             actions.push(LifecycleAction::AlertActionRequired {
                                 mac: norm.clone(),
                                 message: format!(
-                                    "Authentication failure for {name}; re-pair/re-enroll device"
+                                    "Authentication failure for {name}; re-pair/re-enroll Wearable"
                                 ),
                             });
                         }
@@ -295,7 +268,7 @@ impl StreamTracker {
                                 actions.push(LifecycleAction::AlertActionRequired {
                                     mac: norm.clone(),
                                     message: format!(
-                                        "{name} rejected GATT subscription (NotPermitted); enable Heart Rate Push or check device support"
+                                        "{name} rejected GATT subscription (NotPermitted); enable Heart Rate Push or check Wearable support"
                                     ),
                                 });
                             }
@@ -305,13 +278,12 @@ impl StreamTracker {
                     // Auto-promote standby wearable
                     if let Some(next_mac) = self.standby_macs.first().cloned() {
                         self.standby_macs.remove(0);
-                        self.active_mac = Some(next_mac.clone());
-                        self.active_status = Some(StreamStatus::Connecting);
-                        actions.push(LifecycleAction::StatusTransition {
-                            mac: next_mac.clone(),
-                            status: StreamStatus::Connecting,
+                        self.transition_status(
+                            &next_mac,
+                            StreamStatus::Connecting,
                             ts_ms,
-                        });
+                            &mut actions,
+                        );
                         actions.push(LifecycleAction::StartNotify { mac: next_mac });
                     }
                 }
@@ -340,12 +312,12 @@ impl StreamTracker {
                         if let Some(started) = self.acquiring_started_ts_ms
                             && ts_ms >= started + 20_000
                         {
-                            self.active_status = Some(StreamStatus::SignalLost);
-                            actions.push(LifecycleAction::StatusTransition {
-                                mac: active.clone(),
-                                status: StreamStatus::SignalLost,
+                            self.transition_status(
+                                active,
+                                StreamStatus::SignalLost,
                                 ts_ms,
-                            });
+                                &mut actions,
+                            );
                         }
                     }
                     Some(StreamStatus::Streaming) => {
@@ -355,12 +327,12 @@ impl StreamTracker {
                             .or(self.acquiring_started_ts_ms)
                             .unwrap_or(ts_ms);
                         if ts_ms >= last_ts + 10_000 {
-                            self.active_status = Some(StreamStatus::SignalLost);
-                            actions.push(LifecycleAction::StatusTransition {
-                                mac: active.clone(),
-                                status: StreamStatus::SignalLost,
+                            self.transition_status(
+                                active,
+                                StreamStatus::SignalLost,
                                 ts_ms,
-                            });
+                                &mut actions,
+                            );
                         }
                     }
                     Some(StreamStatus::SignalLost) => {
@@ -382,6 +354,50 @@ impl StreamTracker {
         }
 
         actions
+    }
+
+    fn transition_status(
+        &mut self,
+        mac: &str,
+        status: StreamStatus,
+        ts_ms: i64,
+        actions: &mut Vec<LifecycleAction>,
+    ) {
+        let norm = mac.to_ascii_uppercase();
+        self.active_status = Some(status);
+        match status {
+            StreamStatus::Disconnected => {
+                self.active_mac = None;
+                self.acquiring_started_ts_ms = None;
+                self.last_valid_packet_ts_ms = None;
+                self.last_any_packet_ts_ms = None;
+                self.notifying_checked = false;
+            }
+            StreamStatus::Connecting => {
+                self.active_mac = Some(norm.clone());
+                self.acquiring_started_ts_ms = None;
+                self.last_valid_packet_ts_ms = None;
+                self.last_any_packet_ts_ms = None;
+                self.notifying_checked = false;
+            }
+            StreamStatus::Acquiring => {
+                self.acquiring_started_ts_ms = Some(ts_ms);
+                self.last_valid_packet_ts_ms = None;
+                self.last_any_packet_ts_ms = None;
+                self.notifying_checked = false;
+            }
+            StreamStatus::Streaming => {
+                // Keep packet timers
+            }
+            StreamStatus::SignalLost => {
+                // Keep packet timers for 30s check
+            }
+        }
+        actions.push(LifecycleAction::StatusTransition {
+            mac: norm,
+            status,
+            ts_ms,
+        });
     }
 
     fn wearable_name(&self, mac: &str) -> String {

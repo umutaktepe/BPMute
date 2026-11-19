@@ -81,6 +81,10 @@ pub fn initialize_rw_connection(conn: &Connection) -> Result<(), StorageError> {
             "ALTER TABLE wearables ADD COLUMN address_type TEXT NOT NULL DEFAULT 'public';",
             [],
         );
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wearables_mac_type ON wearables(mac, address_type);",
+            [],
+        );
     } else {
         return Err(StorageError::Validation(format!(
             "unsupported SQLite ledger schema version {user_version}; expected {CURRENT_DB_SCHEMA_VERSION}"
@@ -107,7 +111,7 @@ pub fn initialize_ro_connection(conn: &Connection) -> Result<(), StorageError> {
 const DDL_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS wearables (
     id TEXT PRIMARY KEY,
-    mac TEXT NOT NULL UNIQUE,
+    mac TEXT NOT NULL,
     address_type TEXT NOT NULL DEFAULT 'public',
     alias TEXT,
     advertised_name TEXT,
@@ -117,7 +121,8 @@ CREATE TABLE IF NOT EXISTS wearables (
     typical_sqi REAL,
     enrolled_at_ms INTEGER NOT NULL,
     last_seen_at_ms INTEGER NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1
+    active INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (mac, address_type)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

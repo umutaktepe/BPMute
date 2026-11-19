@@ -1,86 +1,27 @@
-//! Synchronous SQLite WAL ledger store with exclusive `flock` write coordination.
-
-use std::path::{Path, PathBuf};
+//! Monitoring Session persistence, epoch queries, raw samples, and session feedback.
 
 use chrono::{Duration, Local, LocalResult, NaiveDateTime, TimeZone};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use uuid::ContextV7;
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::calibration::{
-    BoundaryReason, CalibrationBoundaryRecord, CalibrationState, DismissedShift, FeedbackVerdict,
-    LedgerRecomputeInput, SessionFeedbackRecord, SessionLedgerRecord, SessionReplayInput,
-    ShiftDirection, WearableSeedMeta, recompute_calibration, validate_sleep_hr_bpm,
+    CalibrationState, FeedbackVerdict, SessionFeedbackRecord, SessionLedgerRecord,
+    validate_sleep_hr_bpm,
 };
 use crate::config::{ClockTime, PatchField, PowerAction, Sensitivity};
 use crate::logging::mask_mac;
-use crate::paths::ensure_private_dir;
 use crate::sleep_engine::{
-    ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason, WearableFloor,
+    ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason,
 };
-use crate::storage::lock::LedgerFileLock;
-use crate::storage::schema::{
-    db_exists, enforce_private_db_permissions, generate_uuid_v7_with, initialize_ro_connection,
-    initialize_rw_connection,
-};
+use crate::storage::schema::generate_uuid_v7_with;
 use crate::storage::{
-    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, OpenSessionRequest,
-    SessionFullDetail, SessionListEntry, SessionListPage, SessionReplayBundle, SessionStatus,
-    SetFeedbackRequest, StorageError, WearableDescriptor, WearableInfo,
+    CloseSessionRequest, OpenSessionRequest, SessionFullDetail, SessionListEntry, SessionListPage,
+    SessionReplayBundle, SessionStatus, SetFeedbackRequest, StorageError, WearableInfo,
 };
 
-/// Synchronous SQLite WAL store backing both the persistence worker and offline CLI commands.
-pub struct LedgerStore {
-    conn: Connection,
-    db_path: PathBuf,
-    lock_path: PathBuf,
-    uuid_ctx: ContextV7,
-}
+use super::recompute_and_persist_in_tx;
+use super::{LedgerStore, resolve_table_id_prefix};
 
 impl LedgerStore {
-    /// Opens (and initializes if needed) a read-write SQLite WAL ledger with `0700`/`0600` modes.
-    pub fn open_read_write(db_path: &Path, lock_path: &Path) -> Result<Self, StorageError> {
-        if let Some(parent) = db_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            ensure_private_dir(parent)?;
-        }
-
-        let _lock = LedgerFileLock::acquire_exclusive(lock_path)?;
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        initialize_rw_connection(&conn)?;
-        enforce_private_db_permissions(db_path)?;
-
-        Ok(Self {
-            conn,
-            db_path: db_path.to_path_buf(),
-            lock_path: lock_path.to_path_buf(),
-            uuid_ctx: ContextV7::new(),
-        })
-    }
-
-    /// Opens an existing SQLite ledger strictly read-only, returning `Ok(None)` if absent.
-    pub fn open_read_only(db_path: &Path) -> Result<Option<Self>, StorageError> {
-        if !db_exists(db_path)? {
-            return Ok(None);
-        }
-        let conn = Connection::open_with_flags(
-            db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        initialize_ro_connection(&conn)?;
-        Ok(Some(Self {
-            conn,
-            db_path: db_path.to_path_buf(),
-            lock_path: PathBuf::new(),
-            uuid_ctx: ContextV7::new(),
-        }))
-    }
-
     /// Recovers stale `'active'` sessions left behind by an ungraceful daemon termination.
     pub fn recover_stale_sessions(&mut self, now_ms: i64) -> Result<usize, StorageError> {
         self.write_tx(|tx| {
@@ -118,171 +59,6 @@ impl LedgerStore {
 
             recompute_and_persist_in_tx(tx, now_ms)?;
             Ok(stale.len())
-        })
-    }
-
-    /// Inserts or updates a Wearable by MAC address and returns its UUIDv7 ID.
-    pub fn upsert_wearable(
-        &mut self,
-        desc: &WearableDescriptor,
-        now_ms: i64,
-    ) -> Result<String, StorageError> {
-        let mac = desc.mac.trim().to_ascii_uppercase();
-        if mac.is_empty() {
-            return Err(StorageError::Validation(
-                "wearable MAC address must not be empty".to_string(),
-            ));
-        }
-        let address_type = if desc.address_type.trim().is_empty() {
-            "public"
-        } else {
-            desc.address_type.trim().to_ascii_lowercase().leak()
-        };
-
-        let new_id = generate_uuid_v7_with(&self.uuid_ctx, now_ms);
-        self.write_tx(|tx| {
-            let existing: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM wearables WHERE mac = ?1",
-                    params![mac],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            if let Some(id) = existing {
-                tx.execute(
-                    "UPDATE wearables
-                     SET address_type = ?2,
-                         alias = COALESCE(?3, alias),
-                         advertised_name = COALESCE(?4, advertised_name),
-                         supports_rr = supports_rr OR ?5,
-                         supports_contact = supports_contact OR ?6,
-                         last_seen_at_ms = ?7,
-                         active = 1
-                     WHERE id = ?1",
-                    params![
-                        id,
-                        address_type,
-                        desc.alias,
-                        desc.advertised_name,
-                        i32::from(desc.supports_rr),
-                        i32::from(desc.supports_contact),
-                        now_ms
-                    ],
-                )?;
-                Ok(id)
-            } else {
-                tx.execute(
-                    "INSERT INTO wearables (
-                         id, mac, address_type, alias, advertised_name, supports_rr, supports_contact,
-                         hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 1)",
-                    params![
-                        new_id,
-                        mac,
-                        address_type,
-                        desc.alias,
-                        desc.advertised_name,
-                        i32::from(desc.supports_rr),
-                        i32::from(desc.supports_contact),
-                        WearableFloor::DEFAULT_HR_VAR_FLOOR,
-                        now_ms
-                    ],
-                )?;
-                Ok(new_id)
-            }
-        })
-    }
-
-    /// Lists enrolled Wearables (active allowlist entries).
-    pub fn list_enrolled_wearables(&self) -> Result<Vec<EnrolledWearable>, StorageError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, mac, address_type, alias, advertised_name, supports_rr, supports_contact,
-                    hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active
-             FROM wearables
-             WHERE active = 1
-             ORDER BY last_seen_at_ms DESC, id ASC",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                let mac: String = row.get(1)?;
-                Ok(EnrolledWearable {
-                    id: row.get(0)?,
-                    mac_masked: mask_mac(&mac),
-                    mac,
-                    address_type: row.get(2)?,
-                    alias: row.get(3)?,
-                    advertised_name: row.get(4)?,
-                    supports_rr: row.get::<_, i64>(5)? != 0,
-                    supports_contact: row.get::<_, i64>(6)? != 0,
-                    hr_var_floor: row.get(7)?,
-                    typical_sqi: row.get(8)?,
-                    enrolled_at_ms: row.get(9)?,
-                    last_seen_at_ms: row.get(10)?,
-                    active: row.get::<_, i64>(11)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Fetches an enrolled Wearable by UUIDv7 ID or unambiguous prefix.
-    pub fn get_wearable(&self, id_or_prefix: &str) -> Result<EnrolledWearable, StorageError> {
-        let id = resolve_wearable_id(&self.conn, id_or_prefix)?;
-        load_enrolled_wearable_in_conn(&self.conn, &id)
-    }
-
-    /// Renames a Wearable's alias by UUIDv7 ID or unambiguous prefix.
-    pub fn rename_wearable(
-        &mut self,
-        id_or_prefix: &str,
-        new_alias: Option<&str>,
-    ) -> Result<EnrolledWearable, StorageError> {
-        self.write_tx(|tx| {
-            let id = resolve_wearable_id(tx, id_or_prefix)?;
-            tx.execute(
-                "UPDATE wearables SET alias = ?2 WHERE id = ?1",
-                params![id, new_alias],
-            )?;
-            load_enrolled_wearable_in_conn(tx, &id)
-        })
-    }
-
-    /// Unenrolls a Wearable by UUIDv7 ID or unambiguous prefix.
-    ///
-    /// By default (`delete_sessions = false`), only BPMute's active allowlist entry is removed
-    /// (`active = 0`), preserving historical `Monitoring Sessions`.
-    /// When `delete_sessions = true`, all associated sessions and telemetry are deleted.
-    pub fn unenroll_wearable(
-        &mut self,
-        id_or_prefix: &str,
-        delete_sessions: bool,
-    ) -> Result<EnrolledWearable, StorageError> {
-        self.write_tx(|tx| {
-            let id = resolve_wearable_id(tx, id_or_prefix)?;
-            if delete_sessions {
-                tx.execute(
-                    "DELETE FROM session_feedback WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
-                    params![id],
-                )?;
-                tx.execute(
-                    "DELETE FROM session_epochs WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
-                    params![id],
-                )?;
-                tx.execute(
-                    "DELETE FROM raw_samples WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
-                    params![id],
-                )?;
-                tx.execute(
-                    "DELETE FROM sessions WHERE wearable_id = ?1",
-                    params![id],
-                )?;
-            }
-            tx.execute(
-                "UPDATE wearables SET active = 0 WHERE id = ?1",
-                params![id],
-            )?;
-            load_enrolled_wearable_in_conn(tx, &id)
         })
     }
 
@@ -739,445 +515,16 @@ impl LedgerStore {
             Ok((detail, state))
         })
     }
-
-    /// Returns the cached `calibration_state` or recomputes if absent.
-    pub fn get_calibration_state(&self) -> Result<CalibrationState, StorageError> {
-        let cached: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT state_json FROM calibration_state WHERE singleton_id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(json) = cached {
-            let state: CalibrationState = serde_json::from_str(&json)?;
-            return Ok(state);
-        }
-        self.recompute_from_scratch()
-    }
-
-    /// Deterministically recomputes `CalibrationState` directly from ledger tables (read-only).
-    pub fn recompute_from_scratch(&self) -> Result<CalibrationState, StorageError> {
-        let input = load_ledger_recompute_input(&self.conn)?;
-        Ok(recompute_calibration(&input))
-    }
-
-    /// Sets or clears the Day-1 sleeping-HR seed and recomputes `calibration_state`.
-    pub fn set_day1_seed_and_recompute(
-        &mut self,
-        sleep_hr: Option<f64>,
-        now_ms: i64,
-    ) -> Result<CalibrationState, StorageError> {
-        if let Some(hr) = sleep_hr {
-            validate_sleep_hr_bpm("Day-1 sleeping HR seed", hr)
-                .map_err(StorageError::Validation)?;
-        }
-
-        self.write_tx(|tx| {
-            let active_boundary_id: Option<String> = tx
-                .query_row(
-                    "SELECT id FROM calibration_boundaries
-                     WHERE reverted_at_ms IS NULL
-                     ORDER BY effective_ts_ms DESC, created_at_ms DESC, id DESC
-                     LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?;
-
-            if let Some(boundary_id) = active_boundary_id {
-                tx.execute(
-                    "UPDATE calibration_boundaries SET seed_sleep_hr = ?2 WHERE id = ?1",
-                    params![boundary_id, sleep_hr],
-                )?;
-            } else {
-                tx.execute(
-                    "INSERT INTO calibration_meta (singleton_id, day1_seed_sleep_hr, day1_seed_updated_at_ms)
-                     VALUES (1, ?1, ?2)
-                     ON CONFLICT(singleton_id) DO UPDATE SET
-                         day1_seed_sleep_hr = excluded.day1_seed_sleep_hr,
-                         day1_seed_updated_at_ms = excluded.day1_seed_updated_at_ms",
-                    params![sleep_hr, now_ms],
-                )?;
-            }
-
-            recompute_and_persist_in_tx(tx, now_ms)
-        })
-    }
-
-    /// Accepts a pending 5-session shift by inserting a reversible `Calibration Boundary`.
-    pub fn accept_shift_and_recompute(
-        &mut self,
-        now_ms: i64,
-    ) -> Result<AcceptShiftResult, StorageError> {
-        let boundary_id = generate_uuid_v7_with(&self.uuid_ctx, now_ms);
-        self.write_tx(|tx| {
-            let current = recompute_calibration(&load_ledger_recompute_input(tx)?);
-            let alert = current.pending_shift_alert.ok_or_else(|| {
-                StorageError::PreconditionFailed(
-                    "no pending 5-session persistent-shift alert to accept".to_string(),
-                )
-            })?;
-
-            let boundary = CalibrationBoundaryRecord {
-                id: boundary_id,
-                effective_ts_ms: alert.first_session_start_ts_ms,
-                reason: BoundaryReason::PersistentShift,
-                seed_sleep_hr: None,
-                reset_floors: false,
-                created_at_ms: now_ms,
-                reverted_at_ms: None,
-            };
-
-            tx.execute(
-                "INSERT INTO calibration_boundaries (
-                     id, effective_ts_ms, reason, seed_sleep_hr, reset_floors, created_at_ms, reverted_at_ms
-                 ) VALUES (?1, ?2, ?3, NULL, 0, ?4, NULL)",
-                params![
-                    boundary.id,
-                    boundary.effective_ts_ms,
-                    boundary.reason.as_str(),
-                    boundary.created_at_ms
-                ],
-            )?;
-
-            tx.execute(
-                "INSERT INTO calibration_meta (
-                     singleton_id, dismissed_shift_anchor_ts_ms, dismissed_shift_direction
-                 ) VALUES (1, NULL, NULL)
-                 ON CONFLICT(singleton_id) DO UPDATE SET
-                     dismissed_shift_anchor_ts_ms = NULL,
-                     dismissed_shift_direction = NULL",
-                [],
-            )?;
-
-            let calibration = recompute_and_persist_in_tx(tx, now_ms)?;
-            Ok(AcceptShiftResult {
-                boundary,
-                calibration,
-            })
-        })
-    }
-
-    /// Dismisses a pending 5-session shift prompt (`Keep ignoring`).
-    pub fn dismiss_shift_and_recompute(
-        &mut self,
-        now_ms: i64,
-    ) -> Result<CalibrationState, StorageError> {
-        self.write_tx(|tx| {
-            let current = recompute_calibration(&load_ledger_recompute_input(tx)?);
-            let alert = current.pending_shift_alert.ok_or_else(|| {
-                StorageError::PreconditionFailed(
-                    "no pending 5-session persistent-shift alert to dismiss".to_string(),
-                )
-            })?;
-
-            tx.execute(
-                "INSERT INTO calibration_meta (
-                     singleton_id, dismissed_shift_anchor_ts_ms, dismissed_shift_direction
-                 ) VALUES (1, ?1, ?2)
-                 ON CONFLICT(singleton_id) DO UPDATE SET
-                     dismissed_shift_anchor_ts_ms = excluded.dismissed_shift_anchor_ts_ms,
-                     dismissed_shift_direction = excluded.dismissed_shift_direction",
-                params![alert.first_session_start_ts_ms, alert.direction.as_str()],
-            )?;
-
-            recompute_and_persist_in_tx(tx, now_ms)
-        })
-    }
-
-    fn write_tx<T, F>(&mut self, f: F) -> Result<T, StorageError>
-    where
-        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StorageError>,
-    {
-        if self.lock_path.as_os_str().is_empty() {
-            return Err(StorageError::Validation(
-                "cannot perform write transaction on read-only LedgerStore".to_string(),
-            ));
-        }
-        let _lock = LedgerFileLock::acquire_exclusive(&self.lock_path)?;
-        let tx = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        enforce_private_db_permissions(&self.db_path)?;
-        Ok(out)
-    }
 }
 
-fn recompute_and_persist_in_tx(
-    tx: &Connection,
-    now_ms: i64,
-) -> Result<CalibrationState, StorageError> {
-    let input = load_ledger_recompute_input(tx)?;
-    let state = recompute_calibration(&input);
-
-    let mut update_w = tx.prepare(
-        "UPDATE wearables
-         SET hr_var_floor = ?2,
-             supports_rr = ?3,
-             supports_contact = ?4,
-             typical_sqi = ?5
-         WHERE id = ?1",
-    )?;
-    for w in state.wearables.values() {
-        update_w.execute(params![
-            w.wearable_id,
-            w.hr_var_floor,
-            i32::from(w.supports_rr),
-            i32::from(w.supports_contact),
-            w.typical_sqi
-        ])?;
-    }
-    drop(update_w);
-
-    let state_json = serde_json::to_string(&state)?;
-    tx.execute(
-        "INSERT INTO calibration_state (singleton_id, algorithm_version, computed_at_ms, state_json)
-         VALUES (1, ?1, ?2, ?3)
-         ON CONFLICT(singleton_id) DO UPDATE SET
-             algorithm_version = excluded.algorithm_version,
-             computed_at_ms = excluded.computed_at_ms,
-             state_json = excluded.state_json",
-        params![state.algorithm_version, now_ms, state_json],
-    )?;
-
-    Ok(state)
-}
-
-fn load_ledger_recompute_input(conn: &Connection) -> Result<LedgerRecomputeInput, StorageError> {
-    let (day1_seed_sleep_hr, dismissed_shift) = conn
-        .query_row(
-            "SELECT day1_seed_sleep_hr, dismissed_shift_anchor_ts_ms, dismissed_shift_direction
-             FROM calibration_meta WHERE singleton_id = 1",
-            [],
-            |row| {
-                let seed: Option<f64> = row.get(0)?;
-                let anchor: Option<i64> = row.get(1)?;
-                let dir_str: Option<String> = row.get(2)?;
-                let dismissed = match (anchor, dir_str) {
-                    (Some(a), Some(d)) => {
-                        d.parse::<ShiftDirection>()
-                            .ok()
-                            .map(|direction| DismissedShift {
-                                anchor_ts_ms: a,
-                                direction,
-                            })
-                    }
-                    _ => None,
-                };
-                Ok((seed, dismissed))
-            },
-        )
-        .optional()?
-        .unwrap_or((None, None));
-
-    let mut b_stmt = conn.prepare(
-        "SELECT id, effective_ts_ms, reason, seed_sleep_hr, reset_floors, created_at_ms, reverted_at_ms
-         FROM calibration_boundaries
-         ORDER BY effective_ts_ms ASC, created_at_ms ASC, id ASC",
-    )?;
-    let boundaries = b_stmt
-        .query_map([], |row| {
-            let reason_str: String = row.get(2)?;
-            Ok(CalibrationBoundaryRecord {
-                id: row.get(0)?,
-                effective_ts_ms: row.get(1)?,
-                reason: reason_str
-                    .parse()
-                    .unwrap_or(BoundaryReason::ManualRebaseline),
-                seed_sleep_hr: row.get(3)?,
-                reset_floors: row.get::<_, i64>(4)? != 0,
-                created_at_ms: row.get(5)?,
-                reverted_at_ms: row.get(6)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut w_stmt =
-        conn.prepare("SELECT id, supports_rr, supports_contact FROM wearables ORDER BY id ASC")?;
-    let wearables = w_stmt
-        .query_map([], |row| {
-            Ok(WearableSeedMeta {
-                wearable_id: row.get(0)?,
-                supports_rr: row.get::<_, i64>(1)? != 0,
-                supports_contact: row.get::<_, i64>(2)? != 0,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut s_stmt = conn.prepare(
-        "SELECT s.id, s.wearable_id, s.start_ts_ms, s.end_ts_ms, s.end_reason, s.detection_sensitivity,
-                s.had_rr, s.warmup_mu_hr, s.warmup_sigma_hr, s.warmup_ln_rmssd,
-                s.onset_candidate_ts_ms, s.onset_confirmed_ts_ms, s.sleeping_ts_ms,
-                s.sleep_mu_hr, s.onset_hr_bpm, s.delta_hr_onset, s.sleep_ln_rmssd,
-                s.sleep_hr_var_ratio, s.typical_sqi, s.post_trigger_sleep_sec,
-                s.trigger_power_action, s.rapid_resume_within_5m, s.grace_cancel_count,
-                s.rapid_wake_fp_count, s.snooze_count, s.auto_anomalous,
-                s.epochs_count, s.raw_samples_count,
-                w.supports_rr, w.supports_contact,
-                f.id, f.verdict, f.manual_onset_ts_ms, f.manual_avg_sleep_hr, f.notes, f.updated_at_ms
-         FROM sessions s
-         JOIN wearables w ON w.id = s.wearable_id
-         LEFT JOIN session_feedback f ON f.session_id = s.id
-         WHERE s.status = 'closed'
-         ORDER BY s.start_ts_ms ASC, s.id ASC",
-    )?;
-
-    let session_rows = s_stmt
-        .query_map([], |row| {
-            let record = map_session_ledger_row(row)?;
-            let w_rr = row.get::<_, i64>(28)? != 0;
-            let w_contact = row.get::<_, i64>(29)? != 0;
-            let feedback = map_optional_session_feedback_row(row, 30, record.id.clone())?;
-            Ok((record, feedback, w_rr, w_contact))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut sessions = Vec::with_capacity(session_rows.len());
-    for (record, feedback, wearable_supports_rr, wearable_supports_contact) in session_rows {
-        let epochs = if feedback
-            .as_ref()
-            .is_some_and(|f| f.manual_onset_ts_ms.is_some())
-        {
-            load_session_epochs(conn, &record.id)?
-        } else {
-            Vec::new()
-        };
-        sessions.push(SessionReplayInput {
-            session: record,
-            feedback,
-            epochs,
-            wearable_supports_rr,
-            wearable_supports_contact,
-        });
-    }
-
-    Ok(LedgerRecomputeInput {
-        day1_seed_sleep_hr,
-        boundaries,
-        dismissed_shift,
-        wearables,
-        sessions,
-    })
-}
-
-fn resolve_session_id(conn: &Connection, id_or_prefix: &str) -> Result<String, StorageError> {
-    let trimmed = id_or_prefix.trim();
-    if trimmed.is_empty() {
-        return Err(StorageError::Validation(
-            "session ID or prefix must not be empty".to_string(),
-        ));
-    }
-
-    let exact: Option<String> = conn
-        .query_row(
-            "SELECT id FROM sessions WHERE id = ?1",
-            params![trimmed],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = exact {
-        return Ok(id);
-    }
-
-    let escaped = trimmed
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let pattern = format!("{escaped}%");
-    let mut stmt = conn.prepare("SELECT id FROM sessions WHERE id LIKE ?1 ESCAPE '\\' LIMIT 2")?;
-    let matches: Vec<String> = stmt
-        .query_map(params![pattern], |r| r.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    match matches.len() {
-        0 => Err(StorageError::NotFound(format!(
-            "session '{trimmed}' not found"
-        ))),
-        1 => Ok(matches.into_iter().next().expect("single match present")),
-        _ => Err(StorageError::AmbiguousId(format!(
-            "session prefix '{trimmed}' matches multiple sessions; provide more characters"
-        ))),
-    }
-}
-
-fn resolve_wearable_id(conn: &Connection, id_or_prefix: &str) -> Result<String, StorageError> {
-    let trimmed = id_or_prefix.trim();
-    if trimmed.is_empty() {
-        return Err(StorageError::Validation(
-            "wearable ID or prefix must not be empty".to_string(),
-        ));
-    }
-
-    let exact: Option<String> = conn
-        .query_row(
-            "SELECT id FROM wearables WHERE id = ?1",
-            params![trimmed],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = exact {
-        return Ok(id);
-    }
-
-    let escaped = trimmed
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let pattern = format!("{escaped}%");
-    let mut stmt = conn.prepare("SELECT id FROM wearables WHERE id LIKE ?1 ESCAPE '\\' LIMIT 2")?;
-    let matches: Vec<String> = stmt
-        .query_map(params![pattern], |r| r.get(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    match matches.len() {
-        0 => Err(StorageError::NotFound(format!(
-            "wearable '{trimmed}' not found"
-        ))),
-        1 => Ok(matches.into_iter().next().expect("single match present")),
-        _ => Err(StorageError::AmbiguousId(format!(
-            "wearable prefix '{trimmed}' matches multiple wearables; provide more characters"
-        ))),
-    }
-}
-
-fn load_enrolled_wearable_in_conn(
+pub(crate) fn resolve_session_id(
     conn: &Connection,
-    wearable_id: &str,
-) -> Result<EnrolledWearable, StorageError> {
-    conn.query_row(
-        "SELECT id, mac, address_type, alias, advertised_name, supports_rr, supports_contact,
-                hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active
-         FROM wearables
-         WHERE id = ?1",
-        params![wearable_id],
-        |row| {
-            let mac: String = row.get(1)?;
-            Ok(EnrolledWearable {
-                id: row.get(0)?,
-                mac_masked: mask_mac(&mac),
-                mac,
-                address_type: row.get(2)?,
-                alias: row.get(3)?,
-                advertised_name: row.get(4)?,
-                supports_rr: row.get::<_, i64>(5)? != 0,
-                supports_contact: row.get::<_, i64>(6)? != 0,
-                hr_var_floor: row.get(7)?,
-                typical_sqi: row.get(8)?,
-                enrolled_at_ms: row.get(9)?,
-                last_seen_at_ms: row.get(10)?,
-                active: row.get::<_, i64>(11)? != 0,
-            })
-        },
-    )
-    .optional()?
-    .ok_or_else(|| StorageError::NotFound(format!("wearable '{wearable_id}' not found")))
+    id_or_prefix: &str,
+) -> Result<String, StorageError> {
+    resolve_table_id_prefix(conn, "sessions", "session", id_or_prefix)
 }
 
-fn load_session_record(
+pub(crate) fn load_session_record(
     conn: &Connection,
     session_id: &str,
 ) -> Result<(SessionLedgerRecord, SessionStatus), StorageError> {
@@ -1203,7 +550,7 @@ fn load_session_record(
     .ok_or_else(|| StorageError::NotFound(format!("session '{session_id}' not found")))
 }
 
-fn load_session_detail_in_conn(
+pub(crate) fn load_session_detail_in_conn(
     conn: &Connection,
     session_id: &str,
 ) -> Result<SessionFullDetail, StorageError> {
@@ -1244,7 +591,7 @@ fn load_session_detail_in_conn(
     })
 }
 
-fn load_session_feedback(
+pub(crate) fn load_session_feedback(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Option<SessionFeedbackRecord>, StorageError> {
@@ -1259,7 +606,10 @@ fn load_session_feedback(
         .flatten())
 }
 
-fn load_session_epochs(conn: &Connection, session_id: &str) -> Result<Vec<Epoch>, StorageError> {
+pub(crate) fn load_session_epochs(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<Epoch>, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
                 ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
@@ -1303,7 +653,10 @@ fn load_session_epochs(conn: &Connection, session_id: &str) -> Result<Vec<Epoch>
     Ok(epochs)
 }
 
-fn load_raw_samples(conn: &Connection, session_id: &str) -> Result<Vec<HrPacket>, StorageError> {
+pub(crate) fn load_raw_samples(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Vec<HrPacket>, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT ts_ms, bpm, rr_ms_json, contact_status
          FROM raw_samples
@@ -1333,7 +686,9 @@ fn load_raw_samples(conn: &Connection, session_id: &str) -> Result<Vec<HrPacket>
     Ok(packets)
 }
 
-fn map_session_ledger_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLedgerRecord> {
+pub(crate) fn map_session_ledger_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SessionLedgerRecord> {
     let end_reason_str: Option<String> = row.get(4)?;
     let sens_str: String = row.get(5)?;
     let power_str: String = row.get(20)?;
@@ -1371,7 +726,7 @@ fn map_session_ledger_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionLe
     })
 }
 
-fn map_optional_session_feedback_row(
+pub(crate) fn map_optional_session_feedback_row(
     row: &rusqlite::Row<'_>,
     start_col: usize,
     session_id: String,
@@ -1392,7 +747,7 @@ fn map_optional_session_feedback_row(
     }))
 }
 
-fn resolve_onset_hhmm_ms(
+pub(crate) fn resolve_onset_hhmm_ms(
     start_ts_ms: i64,
     end_ts_ms: i64,
     onset: ClockTime,

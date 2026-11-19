@@ -2,25 +2,31 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
 use zbus::zvariant::ObjectPath;
 
+use crate::daemon::DaemonClock;
 use crate::daemon::wearable::{WearableDescriptor, WearableEvent, WearableSource};
 use crate::sleep_engine::StreamState;
 use crate::storage::LedgerStore;
 
-use super::dbus::{GattManager1Proxy, HRS_UUID};
+use super::dbus::{GattCharacteristic1Proxy, GattManager1Proxy, HRM_CHAR_UUID, HRS_UUID};
+use super::operations::{
+    find_characteristic_path, read_battery_percentage, read_body_sensor_location,
+};
 use super::profile::{GATT_HRS_PROFILE_PATH, GattProfileHrs};
 use super::stream::{LifecycleAction, StreamEvent, StreamTracker};
 
 /// Pure-Rust BlueZ BLE heart-rate wearable stream source.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BluezWearableSource {
     db_path: PathBuf,
     connection_lifecycle_notifications: bool,
     pinned_adapter: Option<String>,
+    clock: Arc<dyn DaemonClock>,
 }
 
 impl BluezWearableSource {
@@ -29,11 +35,13 @@ impl BluezWearableSource {
         db_path: PathBuf,
         connection_lifecycle_notifications: bool,
         pinned_adapter: Option<String>,
+        clock: Arc<dyn DaemonClock>,
     ) -> Self {
         Self {
             db_path,
             connection_lifecycle_notifications,
             pinned_adapter,
+            clock,
         }
     }
 
@@ -138,15 +146,7 @@ async fn run_bluez_source_task(
     loop {
         tokio::select! {
             _ = tick_interval.tick() => {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                // Refresh enrolled wearables in tracker if storage changed
-                let current_descriptors = source.load_enrolled_descriptors();
-                for desc in &current_descriptors {
-                    if !known_descriptors.contains_key(&desc.mac) {
-                        known_descriptors.insert(desc.mac.clone(), desc.clone());
-                        tracker.add_enrolled(desc.clone());
-                    }
-                }
+                let now_ms = source.clock.now_utc().timestamp_millis();
 
                 let actions = tracker.handle_event(StreamEvent::Tick { ts_ms: now_ms });
                 for action in actions {
@@ -154,6 +154,7 @@ async fn run_bluez_source_task(
                         &action,
                         &known_descriptors,
                         &event_tx,
+                        &system_conn,
                         session_conn.as_ref(),
                         &mut last_notification_id,
                     ).await;
@@ -209,6 +210,7 @@ async fn handle_lifecycle_action(
     action: &LifecycleAction,
     known: &HashMap<String, WearableDescriptor>,
     event_tx: &mpsc::Sender<WearableEvent>,
+    system_conn: &zbus::Connection,
     session_conn: Option<&zbus::Connection>,
     last_notif_id: &mut u32,
 ) {
@@ -226,11 +228,30 @@ async fn handle_lifecycle_action(
                     .await;
             }
         }
-        LifecycleAction::StartNotify { .. } => {
+        LifecycleAction::StartNotify { mac } => {
             // BlueZ GATT notification handling
+            if let Ok(Some(char_path)) =
+                find_characteristic_path(system_conn, mac, HRM_CHAR_UUID).await
+                && let Ok(builder) = GattCharacteristic1Proxy::builder(system_conn).path(char_path)
+                && let Ok(proxy) = builder.build().await
+            {
+                let _ = proxy.start_notify().await;
+            }
+            // Read 0x2A38 body sensor location
+            let _ = read_body_sensor_location(system_conn, mac).await;
+            // Read Battery1 percentage
+            let _ = read_battery_percentage(system_conn, mac).await;
         }
-        LifecycleAction::CheckNotifying { .. } => {
-            // Check BlueZ GATT notification status
+        LifecycleAction::CheckNotifying { mac } => {
+            // Verify GATT notification status after silence and re-subscribe if needed
+            if let Ok(Some(char_path)) =
+                find_characteristic_path(system_conn, mac, HRM_CHAR_UUID).await
+                && let Ok(builder) = GattCharacteristic1Proxy::builder(system_conn).path(char_path)
+                && let Ok(proxy) = builder.build().await
+                && let Ok(false) = proxy.notifying().await
+            {
+                let _ = proxy.start_notify().await;
+            }
         }
         LifecycleAction::NotifyConnected { mac, name, battery } => {
             let body = match battery {
