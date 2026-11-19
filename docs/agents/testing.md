@@ -9,6 +9,7 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 
 ## Tokio Virtual Time (`start_paused = true`)
 
+- **Virtual-time sleeps**: Any async test exercising countdowns, settle delays, or timeouts must use `#[tokio::test(start_paused = true)]` (or explicit `tokio::time::pause()`). Never use unpaused `tokio::time::sleep(...)` with wall-clock durations; virtual time advances instantaneously, keeping the test suite runtime under target bounds (ADR-0007).
 - **OS thread I/O vs. virtual time**: In `#[tokio::test(start_paused = true)]`, do NOT wrap IPC or socket calls in `tokio::time::timeout(...)` when the daemon must communicate with an OS worker thread doing SQLite/disk I/O. Tokio will advance virtual time immediately past the timeout before the OS thread can finish. Call `client.next_event().await` without an outer timeout; Tokio will park the test task and wake it when the socket produces bytes.
 - **Stream event synchronization**: When feeding simulated wearable streams into `FakeWearableSource`, wait for the expected stream events (e.g., `EpochUpdate`) to arrive before issuing live reconfiguration calls (such as `config.update`). Otherwise, `tokio::select!` in the monitoring loop can interleave the config change before the epoch features are processed and stored.
 

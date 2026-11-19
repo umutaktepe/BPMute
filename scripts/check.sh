@@ -23,6 +23,11 @@ if find src/sleep_engine src/calibration -name '*.rs' -print0 | xargs -0 awk '{ 
   exit 1
 fi
 
+if grep -Eq 'DaemonOptions\s*\{' tests/*.rs; then
+  echo "error: direct DaemonOptions struct literal forbidden in tests; use DaemonOptions::for_testing(...) (docs/agents/testing.md:27)" >&2
+  exit 1
+fi
+
 timeout 60 cargo test
 timeout 5 cargo test --test sleep_engine
 timeout 5 cargo test --test calibration_ledger
