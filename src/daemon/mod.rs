@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::actions::traits::{ActionExecutor, Notifier};
 use crate::config::{CliOverrides, DetectionConfig, LoadedConfig, RawSamplesRetention};
+use crate::idle::IdleProbe;
 use crate::ipc::protocol::{EpochUpdateEvent, HrSampleEvent};
 use crate::ipc::pubsub::EventBroker;
 use crate::ipc::server::handle_connection;
@@ -65,11 +66,12 @@ pub struct DaemonOptions {
     pub install_signals: bool,
     pub action_executor: Option<Arc<dyn ActionExecutor>>,
     pub notifier: Option<Arc<dyn Notifier>>,
+    pub idle_probe: Option<Arc<dyn IdleProbe>>,
 }
 
 impl DaemonOptions {
     /// Constructs [`DaemonOptions`] for hermetic testing with in-memory defaults
-    /// (`NullWearableSource`, `FakeActionExecutor`, `FakeNotifier`, `install_signals = false`).
+    /// (`NullWearableSource`, `FakeActionExecutor`, `FakeNotifier`, `FakeIdleProbe`, `install_signals = false`).
     pub fn for_testing(
         paths: ResolvedPaths,
         loaded_config: LoadedConfig,
@@ -86,6 +88,7 @@ impl DaemonOptions {
             install_signals: false,
             action_executor: None,
             notifier: None,
+            idle_probe: None,
         }
     }
 
@@ -104,6 +107,12 @@ impl DaemonOptions {
     /// Builder helper to attach a custom [`Notifier`].
     pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
         self.notifier = Some(notifier);
+        self
+    }
+
+    /// Builder helper to attach a custom [`IdleProbe`].
+    pub fn with_idle_probe(mut self, idle_probe: Arc<dyn IdleProbe>) -> Self {
+        self.idle_probe = Some(idle_probe);
         self
     }
 
@@ -158,6 +167,9 @@ impl DaemonHandle {
         let notifier = opts
             .notifier
             .unwrap_or_else(|| Arc::new(crate::actions::FakeNotifier::new()));
+        let idle_probe = opts
+            .idle_probe
+            .unwrap_or_else(|| Arc::new(crate::idle::FakeIdleProbe::default()));
 
         let core = Arc::new(DaemonCore::new(DaemonCoreInit {
             paths: opts.paths,
@@ -171,6 +183,7 @@ impl DaemonHandle {
             initial_calibration,
             action_executor,
             notifier,
+            idle_probe,
             engine_ctrl_tx: ctrl_tx.clone(),
         }));
 

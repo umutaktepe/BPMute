@@ -110,17 +110,12 @@ async fn virtual_time_cli_pause_resume_and_config_reload_e2e() {
 
     let start_local = Local.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
     let clock = Arc::new(VirtualClock::starting_at(start_local.with_timezone(&Utc)));
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env.clone()),
-        cli_overrides: CliOverrides::default(),
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env.clone()),
         clock,
-        wearable_source: None,
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    ))
     .await
     .unwrap();
 

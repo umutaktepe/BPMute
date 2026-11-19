@@ -21,17 +21,12 @@ async fn spawn_test_daemon(temp: &TempDir) -> (DaemonHandle, ResolvedPaths) {
     let loaded = LoadedConfig::load(&paths.config_file, &env, &cli).unwrap();
     let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
 
-    let handle = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: cli,
+    let handle = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env),
         clock,
-        wearable_source: None,
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    ))
     .await
     .unwrap();
 

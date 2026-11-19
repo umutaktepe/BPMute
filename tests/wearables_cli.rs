@@ -170,17 +170,12 @@ async fn wearables_cli_online_end_to_end() {
     let loaded = LoadedConfig::load(&paths.config_file, &env, &cli_overrides).unwrap();
     let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
 
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env.clone()),
-        cli_overrides,
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env.clone()),
         clock,
-        wearable_source: None,
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    ))
     .await
     .unwrap();
 

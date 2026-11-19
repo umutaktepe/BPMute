@@ -8,6 +8,7 @@ use bpmute::actions::fake::FakeNotifier;
 use bpmute::actions::grace::{GraceControlCmd, GraceCoordinator, GraceRunOutcome, GraceRunParams};
 use bpmute::config::{ActionsConfig, PowerAction};
 use bpmute::daemon::{DaemonClock, VirtualClock};
+use bpmute::idle::fake::FakeIdleProbe;
 use bpmute::ipc::pubsub::EventBroker;
 use bpmute::sleep_engine::{GraceOutcome, GraceResult};
 
@@ -22,6 +23,7 @@ async fn test_grace_period_countdown_ticks_and_notification_cadence() {
 
     let coordinator = GraceCoordinator::new(
         Arc::clone(&notifier) as Arc<dyn bpmute::actions::traits::Notifier>,
+        Arc::new(FakeIdleProbe::default()),
         Arc::clone(&clock) as Arc<dyn DaemonClock>,
         Arc::clone(&broker),
     );
@@ -94,6 +96,7 @@ async fn test_grace_period_cancel_from_notification() {
 
     let coordinator = GraceCoordinator::new(
         Arc::clone(&notifier) as Arc<dyn bpmute::actions::traits::Notifier>,
+        Arc::new(FakeIdleProbe::default()),
         Arc::clone(&clock) as Arc<dyn DaemonClock>,
         Arc::clone(&broker),
     );
@@ -145,6 +148,7 @@ async fn test_grace_period_snooze_from_command() {
 
     let coordinator = GraceCoordinator::new(
         Arc::clone(&notifier) as Arc<dyn bpmute::actions::traits::Notifier>,
+        Arc::new(FakeIdleProbe::default()),
         Arc::clone(&clock) as Arc<dyn DaemonClock>,
         Arc::clone(&broker),
     );
@@ -193,6 +197,7 @@ async fn test_grace_period_swipe_dismiss_is_non_cancelling() {
 
     let coordinator = GraceCoordinator::new(
         Arc::clone(&notifier) as Arc<dyn bpmute::actions::traits::Notifier>,
+        Arc::new(FakeIdleProbe::default()),
         Arc::clone(&clock) as Arc<dyn DaemonClock>,
         Arc::clone(&broker),
     );
@@ -241,6 +246,7 @@ async fn test_grace_period_asymmetric_signal_lost() {
 
     let coordinator = GraceCoordinator::new(
         Arc::clone(&notifier) as Arc<dyn bpmute::actions::traits::Notifier>,
+        Arc::new(FakeIdleProbe::default()),
         Arc::clone(&clock) as Arc<dyn DaemonClock>,
         Arc::clone(&broker),
     );
@@ -285,6 +291,7 @@ async fn test_grace_period_arousal_abort_no_penalty() {
 
     let coordinator = GraceCoordinator::new(
         Arc::clone(&notifier) as Arc<dyn bpmute::actions::traits::Notifier>,
+        Arc::new(FakeIdleProbe::default()),
         Arc::clone(&clock) as Arc<dyn DaemonClock>,
         Arc::clone(&broker),
     );

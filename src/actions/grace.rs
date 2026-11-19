@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::config::{ActionsConfig, PowerAction};
 use crate::daemon::DaemonClock;
+use crate::idle::IdleProbe;
 use crate::ipc::protocol::GraceTickEvent;
 use crate::ipc::pubsub::EventBroker;
 use crate::sleep_engine::{GraceOutcome, GraceResult};
@@ -40,6 +41,7 @@ pub enum GraceRunOutcome {
 /// Manages the cancellable Grace Period countdown, notification updates, and cancellation hooks.
 pub struct GraceCoordinator {
     notifier: Arc<dyn Notifier>,
+    idle_probe: Arc<dyn IdleProbe>,
     clock: Arc<dyn DaemonClock>,
     broker: Arc<EventBroker>,
 }
@@ -48,11 +50,13 @@ impl GraceCoordinator {
     /// Creates a new coordinator with injected notification, clock, and event broker boundaries.
     pub fn new(
         notifier: Arc<dyn Notifier>,
+        idle_probe: Arc<dyn IdleProbe>,
         clock: Arc<dyn DaemonClock>,
         broker: Arc<EventBroker>,
     ) -> Self {
         Self {
             notifier,
+            idle_probe,
             clock,
             broker,
         }
@@ -83,6 +87,11 @@ impl GraceCoordinator {
             .unwrap_or(0);
 
         let mut notif_rx = self.notifier.subscribe_actions();
+        let mut idle_rx = self
+            .idle_probe
+            .watch_grace_period_activity(Duration::from_secs(1))
+            .await
+            .ok();
 
         // Publish initial tick at start
         self.publish_tick(&params, remaining_sec, total_sec);
@@ -122,6 +131,21 @@ impl GraceCoordinator {
                             return GraceRunOutcome::AsymmetricSignalLost;
                         }
                     }
+                }
+
+                Some(()) = async {
+                    match idle_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let now_ms = self.clock.now_utc().timestamp_millis();
+                    self.close_notice_if_active(active_notice_id).await;
+                    tracing::info!("desktop user activity detected during Grace Period; cancelling");
+                    return GraceRunOutcome::Completed(GraceOutcome {
+                        ts_ms: now_ms,
+                        outcome: GraceResult::Cancelled,
+                    });
                 }
 
                 Some(notif_ev) = notif_rx.recv() => {

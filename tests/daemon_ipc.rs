@@ -31,17 +31,12 @@ async fn start_virtual_daemon(
     let loaded = LoadedConfig::load(&paths.config_file, &env, &cli).unwrap();
     let clock = std::sync::Arc::new(VirtualClock::starting_at(start_utc));
 
-    let handle = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: std::sync::Arc::new(env),
-        cli_overrides: cli,
+    let handle = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        std::sync::Arc::new(env),
         clock,
-        wearable_source: None,
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    ))
     .await
     .expect("daemon should start");
 
@@ -74,17 +69,12 @@ async fn daemon_socket_permissions_ping_status_and_framing_guards() {
     // Stale/duplicate daemon guard: spawning on the same live socket must fail.
     let loaded =
         LoadedConfig::load(&paths.config_file, &MapEnv::new(), &CliOverrides::default()).unwrap();
-    let dup = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: std::sync::Arc::new(MapEnv::new()),
-        cli_overrides: CliOverrides::default(),
-        clock: std::sync::Arc::new(VirtualClock::starting_at(start_utc)),
-        wearable_source: None,
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    let dup = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        std::sync::Arc::new(MapEnv::new()),
+        std::sync::Arc::new(VirtualClock::starting_at(start_utc)),
+    ))
     .await;
     assert!(dup.is_err(), "cannot steal live daemon socket");
 

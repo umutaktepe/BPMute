@@ -360,17 +360,10 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
     let clock = Arc::new(VirtualClock::starting_at(start_utc));
     let (wearable_tx, wearable_source) = FakeWearableSource::channel();
 
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: CliOverrides::default(),
-        clock,
-        wearable_source: Some(Arc::new(wearable_source)),
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(wearable_source)),
+    )
     .await
     .unwrap();
 
@@ -574,17 +567,10 @@ async fn live_daemon_respects_raw_samples_opt_out_and_shift_ipc_controls() {
     let clock = Arc::new(VirtualClock::starting_at(start_utc));
     let (wearable_tx, wearable_source) = FakeWearableSource::channel();
 
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: CliOverrides::default(),
-        clock,
-        wearable_source: Some(Arc::new(wearable_source)),
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(wearable_source)),
+    )
     .await
     .unwrap();
 
@@ -763,17 +749,10 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
     let clock = Arc::new(VirtualClock::starting_at(start_utc));
     let (wearable_tx, wearable_source) = FakeWearableSource::channel();
 
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env.clone()),
-        cli_overrides: CliOverrides::default(),
-        clock,
-        wearable_source: Some(Arc::new(wearable_source)),
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env.clone()), clock)
+            .with_wearable_source(Arc::new(wearable_source)),
+    )
     .await
     .unwrap();
 
@@ -1113,17 +1092,12 @@ async fn cli_accept_shift_and_dismiss_shift_end_to_end() {
     let clock = Arc::new(VirtualClock::starting_at(
         Utc.with_ymd_and_hms(2026, 11, 20, 9, 0, 0).unwrap(),
     ));
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env.clone()),
-        cli_overrides: CliOverrides::default(),
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env.clone()),
         clock,
-        wearable_source: None,
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    ))
     .await
     .unwrap();
 
@@ -1222,17 +1196,10 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
     let clock = Arc::new(VirtualClock::starting_at(start_utc));
     let (wearable_tx, wearable_source) = FakeWearableSource::channel();
 
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: CliOverrides::default(),
-        clock,
-        wearable_source: Some(Arc::new(wearable_source)),
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(wearable_source)),
+    )
     .await
     .unwrap();
 

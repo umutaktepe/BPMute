@@ -77,6 +77,7 @@ async fn spawn_test_daemon(
         install_signals: false,
         action_executor: Some(executor as Arc<dyn bpmute::actions::traits::ActionExecutor>),
         notifier: Some(notifier as Arc<dyn bpmute::actions::traits::Notifier>),
+        idle_probe: None,
     })
     .await
     .expect("daemon should start");
@@ -486,6 +487,7 @@ grace_period_sec = 10
         install_signals: false,
         action_executor: Some(executor),
         notifier: Some(notifier),
+        idle_probe: None,
     })
     .await
     .unwrap();

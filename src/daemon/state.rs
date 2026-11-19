@@ -15,6 +15,9 @@ use crate::config::{
     CliOverrides, ClockTime, ConfigPatch, DetectionConfig, LoadedConfig, PowerAction,
     RawSamplesRetention, patch_config_file,
 };
+use crate::idle::{
+    IdleBackendKind, IdleProbe, compute_effective_grace_period, is_power_action_refused,
+};
 use crate::ipc::protocol::{
     AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
     DiscoveredWearable, EnrollAuthResponseParams, EnrollSelectParams, EnrollStartParams,
@@ -33,6 +36,7 @@ use super::clock::DaemonClock;
 
 const CONFIG_RELOAD_ALERT_ID: &str = "config_reload_failed";
 const PERSISTENT_SHIFT_ALERT_ID: &str = "calibration_persistent_shift";
+const DEGRADED_IDLE_ALERT_ID: &str = "idle_backend_degraded";
 const MAX_HR_RING_BUFFER_LEN: usize = 1_800; // 30 min at 1 Hz
 
 fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
@@ -61,6 +65,7 @@ pub struct DaemonCore {
     pub persistence: PersistenceHandle,
     pub action_executor: Arc<dyn ActionExecutor>,
     pub notifier: Arc<dyn Notifier>,
+    pub idle_probe: Arc<dyn IdleProbe>,
     pub pipeline: Arc<SleepActionPipeline>,
     pub coordinator: Arc<GraceCoordinator>,
     pub engine_ctrl_tx: mpsc::Sender<super::EngineControlEvent>,
@@ -113,6 +118,7 @@ pub struct DaemonCoreInit {
     pub initial_calibration: CalibrationState,
     pub action_executor: Arc<dyn ActionExecutor>,
     pub notifier: Arc<dyn Notifier>,
+    pub idle_probe: Arc<dyn IdleProbe>,
     pub engine_ctrl_tx: mpsc::Sender<super::EngineControlEvent>,
 }
 
@@ -131,6 +137,7 @@ impl DaemonCore {
             initial_calibration,
             action_executor,
             notifier,
+            idle_probe,
             engine_ctrl_tx,
         } = init;
         let dry_run = loaded_config.config.actions.dry_run;
@@ -142,6 +149,11 @@ impl DaemonCore {
         ));
         let mut alerts = Vec::new();
         sync_shift_alert_locked(&mut alerts, &initial_calibration);
+        sync_degraded_idle_alert_locked(
+            &mut alerts,
+            idle_probe.backend_kind(),
+            loaded_config.config.actions.power_action,
+        );
 
         let pipeline = Arc::new(SleepActionPipeline::new(
             Arc::clone(&action_executor),
@@ -150,6 +162,7 @@ impl DaemonCore {
         ));
         let coordinator = Arc::new(GraceCoordinator::new(
             Arc::clone(&notifier),
+            Arc::clone(&idle_probe),
             Arc::clone(&clock),
             Arc::clone(&broker),
         ));
@@ -164,6 +177,7 @@ impl DaemonCore {
             persistence,
             action_executor,
             notifier,
+            idle_probe,
             pipeline,
             coordinator,
             engine_ctrl_tx,
@@ -409,7 +423,12 @@ impl DaemonCore {
         let (params, eff_sec) = {
             let guard = self.inner.lock().unwrap();
             let mut cfg = guard.loaded_config.config.actions.clone();
-            let eff_sec = grace_sec.unwrap_or_else(|| cfg.effective_grace_period_sec());
+            let raw_sec = grace_sec.unwrap_or_else(|| cfg.effective_grace_period_sec());
+            let eff_sec = compute_effective_grace_period(
+                raw_sec,
+                self.idle_probe.backend_kind(),
+                cfg.power_action,
+            );
             cfg.grace_period_sec = Some(eff_sec);
             let params = GraceRunParams {
                 session_id: "test-trigger-session".to_string(),
@@ -503,6 +522,25 @@ impl DaemonCore {
             return;
         }
 
+        // 2-minute desktop input pre-gate:
+        // Desktop activity within trailing 2 min suppresses entering Grace Period
+        let is_active = self
+            .idle_probe
+            .is_user_active_trailing(Duration::from_secs(120))
+            .await
+            .unwrap_or(false);
+        if is_active {
+            tracing::info!(
+                "desktop activity detected within trailing 2-min pre-gate window; suppressing Grace Period"
+            );
+            self.deliver_grace_outcome(GraceOutcome {
+                ts_ms,
+                outcome: GraceResult::AbortedNoPenalty,
+            })
+            .await;
+            return;
+        }
+
         if cfg.actions.pause_media
             && cfg.actions.custom_command.is_empty()
             && !cfg.actions.lock_screen
@@ -526,10 +564,52 @@ impl DaemonCore {
             }
         }
 
+        let mut eff_actions = cfg.actions.clone();
+        let eff_grace = compute_effective_grace_period(
+            eff_actions.effective_grace_period_sec(),
+            self.idle_probe.backend_kind(),
+            eff_actions.power_action,
+        );
+        eff_actions.grace_period_sec = Some(eff_grace);
+
+        if is_power_action_refused(
+            self.idle_probe.backend_kind(),
+            eff_actions.power_action,
+            eff_actions.strict_idle_backend,
+        ) {
+            tracing::warn!(
+                action = %eff_actions.power_action,
+                "destructive power action refused due to strict_idle_backend on degraded idle probe"
+            );
+            let _ = self
+                .notifier
+                .show_warning(
+                    "Power Action Refused",
+                    "Destructive power action refused because strict_idle_backend is enabled and no desktop idle backend is available.",
+                    false,
+                )
+                .await;
+            eff_actions.power_action = PowerAction::None;
+        } else if self.idle_probe.backend_kind().is_degraded()
+            && matches!(
+                eff_actions.power_action,
+                PowerAction::Suspend | PowerAction::Poweroff
+            )
+        {
+            let _ = self
+                .notifier
+                .show_warning(
+                    "Degraded Idle Backend",
+                    "No desktop idle backend available. Enforcing a >= 90s Grace Period safety floor.",
+                    false,
+                )
+                .await;
+        }
+
         let params = GraceRunParams {
             session_id: session_id.clone(),
             wearable_id: wearable_id.clone(),
-            config: cfg.actions.clone(),
+            config: eff_actions.clone(),
             dry_run: self.is_dry_run(),
         };
 
@@ -543,51 +623,109 @@ impl DaemonCore {
             match outcome {
                 GraceRunOutcome::Completed(gr) => {
                     if gr.outcome == GraceResult::Expired {
+                        core.set_detector_phase(
+                            DetectorState::Sleeping,
+                            Some(session_id.clone()),
+                            Some(wearable_id.clone()),
+                        );
                         let ctx = PipelineContext {
-                            session_id,
-                            wearable_id,
+                            session_id: session_id.clone(),
+                            wearable_id: wearable_id.clone(),
                             event: "sleep_trigger".to_string(),
                             dry_run: core.is_dry_run(),
                         };
                         let res = core
                             .pipeline
-                            .execute(&ctx, &cfg.actions)
+                            .execute(&ctx, &eff_actions)
                             .await
                             .unwrap_or_default();
                         *core.sleep_triggered_at.lock().unwrap() = Some(gr.ts_ms);
-                        *core.trigger_power_action.lock().unwrap() = cfg.actions.power_action;
+                        *core.trigger_power_action.lock().unwrap() = eff_actions.power_action;
 
-                        if cfg.actions.power_action == PowerAction::None
-                            && !res.paused_players.is_empty()
-                            && !core.is_dry_run()
-                        {
+                        if eff_actions.power_action == PowerAction::None && !core.is_dry_run() {
                             let c_watch = Arc::clone(&core);
                             let paused_targets = res.paused_players.clone();
+                            let s_id = session_id.clone();
+                            let w_id = wearable_id.clone();
                             tokio::spawn(async move {
-                                if c_watch
-                                    .action_executor
-                                    .watch_mpris_resume(&paused_targets)
-                                    .await
-                                {
-                                    tracing::info!(
-                                        "MPRIS player resumed playback within 5-min post-trigger watch; recording FP"
-                                    );
-                                    let now_ms = c_watch.clock.now_utc().timestamp_millis();
-                                    c_watch
-                                        .deliver_grace_outcome(GraceOutcome {
-                                            ts_ms: now_ms,
-                                            outcome: GraceResult::PostTriggerRapidWake,
-                                        })
-                                        .await;
+                                let mpris_watch = async {
+                                    if paused_targets.is_empty() {
+                                        std::future::pending::<bool>().await
+                                    } else {
+                                        c_watch
+                                            .action_executor
+                                            .watch_mpris_resume(&paused_targets)
+                                            .await
+                                    }
+                                };
+                                let idle_watch = c_watch
+                                    .idle_probe
+                                    .watch_post_trigger_activity(Duration::from_secs(300));
+
+                                tokio::select! {
+                                    resumed = mpris_watch => {
+                                        if resumed {
+                                            tracing::info!(
+                                                "MPRIS player resumed playback within 5-min post-trigger watch; recording FP"
+                                            );
+                                            let now_ms = c_watch.clock.now_utc().timestamp_millis();
+                                            c_watch.set_detector_phase(
+                                                DetectorState::Monitoring,
+                                                Some(s_id),
+                                                Some(w_id),
+                                            );
+                                            c_watch
+                                                .deliver_grace_outcome(GraceOutcome {
+                                                    ts_ms: now_ms,
+                                                    outcome: GraceResult::PostTriggerRapidWake,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    activity = idle_watch => {
+                                        if activity {
+                                            tracing::info!(
+                                                "desktop user activity detected within 5-min post-trigger watch; recording FP"
+                                            );
+                                            let now_ms = c_watch.clock.now_utc().timestamp_millis();
+                                            c_watch.set_detector_phase(
+                                                DetectorState::Monitoring,
+                                                Some(s_id),
+                                                Some(w_id),
+                                            );
+                                            c_watch
+                                                .deliver_grace_outcome(GraceOutcome {
+                                                    ts_ms: now_ms,
+                                                    outcome: GraceResult::PostTriggerRapidWake,
+                                                })
+                                                .await;
+                                        }
+                                    }
                                 }
                             });
                         }
+                    } else if matches!(
+                        gr.outcome,
+                        GraceResult::Cancelled
+                            | GraceResult::Snoozed { .. }
+                            | GraceResult::AbortedNoPenalty
+                    ) {
+                        core.set_detector_phase(
+                            DetectorState::Monitoring,
+                            Some(session_id.clone()),
+                            Some(wearable_id.clone()),
+                        );
                     }
                     if !core.is_dry_run() {
                         core.deliver_grace_outcome(gr).await;
                     }
                 }
                 GraceRunOutcome::AsymmetricSignalLost => {
+                    core.set_detector_phase(
+                        DetectorState::Monitoring,
+                        Some(session_id.clone()),
+                        Some(wearable_id.clone()),
+                    );
                     let ctx = PipelineContext {
                         session_id,
                         wearable_id,
@@ -1357,7 +1495,13 @@ impl DaemonCore {
             }
 
             let cleared_alert = clear_reload_alert(&mut guard.alerts);
-            let alerts_opt = cleared_alert.then(|| guard.alerts.clone());
+            let power_action = guard.loaded_config.config.actions.power_action;
+            let degraded_idle_changed = sync_degraded_idle_alert_locked(
+                &mut guard.alerts,
+                self.idle_probe.backend_kind(),
+                power_action,
+            );
+            let alerts_opt = (cleared_alert || degraded_idle_changed).then(|| guard.alerts.clone());
 
             let new_armed = is_armed_locked(&guard, self.clock.as_ref());
             let status_opt = (old_armed != new_armed || old_dry_run != guard.dry_run)
@@ -1453,6 +1597,31 @@ fn sync_shift_alert_locked(alerts: &mut Vec<DaemonAlert>, state: &CalibrationSta
     } else {
         let before = alerts.len();
         alerts.retain(|a| a.id != PERSISTENT_SHIFT_ALERT_ID);
+        alerts.len() != before
+    }
+}
+
+fn sync_degraded_idle_alert_locked(
+    alerts: &mut Vec<DaemonAlert>,
+    backend: IdleBackendKind,
+    power_action: PowerAction,
+) -> bool {
+    let needs_alert = backend.is_degraded()
+        && matches!(power_action, PowerAction::Suspend | PowerAction::Poweroff);
+    if needs_alert {
+        upsert_alert(
+            alerts,
+            DaemonAlert {
+                id: DEGRADED_IDLE_ALERT_ID.to_string(),
+                kind: DEGRADED_IDLE_ALERT_ID.to_string(),
+                severity: AlertSeverity::Warn,
+                message: "No desktop idle backend available. Destructive power actions run in degraded mode with a 90s Grace Period safety floor.".to_string(),
+                dismissible: false,
+            },
+        )
+    } else {
+        let before = alerts.len();
+        alerts.retain(|a| a.id != DEGRADED_IDLE_ALERT_ID);
         alerts.len() != before
     }
 }

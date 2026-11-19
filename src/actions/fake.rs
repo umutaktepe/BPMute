@@ -86,6 +86,11 @@ impl FakeActionExecutor {
         let guard = self.inner.lock().expect("mutex poisoned");
         guard.events.clone()
     }
+
+    pub fn clear_events(&self) {
+        let mut guard = self.inner.lock().expect("mutex poisoned");
+        guard.events.clear();
+    }
 }
 
 impl ActionExecutor for FakeActionExecutor {
@@ -229,6 +234,11 @@ impl FakeNotifier {
     pub fn events(&self) -> Vec<String> {
         let guard = self.inner.lock().expect("mutex poisoned");
         guard.events.clone()
+    }
+
+    pub fn clear_events(&self) {
+        let mut guard = self.inner.lock().expect("mutex poisoned");
+        guard.events.clear();
     }
 
     pub fn active_notice_id(&self) -> Option<u32> {

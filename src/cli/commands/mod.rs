@@ -137,13 +137,14 @@ async fn run_daemon<WErr: Write>(
     let handle = match DaemonHandle::spawn(DaemonOptions {
         paths,
         loaded_config: loaded,
-        env: env_arc,
+        env: env_arc.clone(),
         cli_overrides,
         clock,
         wearable_source: Some(wearable_source),
         install_signals: true,
         action_executor: Some(Arc::new(crate::actions::SystemActionExecutor)),
         notifier: Some(Arc::new(crate::actions::DesktopNotifier)),
+        idle_probe: Some(Arc::new(crate::idle::SystemIdleProbe::new(env_arc))),
     })
     .await
     {

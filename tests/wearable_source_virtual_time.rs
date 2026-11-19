@@ -76,17 +76,10 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
     let (feed_tx, feed_rx) = mpsc::channel(64);
     let wearable_source = Arc::new(ChannelWearableSource::new(feed_rx));
 
-    let daemon = DaemonHandle::spawn(DaemonOptions {
-        paths: paths.clone(),
-        loaded_config: loaded,
-        env: Arc::new(env),
-        cli_overrides: cli,
-        clock: clock.clone(),
-        wearable_source: Some(wearable_source),
-        install_signals: false,
-        action_executor: None,
-        notifier: None,
-    })
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock.clone())
+            .with_wearable_source(wearable_source),
+    )
     .await
     .unwrap();
 
