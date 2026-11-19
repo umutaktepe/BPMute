@@ -1,5 +1,6 @@
 //! Local SQLite WAL persistence, `flock` coordination, and dedicated ledger worker (ADR-0005, ADR-0008).
 
+pub mod bundle;
 pub mod lock;
 pub mod schema;
 pub mod store;
@@ -20,11 +21,17 @@ use crate::config::{ClockTime, PatchField, PowerAction, Sensitivity};
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::error_codes;
 use crate::sleep_engine::{
-    CalibrationPriors, Epoch, HrPacket, SessionEndReason, SessionSummary, WearableFloor,
+    CalibrationMaturity, CalibrationPriors, Epoch, HrPacket, SessionEndReason, SessionSummary,
+    WearableFloor,
 };
 
+pub use bundle::{
+    CURRENT_BUNDLE_SCHEMA_VERSION, CalibrationMetaBundleRecord, ImportMode, ImportSummary,
+    LedgerBundle, RawSampleBundleRecord, SessionBundleRecord, SessionEpochBundleRecord,
+    validate_bundle_payload,
+};
 pub use lock::LedgerFileLock;
-pub use schema::{db_exists, db_path_in_data_dir, lock_path_in_data_dir};
+pub use schema::{backups_dir_in_data_dir, db_exists, db_path_in_data_dir, lock_path_in_data_dir};
 pub use store::LedgerStore;
 pub use worker::PersistenceWorker;
 
@@ -269,4 +276,28 @@ pub struct SetFeedbackRequest {
 pub struct AcceptShiftResult {
     pub boundary: CalibrationBoundaryRecord,
     pub calibration: CalibrationState,
+}
+
+/// Retention pruning summary report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PruneSummary {
+    pub raw_samples_pruned: usize,
+    pub session_epochs_pruned: usize,
+}
+
+/// Detailed storage statistics reported by `bpmute data stats [--json]` and `data.stats`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorageStats {
+    pub db_size_bytes: u64,
+    pub db_size_formatted: String,
+    pub sessions_count: usize,
+    pub session_epochs_count: usize,
+    pub raw_samples_count: usize,
+    pub session_feedback_count: usize,
+    pub calibration_boundaries_count: usize,
+    pub wearables_count: usize,
+    pub raw_samples_retention: String,
+    pub session_epochs_retention: String,
+    pub calibration_maturity: CalibrationMaturity,
+    pub active_calibration_boundary: Option<CalibrationBoundaryRecord>,
 }

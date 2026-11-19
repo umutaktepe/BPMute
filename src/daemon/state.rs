@@ -19,16 +19,19 @@ use crate::idle::{
     IdleBackendKind, IdleProbe, compute_effective_grace_period, is_power_action_refused,
 };
 use crate::ipc::protocol::{
-    AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
-    DiscoveredWearable, EnrollAuthResponseParams, EnrollSelectParams, EnrollStartParams,
-    EnrolledWearableStatus, EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState,
-    PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope, SessionClosedEvent,
-    SessionGetParams, SessionListParams, SetDryRunParams, SetFeedbackParams, SetSeedParams,
-    WearableConnectParams, WearableRenameParams, WearableUnenrollParams, error_codes,
+    AlertSeverity, CalibrationSetBoundaryParams, CalibrationUpdatedEvent, ConfigSnapshotPayload,
+    DaemonAlert, DaemonStatus, DataBackupSqliteParams, DataExportBundleParams, DataHardWipeParams,
+    DataImportBundleParams, DiscoveredWearable, EnrollAuthResponseParams, EnrollSelectParams,
+    EnrollStartParams, EnrolledWearableStatus, EpochUpdateEvent, ErrorPayload, HrSampleEvent,
+    MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope,
+    SessionClosedEvent, SessionDeleteParams, SessionExportTraceParams, SessionGetParams,
+    SessionListParams, SetDryRunParams, SetFeedbackParams, SetSeedParams, WearableConnectParams,
+    WearableRenameParams, WearableUnenrollParams, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
 use crate::sleep_engine::{DetectorState, GraceOutcome, GraceResult, StreamStatus};
+use crate::storage::ImportMode;
 use crate::storage::worker::PersistenceHandle;
 use crate::storage::{SessionFullDetail, SetFeedbackRequest, StorageError, WearableDescriptor};
 
@@ -872,6 +875,53 @@ impl DaemonCore {
                     .map_err(storage_to_ipc_err)?;
                 serialize_json(detail)
             }
+            "session.delete" => {
+                let parsed: SessionDeleteParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session.delete params: {e}"),
+                    )
+                })?;
+                {
+                    let guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    if guard.active_session_id.as_deref() == Some(&parsed.id)
+                        || guard
+                            .active_session_id
+                            .as_ref()
+                            .is_some_and(|aid| aid.starts_with(&parsed.id))
+                    {
+                        return Err(ipc_err(
+                            error_codes::PRECONDITION_FAILED,
+                            "cannot delete an active session",
+                        ));
+                    }
+                }
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let (deleted_id, cal_state) = self
+                    .persistence
+                    .delete_session_and_recompute(parsed.id, now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state);
+                Ok(json!({ "deleted_id": deleted_id }))
+            }
+            "session.export_trace" => {
+                let parsed: SessionExportTraceParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid session.export_trace params: {e}"),
+                        )
+                    })?;
+                let dest_path = std::path::PathBuf::from(&parsed.path);
+                let format = parsed.format.unwrap_or(crate::replay::TraceFormat::Csv);
+                let count = self
+                    .persistence
+                    .export_trace(parsed.id, dest_path, format, !parsed.no_anonymize)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                Ok(json!({ "path": parsed.path, "events_count": count }))
+            }
             "session.set_feedback" => {
                 let parsed: SetFeedbackParams = serde_json::from_value(params).map_err(|e| {
                     ipc_err(
@@ -931,6 +981,132 @@ impl DaemonCore {
                     .map_err(storage_to_ipc_err)?;
                 self.apply_calibration_update(cal_state.clone());
                 serialize_json(cal_state)
+            }
+            "calibration.set_boundary" => {
+                let parsed: CalibrationSetBoundaryParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid calibration.set_boundary params: {e}"),
+                        )
+                    })?;
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let (boundary, cal_state) = self
+                    .persistence
+                    .set_calibration_boundary_and_recompute(
+                        parsed.effective_ts_ms,
+                        parsed.seed_sleep_hr,
+                        parsed.reset_floors,
+                        now_ms,
+                    )
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state.clone());
+                Ok(json!({ "boundary": boundary, "calibration": cal_state }))
+            }
+            "calibration.undo_boundary" => {
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let (boundary, cal_state) = self
+                    .persistence
+                    .undo_calibration_boundary_and_recompute(now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state.clone());
+                Ok(json!({ "boundary": boundary, "calibration": cal_state }))
+            }
+            "data.stats" => {
+                let stats = self
+                    .persistence
+                    .get_storage_stats()
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                serialize_json(stats)
+            }
+            "data.purge_raw" => {
+                let reclaimed = self
+                    .persistence
+                    .purge_raw_samples()
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                Ok(json!({ "reclaimed_rows": reclaimed }))
+            }
+            "data.hard_wipe" => {
+                let parsed: DataHardWipeParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid data.hard_wipe params: {e}"),
+                    )
+                })?;
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    guard.active_session_id = None;
+                    guard.detector_state = crate::sleep_engine::DetectorState::Idle;
+                    guard.hr_ring_buffer.clear();
+                    guard.calibration_state = CalibrationState::default();
+                }
+                self.persistence
+                    .hard_wipe(parsed.all, now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(CalibrationState::default());
+                Ok(json!({ "wiped": true }))
+            }
+            "data.backup_sqlite" => {
+                let parsed: DataBackupSqliteParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid data.backup_sqlite params: {e}"),
+                        )
+                    })?;
+                let path = std::path::PathBuf::from(parsed.path);
+                self.persistence
+                    .backup_sqlite(path.clone())
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                Ok(json!({ "path": path.to_string_lossy() }))
+            }
+            "data.export_bundle" => {
+                let parsed: DataExportBundleParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid data.export_bundle params: {e}"),
+                        )
+                    })?;
+                let path = std::path::PathBuf::from(parsed.path);
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                self.persistence
+                    .export_bundle(
+                        path.clone(),
+                        parsed.include_epochs,
+                        parsed.include_wearables,
+                        parsed.include_raw,
+                        now_ms,
+                    )
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                Ok(json!({ "path": path.to_string_lossy() }))
+            }
+            "data.import_bundle" => {
+                let parsed: DataImportBundleParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid data.import_bundle params: {e}"),
+                        )
+                    })?;
+                let path = std::path::PathBuf::from(parsed.path);
+                let mode = parsed.mode.unwrap_or(ImportMode::Merge);
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let (summary, cal_state) = self
+                    .persistence
+                    .import_bundle(path, mode, parsed.force, now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                self.apply_calibration_update(cal_state.clone());
+                Ok(json!({ "summary": summary, "calibration": cal_state }))
             }
             "wearable.list" => {
                 let enrolled = self
@@ -1510,6 +1686,11 @@ impl DaemonCore {
         };
 
         let _ = self.config_tx.send(cfg_watch);
+        let retention_cfg = snapshot.config.retention.clone();
+        let persistence = self.persistence.clone();
+        tokio::spawn(async move {
+            let _ = persistence.set_retention_config(retention_cfg).await;
+        });
 
         if let Some(alerts) = alerts_changed {
             self.broker

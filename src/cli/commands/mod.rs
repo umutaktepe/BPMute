@@ -16,10 +16,12 @@ use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
 use crate::storage::{LedgerStore, StorageError, db_exists, db_path_in_data_dir};
 
+pub mod data;
 pub mod monitor;
 pub mod sessions;
 pub mod wearables;
 
+use data::run_data;
 use monitor::{run_cancel, run_snooze, run_test_trigger};
 use sessions::{run_calibration, run_replay, run_sessions};
 use wearables::{run_enroll, run_wearables};
@@ -86,6 +88,7 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
         ),
         Command::Sessions { action } => run_sessions(action, &paths, stdout, stderr).await,
         Command::Calibration { action } => run_calibration(action, &paths, stdout, stderr).await,
+        Command::Data { action } => run_data(action, &paths, stdout, stderr).await,
         Command::Wearables { action } => run_wearables(action, &paths, stdout, stderr).await,
         Command::Enroll { address, alias } => {
             run_enroll(address.as_deref(), alias.as_deref(), &paths, stdout, stderr).await
@@ -578,5 +581,88 @@ pub(crate) fn report_ipc_error<WErr: Write>(err: IpcClientError, stderr: &mut WE
         IpcClientError::Frame(_)
         | IpcClientError::InvalidResponse(_)
         | IpcClientError::ConnectionClosed => ExitCode::RuntimeError,
+    }
+}
+
+fn is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+        && std::env::var_os("BPMUTE_NON_INTERACTIVE").is_none()
+        && std::env::var_os("CARGO_MANIFEST_DIR").is_none()
+}
+
+pub(crate) fn confirm_action<WOut: Write, WErr: Write>(
+    prompt: &str,
+    skip_confirmation: bool,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> Result<bool, ExitCode> {
+    if skip_confirmation {
+        return Ok(true);
+    }
+    if !is_interactive() {
+        let _ = writeln!(
+            stderr,
+            "error: interactive confirmation required (or use --yes)"
+        );
+        return Err(ExitCode::UsageOrConfigError);
+    }
+    let _ = write!(stdout, "{prompt} [y/N]: ");
+    let _ = stdout.flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        let _ = writeln!(stderr, "error: failed to read confirmation input");
+        return Err(ExitCode::RuntimeError);
+    }
+    let trimmed = input.trim().to_lowercase();
+    if trimmed == "y" || trimmed == "yes" {
+        Ok(true)
+    } else {
+        let _ = writeln!(stdout, "Aborted.");
+        Ok(false)
+    }
+}
+
+pub(crate) fn confirm_wipe<WOut: Write, WErr: Write>(
+    confirm_arg: Option<&str>,
+    all: bool,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> Result<bool, ExitCode> {
+    if let Some(c) = confirm_arg {
+        if c == "WIPE" {
+            return Ok(true);
+        } else {
+            let _ = writeln!(stderr, "error: confirmation mismatch: expected 'WIPE'");
+            return Err(ExitCode::UsageOrConfigError);
+        }
+    }
+    if !is_interactive() {
+        let _ = writeln!(
+            stderr,
+            "error: --confirm WIPE is required when invoked non-interactively"
+        );
+        return Err(ExitCode::UsageOrConfigError);
+    }
+    let target = if all {
+        "ALL biometric and device data (including enrolled wearables)"
+    } else {
+        "biometric session history and calibration"
+    };
+    let _ = write!(
+        stdout,
+        "WARNING: This will permanently wipe {target}.\nType 'WIPE' to confirm: "
+    );
+    let _ = stdout.flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        let _ = writeln!(stderr, "error: failed to read confirmation input");
+        return Err(ExitCode::RuntimeError);
+    }
+    if input.trim() == "WIPE" {
+        Ok(true)
+    } else {
+        let _ = writeln!(stdout, "Aborted: confirmation mismatch.");
+        Ok(false)
     }
 }

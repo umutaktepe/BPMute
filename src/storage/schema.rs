@@ -23,6 +23,11 @@ pub fn lock_path_in_data_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("bpmute.lock")
 }
 
+/// Returns `<data_dir>/backups`.
+pub fn backups_dir_in_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("backups")
+}
+
 /// Checks whether the SQLite ledger database file exists, propagating permission errors.
 pub fn db_exists(db_path: &Path) -> Result<bool, StorageError> {
     Ok(db_path.try_exists()?)

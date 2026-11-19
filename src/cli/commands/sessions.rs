@@ -11,7 +11,9 @@ use crate::config::{LoadedConfig, PatchField};
 use crate::exit_code::ExitCode;
 use crate::logging::format_wearable_label;
 use crate::paths::ResolvedPaths;
-use crate::replay::{ReplayFidelity, ReplayOptions, replay_file, replay_stored_session};
+use crate::replay::{
+    ReplayFidelity, ReplayOptions, TraceFormat, replay_file, replay_stored_session,
+};
 use crate::sleep_engine::{CalibrationPriors, WearableFloor};
 use crate::storage::{
     AcceptShiftResult, LedgerStore, SessionFullDetail, SessionListPage, SetFeedbackRequest,
@@ -19,7 +21,7 @@ use crate::storage::{
 };
 
 use super::{
-    OnlineOrOffline, ReplayCliArgs, connect_online_or_offline, ipc_request_typed,
+    OnlineOrOffline, ReplayCliArgs, confirm_action, connect_online_or_offline, ipc_request_typed,
     open_existing_store_rw, report_ipc_error, report_storage_error, write_json_line,
 };
 
@@ -373,6 +375,129 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
                 Err(code) => code,
             }
         }
+        SessionsCommand::Delete { id, yes } => {
+            match confirm_action(&format!("Delete session '{id}'?"), yes, stdout, stderr) {
+                Ok(true) => {}
+                Ok(false) => return ExitCode::Success,
+                Err(code) => return code,
+            }
+
+            match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match client
+                        .request("session.delete", json!({ "session_id": id }))
+                        .await
+                    {
+                        Ok(val) => {
+                            let deleted_id = val["deleted_session_id"].as_str().unwrap_or(&id);
+                            let _ = writeln!(
+                                stdout,
+                                "Deleted session {deleted_id} and recomputed calibration."
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_ipc_error(err, stderr),
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => {
+                    let mut store = match open_existing_store_rw(
+                        &db_path,
+                        &lock_path,
+                        ExitCode::RuntimeError,
+                        &format!("error: session '{id}' not found (no ledger database)"),
+                        stderr,
+                    ) {
+                        Ok(s) => s,
+                        Err(code) => return code,
+                    };
+                    let now_ms = Utc::now().timestamp_millis();
+                    match store.delete_session_and_recompute(&id, now_ms) {
+                        Ok((deleted_id, _)) => {
+                            let _ = writeln!(
+                                stdout,
+                                "Deleted session {deleted_id} and recomputed calibration."
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_storage_error(err, stderr),
+                    }
+                }
+                Err(code) => code,
+            }
+        }
+        SessionsCommand::Export {
+            id,
+            path,
+            format,
+            no_anonymize,
+        } => {
+            let abs_path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir().unwrap_or_default().join(path)
+            };
+            let format_str = match format {
+                crate::cli::args::TraceFormatArg::Csv => "csv",
+                crate::cli::args::TraceFormatArg::Jsonl => "jsonl",
+            };
+            let trace_format = match format {
+                crate::cli::args::TraceFormatArg::Csv => TraceFormat::Csv,
+                crate::cli::args::TraceFormatArg::Jsonl => TraceFormat::Jsonl,
+            };
+
+            match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match client
+                        .request(
+                            "session.export_trace",
+                            json!({
+                                "session_id": id,
+                                "destination_path": abs_path.to_string_lossy(),
+                                "format": format_str,
+                                "no_anonymize": no_anonymize,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(val) => {
+                            let count = val["samples_exported"].as_u64().unwrap_or(0);
+                            let sid = val["session_id"].as_str().unwrap_or(&id);
+                            let _ = writeln!(
+                                stdout,
+                                "Exported {count} samples from session {sid} to {}",
+                                abs_path.display()
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_ipc_error(err, stderr),
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => {
+                    let store = match open_existing_store_rw(
+                        &db_path,
+                        &lock_path,
+                        ExitCode::RuntimeError,
+                        &format!("error: session '{id}' not found (no ledger database)"),
+                        stderr,
+                    ) {
+                        Ok(s) => s,
+                        Err(code) => return code,
+                    };
+                    match store.export_trace(&id, &abs_path, trace_format, !no_anonymize) {
+                        Ok(count) => {
+                            let _ = writeln!(
+                                stdout,
+                                "Exported {count} samples from session {id} to {}",
+                                abs_path.display()
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_storage_error(err, stderr),
+                    }
+                }
+                Err(code) => code,
+            }
+        }
     }
 }
 
@@ -579,5 +704,116 @@ pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
             }
             Err(code) => code,
         },
+        CalibrationCommand::Rebaseline {
+            seed,
+            reset_floors,
+            yes,
+        } => {
+            match confirm_action(
+                "Set calibration boundary and rebaseline personal physiology to Cold Start?",
+                yes,
+                stdout,
+                stderr,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return ExitCode::Success,
+                Err(code) => return code,
+            }
+
+            let now_ms = Utc::now().timestamp_millis();
+            match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    let mut map = serde_json::Map::new();
+                    map.insert("reason".to_string(), json!("rebaseline"));
+                    map.insert("reset_floors".to_string(), json!(reset_floors));
+                    if let Some(s) = seed {
+                        map.insert("seed_avg_sleep_hr".to_string(), json!(s));
+                    }
+                    match client
+                        .request("calibration.set_boundary", Value::Object(map))
+                        .await
+                    {
+                        Ok(_) => {
+                            let _ =
+                                writeln!(stdout, "Rebaselined calibration to Cold Start boundary.");
+                            ExitCode::Success
+                        }
+                        Err(err) => report_ipc_error(err, stderr),
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => {
+                    let mut store = match open_existing_store_rw(
+                        &db_path,
+                        &lock_path,
+                        ExitCode::RuntimeError,
+                        "error: ledger database not found",
+                        stderr,
+                    ) {
+                        Ok(s) => s,
+                        Err(code) => return code,
+                    };
+                    match store.set_calibration_boundary(None, seed, reset_floors, now_ms) {
+                        Ok(_) => {
+                            let _ =
+                                writeln!(stdout, "Rebaselined calibration to Cold Start boundary.");
+                            ExitCode::Success
+                        }
+                        Err(err) => report_storage_error(err, stderr),
+                    }
+                }
+                Err(code) => code,
+            }
+        }
+        CalibrationCommand::UndoBoundary { yes } => {
+            match confirm_action(
+                "Undo the most recent calibration boundary?",
+                yes,
+                stdout,
+                stderr,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return ExitCode::Success,
+                Err(code) => return code,
+            }
+
+            let now_ms = Utc::now().timestamp_millis();
+            match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(mut client)) => {
+                    match client.request("calibration.undo_boundary", json!({})).await {
+                        Ok(_) => {
+                            let _ = writeln!(
+                                stdout,
+                                "Undid calibration boundary; restored continuous calibration bit-for-bit."
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_ipc_error(err, stderr),
+                    }
+                }
+                Ok(OnlineOrOffline::Offline) => {
+                    let mut store = match open_existing_store_rw(
+                        &db_path,
+                        &lock_path,
+                        ExitCode::RuntimeError,
+                        "error: ledger database not found",
+                        stderr,
+                    ) {
+                        Ok(s) => s,
+                        Err(code) => return code,
+                    };
+                    match store.undo_calibration_boundary(now_ms) {
+                        Ok(_) => {
+                            let _ = writeln!(
+                                stdout,
+                                "Undid calibration boundary; restored continuous calibration bit-for-bit."
+                            );
+                            ExitCode::Success
+                        }
+                        Err(err) => report_storage_error(err, stderr),
+                    }
+                }
+                Err(code) => code,
+            }
+        }
     }
 }

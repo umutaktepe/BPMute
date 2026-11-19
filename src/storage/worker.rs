@@ -1,15 +1,18 @@
 //! Dedicated OS-thread persistence worker owning SQLite WAL I/O.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::calibration::CalibrationState;
+use crate::calibration::{CalibrationBoundaryRecord, CalibrationState};
+use crate::config::RetentionConfig;
+use crate::replay::TraceFormat;
 use crate::sleep_engine::{Epoch, HrPacket};
 use crate::storage::{
-    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, LedgerStore, OpenSessionRequest,
-    SessionFullDetail, SessionListPage, SetFeedbackRequest, StorageError, WearableDescriptor,
+    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, ImportMode, ImportSummary,
+    LedgerStore, OpenSessionRequest, PruneSummary, SessionFullDetail, SessionListPage,
+    SetFeedbackRequest, StorageError, StorageStats, WearableDescriptor,
 };
 
 enum DbCommand {
@@ -56,6 +59,18 @@ enum DbCommand {
         id_or_prefix: String,
         reply: oneshot::Sender<Result<SessionFullDetail, StorageError>>,
     },
+    DeleteSessionAndRecompute {
+        id_or_prefix: String,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(String, CalibrationState), StorageError>>,
+    },
+    ExportTrace {
+        id_or_prefix: String,
+        dest_path: PathBuf,
+        format: TraceFormat,
+        anonymize: bool,
+        reply: oneshot::Sender<Result<usize, StorageError>>,
+    },
     SetFeedbackAndRecompute {
         req: SetFeedbackRequest,
         now_ms: i64,
@@ -73,6 +88,55 @@ enum DbCommand {
     DismissShiftAndRecompute {
         now_ms: i64,
         reply: oneshot::Sender<Result<CalibrationState, StorageError>>,
+    },
+    SetCalibrationBoundaryAndRecompute {
+        effective_ts_ms: Option<i64>,
+        seed_sleep_hr: Option<f64>,
+        reset_floors: bool,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(CalibrationBoundaryRecord, CalibrationState), StorageError>>,
+    },
+    UndoCalibrationBoundaryAndRecompute {
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(CalibrationBoundaryRecord, CalibrationState), StorageError>>,
+    },
+    PurgeRawSamples {
+        reply: oneshot::Sender<Result<usize, StorageError>>,
+    },
+    HardWipe {
+        wipe_all: bool,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    BackupSqlite {
+        dest_path: PathBuf,
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    GetStorageStats {
+        reply: oneshot::Sender<Result<StorageStats, StorageError>>,
+    },
+    ExportBundle {
+        dest_path: PathBuf,
+        include_epochs: bool,
+        include_wearables: bool,
+        include_raw: bool,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    ImportBundle {
+        src_path: PathBuf,
+        mode: ImportMode,
+        force: bool,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(ImportSummary, CalibrationState), StorageError>>,
+    },
+    SetRetentionConfig {
+        config: RetentionConfig,
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    PruneRetention {
+        now_ms: i64,
+        reply: oneshot::Sender<Result<PruneSummary, StorageError>>,
     },
     FlushWal {
         reply: oneshot::Sender<Result<(), StorageError>>,
@@ -116,6 +180,10 @@ impl PersistenceWorker {
                     }
                 };
                 if let Err(err) = store.recover_stale_sessions(now_ms) {
+                    let _ = init_tx.send(Err(err));
+                    return;
+                }
+                if let Err(err) = store.prune_retention(now_ms) {
                     let _ = init_tx.send(Err(err));
                     return;
                 }
@@ -244,6 +312,87 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         }
         DbCommand::DismissShiftAndRecompute { now_ms, reply } => {
             let _ = reply.send(store.dismiss_shift_and_recompute(now_ms));
+        }
+        DbCommand::DeleteSessionAndRecompute {
+            id_or_prefix,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.delete_session_and_recompute(&id_or_prefix, now_ms));
+        }
+        DbCommand::ExportTrace {
+            id_or_prefix,
+            dest_path,
+            format,
+            anonymize,
+            reply,
+        } => {
+            let _ = reply.send(store.export_trace(&id_or_prefix, &dest_path, format, anonymize));
+        }
+        DbCommand::SetCalibrationBoundaryAndRecompute {
+            effective_ts_ms,
+            seed_sleep_hr,
+            reset_floors,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.set_calibration_boundary(
+                effective_ts_ms,
+                seed_sleep_hr,
+                reset_floors,
+                now_ms,
+            ));
+        }
+        DbCommand::UndoCalibrationBoundaryAndRecompute { now_ms, reply } => {
+            let _ = reply.send(store.undo_calibration_boundary(now_ms));
+        }
+        DbCommand::PurgeRawSamples { reply } => {
+            let _ = reply.send(store.purge_raw_samples());
+        }
+        DbCommand::HardWipe {
+            wipe_all,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.hard_wipe(wipe_all, now_ms));
+        }
+        DbCommand::BackupSqlite { dest_path, reply } => {
+            let _ = reply.send(store.backup_sqlite(&dest_path));
+        }
+        DbCommand::GetStorageStats { reply } => {
+            let _ = reply.send(store.get_storage_stats());
+        }
+        DbCommand::ExportBundle {
+            dest_path,
+            include_epochs,
+            include_wearables,
+            include_raw,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.export_bundle(
+                &dest_path,
+                include_epochs,
+                include_wearables,
+                include_raw,
+                now_ms,
+            ));
+        }
+        DbCommand::ImportBundle {
+            src_path,
+            mode,
+            force,
+            now_ms,
+            reply,
+        } => {
+            let _ = reply.send(store.import_bundle(&src_path, mode, force, now_ms));
+        }
+        DbCommand::SetRetentionConfig { config, reply } => {
+            store.set_retention_config(config);
+            let _ = reply.send(Ok(()));
+        }
+        DbCommand::PruneRetention { now_ms, reply } => {
+            let _ = reply.send(store.prune_retention(now_ms));
         }
         DbCommand::FlushWal { reply } => {
             let _ = reply.send(store.flush_wal());
@@ -397,6 +546,131 @@ impl PersistenceHandle {
         now_ms: i64,
     ) -> Result<CalibrationState, StorageError> {
         self.call(|reply| DbCommand::DismissShiftAndRecompute { now_ms, reply })
+            .await
+    }
+
+    pub async fn delete_session_and_recompute(
+        &self,
+        id_or_prefix: String,
+        now_ms: i64,
+    ) -> Result<(String, CalibrationState), StorageError> {
+        self.call(|reply| DbCommand::DeleteSessionAndRecompute {
+            id_or_prefix,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn export_trace(
+        &self,
+        id_or_prefix: String,
+        dest_path: PathBuf,
+        format: TraceFormat,
+        anonymize: bool,
+    ) -> Result<usize, StorageError> {
+        self.call(|reply| DbCommand::ExportTrace {
+            id_or_prefix,
+            dest_path,
+            format,
+            anonymize,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_calibration_boundary_and_recompute(
+        &self,
+        effective_ts_ms: Option<i64>,
+        seed_sleep_hr: Option<f64>,
+        reset_floors: bool,
+        now_ms: i64,
+    ) -> Result<(CalibrationBoundaryRecord, CalibrationState), StorageError> {
+        self.call(|reply| DbCommand::SetCalibrationBoundaryAndRecompute {
+            effective_ts_ms,
+            seed_sleep_hr,
+            reset_floors,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn undo_calibration_boundary_and_recompute(
+        &self,
+        now_ms: i64,
+    ) -> Result<(CalibrationBoundaryRecord, CalibrationState), StorageError> {
+        self.call(|reply| DbCommand::UndoCalibrationBoundaryAndRecompute { now_ms, reply })
+            .await
+    }
+
+    pub async fn purge_raw_samples(&self) -> Result<usize, StorageError> {
+        self.call(|reply| DbCommand::PurgeRawSamples { reply })
+            .await
+    }
+
+    pub async fn hard_wipe(&self, wipe_all: bool, now_ms: i64) -> Result<(), StorageError> {
+        self.call(|reply| DbCommand::HardWipe {
+            wipe_all,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn backup_sqlite(&self, dest_path: PathBuf) -> Result<(), StorageError> {
+        self.call(|reply| DbCommand::BackupSqlite { dest_path, reply })
+            .await
+    }
+
+    pub async fn get_storage_stats(&self) -> Result<StorageStats, StorageError> {
+        self.call(|reply| DbCommand::GetStorageStats { reply })
+            .await
+    }
+
+    pub async fn export_bundle(
+        &self,
+        dest_path: PathBuf,
+        include_epochs: bool,
+        include_wearables: bool,
+        include_raw: bool,
+        now_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.call(|reply| DbCommand::ExportBundle {
+            dest_path,
+            include_epochs,
+            include_wearables,
+            include_raw,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn import_bundle(
+        &self,
+        src_path: PathBuf,
+        mode: ImportMode,
+        force: bool,
+        now_ms: i64,
+    ) -> Result<(ImportSummary, CalibrationState), StorageError> {
+        self.call(|reply| DbCommand::ImportBundle {
+            src_path,
+            mode,
+            force,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn set_retention_config(&self, config: RetentionConfig) -> Result<(), StorageError> {
+        self.call(|reply| DbCommand::SetRetentionConfig { config, reply })
+            .await
+    }
+
+    pub async fn prune_retention(&self, now_ms: i64) -> Result<PruneSummary, StorageError> {
+        self.call(|reply| DbCommand::PruneRetention { now_ms, reply })
             .await
     }
 }

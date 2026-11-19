@@ -107,6 +107,11 @@ pub enum Command {
         #[command(subcommand)]
         action: CalibrationCommand,
     },
+    /// Manage biometric data retention, purge raw samples, wipe history, and import/export ledger bundles.
+    Data {
+        #[command(subcommand)]
+        action: DataCommand,
+    },
     /// Manage declarative TOML configuration (`config.toml`).
     Config {
         #[command(subcommand)]
@@ -206,6 +211,27 @@ pub enum SessionsCommand {
         #[arg(long)]
         clear: bool,
     },
+    /// Delete a closed Monitoring Session and immediately recompute calibration.
+    Delete {
+        /// Session UUIDv7 or unambiguous ID prefix.
+        id: String,
+        /// Skip interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Export a session trace to canonical CSV or JSONL format.
+    Export {
+        /// Session UUIDv7 or unambiguous ID prefix.
+        id: String,
+        /// Destination file path for trace.
+        path: PathBuf,
+        /// Trace format (`csv` or `jsonl`).
+        #[arg(long, value_enum, default_value = "csv")]
+        format: TraceFormatArg,
+        /// Preserve absolute timestamps and hardware identifiers (do not anonymize).
+        #[arg(long)]
+        no_anonymize: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,6 +259,94 @@ pub enum CalibrationCommand {
     AcceptShift,
     /// Dismiss a pending 5-session persistent-shift prompt (`Keep ignoring`).
     DismissShift,
+    /// Rebaseline personal physiology to Cold Start (recalculating from this boundary onward).
+    Rebaseline {
+        /// Optional initial Day-1 sleeping HR seed (30..=140 bpm).
+        #[arg(long, value_name = "BPM")]
+        seed: Option<f64>,
+        /// Also reset per-wearable hardware signal floors back to Cold Start.
+        #[arg(long)]
+        reset_floors: bool,
+        /// Skip interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Undo the most recent Calibration Boundary, restoring continuous historical calibration bit-for-bit.
+    UndoBoundary {
+        /// Skip interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DataCommand {
+    /// Show storage statistics, retention policies, maturity, and active boundary.
+    Stats {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Zero-overwrite and purge all raw biometric samples across closed sessions without modifying epochs or calibration.
+    PurgeRaw {
+        /// Skip interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Wipe biometric session history, epochs, and calibration (aborts active session; runs VACUUM with secure_delete).
+    Wipe {
+        /// Also wipe enrolled wearables and custom configuration.
+        #[arg(long)]
+        all: bool,
+        /// Confirmation keyword; must be 'WIPE' when invoked non-interactively.
+        #[arg(long, value_name = "CONFIRM")]
+        confirm: Option<String>,
+    },
+    /// Export portable schema-versioned JSON ledger bundle.
+    Export {
+        /// Destination file path (.json).
+        path: PathBuf,
+        /// Include 15-second summary epochs.
+        #[arg(long)]
+        include_epochs: bool,
+        /// Include enrolled wearables.
+        #[arg(long)]
+        include_wearables: bool,
+        /// Include raw biometric samples.
+        #[arg(long)]
+        include_raw: bool,
+    },
+    /// Import portable schema-versioned JSON ledger bundle.
+    Import {
+        /// Source bundle file path (.json).
+        path: PathBuf,
+        /// Import mode (`merge` or `replace`).
+        #[arg(long, value_enum, default_value = "merge")]
+        mode: ImportModeArg,
+        /// In merge mode, force overwriting newer local feedback with incoming bundle records.
+        #[arg(long)]
+        force: bool,
+        /// Skip interactive confirmation (required for non-interactive `replace` mode).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Create a WAL-safe online backup of the SQLite ledger database (0600 permissions).
+    Backup {
+        /// Destination backup SQLite file path.
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum TraceFormatArg {
+    Csv,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ImportModeArg {
+    Merge,
+    Replace,
 }
 
 #[derive(Debug, Subcommand)]

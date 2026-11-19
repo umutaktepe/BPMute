@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use crate::calibration::{CalibrationState, FeedbackVerdict};
 use crate::config::{ClockTime, Config, LogFormat, PatchField, ScheduleConfig};
+use crate::replay::TraceFormat;
 use crate::sleep_engine::{ContactStatus, DetectorState, Epoch, StreamStatus};
-use crate::storage::{EnrolledWearable, SessionFullDetail};
+use crate::storage::{EnrolledWearable, ImportMode, SessionFullDetail};
 
 /// Current NDJSON IPC protocol version (ADR-0002).
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -345,6 +346,72 @@ pub struct SetFeedbackParams {
 #[serde(deny_unknown_fields)]
 pub struct SetSeedParams {
     pub sleep_hr: Option<f64>,
+}
+
+/// Parameters accepted by `session.delete`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDeleteParams {
+    pub id: String,
+}
+
+/// Parameters accepted by `session.export_trace`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionExportTraceParams {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub format: Option<TraceFormat>,
+    #[serde(default)]
+    pub no_anonymize: bool,
+}
+
+/// Parameters accepted by `calibration.set_boundary`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CalibrationSetBoundaryParams {
+    pub effective_ts_ms: Option<i64>,
+    pub seed_sleep_hr: Option<f64>,
+    pub reset_floors: bool,
+}
+
+/// Parameters accepted by `data.hard_wipe`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DataHardWipeParams {
+    pub all: bool,
+}
+
+/// Parameters accepted by `data.export_bundle`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataExportBundleParams {
+    pub path: String,
+    #[serde(default)]
+    pub include_epochs: bool,
+    #[serde(default)]
+    pub include_wearables: bool,
+    #[serde(default)]
+    pub include_raw: bool,
+}
+
+/// Parameters accepted by `data.import_bundle`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataImportBundleParams {
+    pub path: String,
+    #[serde(default)]
+    pub mode: Option<ImportMode>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Parameters accepted by `data.backup_sqlite`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataBackupSqliteParams {
+    pub path: String,
 }
 
 /// Stream event payload pushed as `HrSample` (and buffered for `Snapshot`).
