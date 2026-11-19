@@ -67,6 +67,53 @@ pub struct DaemonOptions {
     pub notifier: Option<Arc<dyn Notifier>>,
 }
 
+impl DaemonOptions {
+    /// Constructs [`DaemonOptions`] for hermetic testing with in-memory defaults
+    /// (`NullWearableSource`, `FakeActionExecutor`, `FakeNotifier`, `install_signals = false`).
+    pub fn for_testing(
+        paths: ResolvedPaths,
+        loaded_config: LoadedConfig,
+        env: Arc<dyn EnvSource>,
+        clock: Arc<dyn DaemonClock>,
+    ) -> Self {
+        Self {
+            paths,
+            loaded_config,
+            env,
+            cli_overrides: CliOverrides::default(),
+            clock,
+            wearable_source: None,
+            install_signals: false,
+            action_executor: None,
+            notifier: None,
+        }
+    }
+
+    /// Builder helper to attach a custom [`WearableSource`].
+    pub fn with_wearable_source(mut self, source: Arc<dyn WearableSource>) -> Self {
+        self.wearable_source = Some(source);
+        self
+    }
+
+    /// Builder helper to attach a custom [`ActionExecutor`].
+    pub fn with_action_executor(mut self, executor: Arc<dyn ActionExecutor>) -> Self {
+        self.action_executor = Some(executor);
+        self
+    }
+
+    /// Builder helper to attach a custom [`Notifier`].
+    pub fn with_notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// Builder helper to set CLI overrides.
+    pub fn with_cli_overrides(mut self, cli_overrides: CliOverrides) -> Self {
+        self.cli_overrides = cli_overrides;
+        self
+    }
+}
+
 /// Running background daemon instance with graceful shutdown and IPC control handles.
 pub struct DaemonHandle {
     core: Arc<DaemonCore>,

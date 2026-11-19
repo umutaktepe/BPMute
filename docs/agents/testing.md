@@ -21,6 +21,11 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 - **`PatchField` serialization**: `PatchField::Unchanged` serializes to JSON `null`, but receiving `null` deserializes as `PatchField::Clear`. When constructing JSON payloads for partial mutation ops (like `session.set_feedback`), omit unchanged keys from the JSON map entirely.
 - **`clap` `ValueEnum` naming**: Annotate enum types parsed by `clap` with `#[value(rename_all = "snake_case")]` and provide kebab-case aliases (`alias = "..."`) so that both CLI arguments (`--verdict missed-sleep` / `--verdict missed_sleep`) and IPC payloads parse consistently.
 
+## D-Bus Hermeticism & Test Doubles
+
+- **Host D-Bus isolation**: Test processes must never connect to the developer's live system or session D-Bus. `./scripts/test.sh` and `./scripts/check.sh` enforce `DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null"` and `DBUS_SYSTEM_BUS_ADDRESS="unix:path=/dev/null"`. Any test requiring OS or notification interactions must use in-memory doubles (`FakeActionExecutor`, `FakeNotifier`).
+- **Daemon options in tests**: Use `DaemonOptions::for_testing(...)` rather than constructing raw struct literals. This defaults OS-touching handles (`action_executor`, `notifier`, `wearable_source`) safely to in-memory test doubles and insulates tests from future struct field additions.
+
 ## Test Execution
 
 - **Timeout bounds**: Wrap iterative test runs in a timeout (`timeout 30 cargo test ...` or `./scripts/test.sh ...`). If a test hangs, an unbounded run will wait indefinitely.
