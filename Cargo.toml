@@ -21,3 +21,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["process", "test-util"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_invalid_type = "deny"
+await_holding_refcell_ref = "deny"

@@ -133,38 +133,77 @@ fn trace_and_debug_logs_redact_biometrics_and_macs_by_default_in_pretty_and_json
         let output = buf.take_string();
         assert!(!output.is_empty());
 
+        // Strip leading timestamps before scanning payloads so wall-clock digits (e.g. `:54:`)
+        // never trigger false-positive collisions on 2-digit biometric values.
+        let payload_only: String = output
+            .lines()
+            .map(|line| match format {
+                EffectiveLogFormat::Json => {
+                    let mut parsed: serde_json::Value =
+                        serde_json::from_str(line).expect("each JSON log line must be valid JSON");
+                    assert!(parsed.get("level").is_some());
+                    assert!(parsed.get("message").is_some());
+                    if let Some(obj) = parsed.as_object_mut() {
+                        obj.remove("timestamp");
+                    }
+                    parsed.to_string()
+                }
+                EffectiveLogFormat::Pretty | EffectiveLogFormat::Journald => line
+                    .split_once(' ')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_else(|| line.to_string()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
         // Sensitive values must NEVER appear anywhere at DEBUG or TRACE when disabled.
-        assert!(!output.contains("57.5"), "raw bpm leaked:\n{output}");
-        assert!(!output.contains("58.0"), "raw bpm leaked:\n{output}");
-        assert!(!output.contains("61"), "raw hr leaked:\n{output}");
-        assert!(!output.contains("54"), "avg_sleep_hr leaked:\n{output}");
-        assert!(!output.contains("1043"), "raw rr leaked:\n{output}");
-        assert!(!output.contains("1024"), "raw rr leaked:\n{output}");
-        assert!(!output.contains("42.3"), "rmssd leaked:\n{output}");
         assert!(
-            !output.contains("D4:A9:28:11:22:C5") && !output.contains("D4-A9-28-11-22-C5"),
-            "full MAC leaked:\n{output}"
+            !payload_only.contains("57.5"),
+            "raw bpm leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("58.0"),
+            "raw bpm leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("61"),
+            "raw hr leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("54"),
+            "avg_sleep_hr leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("1043"),
+            "raw rr leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("1024"),
+            "raw rr leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("42.3"),
+            "rmssd leaked:\n{payload_only}"
+        );
+        assert!(
+            !payload_only.contains("D4:A9:28:11:22:C5")
+                && !payload_only.contains("D4-A9-28-11-22-C5"),
+            "full MAC leaked:\n{payload_only}"
         );
 
         // Masked MAC and alias must be preserved.
-        assert!(output.contains("..:22:C5"), "masked MAC missing:\n{output}");
         assert!(
-            output.contains("Watch GT5 (..:22:C5)"),
-            "formatted wearable label missing:\n{output}"
+            payload_only.contains("..:22:C5"),
+            "masked MAC missing:\n{payload_only}"
         );
         assert!(
-            output.contains("[REDACTED]"),
-            "redaction marker missing:\n{output}"
+            payload_only.contains("Watch GT5 (..:22:C5)"),
+            "formatted wearable label missing:\n{payload_only}"
         );
-
-        if format == EffectiveLogFormat::Json {
-            for line in output.lines() {
-                let parsed: serde_json::Value =
-                    serde_json::from_str(line).expect("each JSON log line must be valid JSON");
-                assert!(parsed.get("level").is_some());
-                assert!(parsed.get("message").is_some());
-            }
-        }
+        assert!(
+            payload_only.contains("[REDACTED]"),
+            "redaction marker missing:\n{payload_only}"
+        );
     }
 }
 

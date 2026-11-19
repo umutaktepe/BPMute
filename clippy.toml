@@ -1,0 +1,5 @@
+await-holding-invalid-types = [
+  { path = "std::io::StdoutLock", reason = "Holding StdoutLock across .await risks deadlocking async tasks writing to stdout" },
+  { path = "std::io::StderrLock", reason = "Holding StderrLock across .await deadlocks Tokio workers logging via tracing to stderr" },
+  { path = "std::io::StdinLock", reason = "Holding StdinLock across .await blocks concurrent stdin access" },
+]
