@@ -5,3 +5,5 @@ pub mod exit_code;
 pub mod ipc;
 pub mod logging;
 pub mod paths;
+pub mod replay;
+pub mod sleep_engine;

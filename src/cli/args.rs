@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::LogFormat;
+use crate::config::{LogFormat, Sensitivity};
 
 /// BPMute — BLE Heart-Rate Sleep-Onset Daemon & CLI.
 #[derive(Debug, Parser)]
@@ -61,6 +61,20 @@ pub enum Command {
     },
     /// Resume Sleep Action Pipeline triggers after a pause.
     Resume,
+    /// Replay a canonical CSV or JSONL heart-rate trace read-only through the sleep-onset engine.
+    Replay {
+        /// Path to canonical CSV or JSONL trace file.
+        file: PathBuf,
+        /// Override sensitivity preset for what-if comparison.
+        #[arg(long, value_enum, value_name = "NAME")]
+        preset: Option<Sensitivity>,
+        /// Force Cold Start priors regardless of personal calibration history.
+        #[arg(long)]
+        cold_start: bool,
+        /// Emit machine-readable JSON replay report (`epochs`, transitions, and sessions).
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage declarative TOML configuration (`config.toml`).
     Config {
         #[command(subcommand)]

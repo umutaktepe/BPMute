@@ -19,6 +19,8 @@ tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+rand = "0.8"
+rand_chacha = "0.3"
 tempfile = "3"
 tokio = { version = "1", features = ["process", "test-util"] }
 

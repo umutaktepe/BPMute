@@ -1,16 +1,19 @@
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
 use serde_json::json;
 
-use crate::config::{CliOverrides, LoadedConfig, init_config_file};
+use crate::config::{CliOverrides, LoadedConfig, Sensitivity, init_config_file};
 use crate::daemon::{DaemonError, DaemonHandle, DaemonOptions, SystemClock};
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::ConfigSnapshotPayload;
 use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus};
 use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
+use crate::replay::{ReplayOptions, replay_file};
+use crate::sleep_engine::{CalibrationPriors, WearableFloor};
 
 use super::args::{Cli, Command, ConfigCommand};
 use super::duration::{PauseTarget, parse_pause_target};
@@ -45,6 +48,24 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
         Command::Status { json } => run_status(&paths, json, stdout, stderr).await,
         Command::Pause { target } => run_pause(&paths, target.as_deref(), stdout, stderr).await,
         Command::Resume => run_resume(&paths, stdout, stderr).await,
+        Command::Replay {
+            file,
+            preset,
+            cold_start,
+            json,
+        } => run_replay(
+            ReplayCliArgs {
+                file: &file,
+                preset,
+                cold_start,
+                as_json: json,
+                paths: &paths,
+                env,
+                cli_overrides: &cli_overrides,
+            },
+            stdout,
+            stderr,
+        ),
         Command::Config { action } => {
             run_config(action, &paths, env, &cli_overrides, stdout, stderr).await
         }
@@ -212,6 +233,93 @@ async fn run_resume<WOut: Write, WErr: Write>(
         }
         Err(err) => report_ipc_error(err, stderr),
     }
+}
+
+struct ReplayCliArgs<'a> {
+    file: &'a Path,
+    preset: Option<Sensitivity>,
+    cold_start: bool,
+    as_json: bool,
+    paths: &'a ResolvedPaths,
+    env: &'a dyn EnvSource,
+    cli_overrides: &'a CliOverrides,
+}
+
+fn run_replay<WOut: Write, WErr: Write>(
+    args: ReplayCliArgs<'_>,
+    stdout: &mut WOut,
+    stderr: &mut WErr,
+) -> ExitCode {
+    let loaded = match LoadedConfig::load(&args.paths.config_file, args.env, args.cli_overrides) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            let _ = writeln!(stderr, "error: {err}");
+            return err.exit_code();
+        }
+    };
+
+    let options = ReplayOptions {
+        preset: args.preset,
+        cold_start: args.cold_start,
+        grace_period_sec: loaded.config.actions.effective_grace_period_sec(),
+        priors: CalibrationPriors::cold_start(),
+        wearable_floor: WearableFloor::default(),
+    };
+
+    let report = match replay_file(args.file, loaded.config.detection, options) {
+        Ok(report) => report,
+        Err(err) => {
+            let _ = writeln!(stderr, "error: {err}");
+            return err.exit_code();
+        }
+    };
+
+    if args.as_json {
+        if let Err(err) = serde_json::to_writer(&mut *stdout, &report) {
+            let _ = writeln!(stderr, "error: failed to serialize replay report: {err}");
+            return ExitCode::RuntimeError;
+        }
+        let _ = writeln!(stdout);
+        return ExitCode::Success;
+    }
+
+    let _ = writeln!(
+        stdout,
+        "Replay fidelity: {} (read-only) | format: {} | preset: {} | cold_start: {}",
+        report.fidelity.as_str(),
+        report.format.as_str(),
+        report.preset,
+        report.cold_start
+    );
+    let _ = writeln!(
+        stdout,
+        "Processed {} HR samples ({} events) -> {} epochs across {} session(s)",
+        report.samples_processed,
+        report.events_processed,
+        report.epochs_emitted,
+        report.sessions.len()
+    );
+    for s in &report.sessions {
+        let end_tag = s
+            .end_reason
+            .map(|r| format!("{r:?}"))
+            .unwrap_or_else(|| "open".to_string());
+        let _ = writeln!(
+            stdout,
+            "  Session #{}: start={} ms, end={} ms ({}), epochs={}, confirmed={:?}, sleeping={:?}, anomalous={}, fps={}",
+            s.session_index,
+            s.start_ts_ms,
+            s.end_ts_ms,
+            end_tag,
+            s.epochs_count,
+            s.confirmed_ts_ms,
+            s.sleeping_ts_ms,
+            s.anomalous,
+            s.fp_count
+        );
+    }
+
+    ExitCode::Success
 }
 
 async fn run_config<WOut: Write, WErr: Write>(
