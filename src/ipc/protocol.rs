@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::config::{Config, ScheduleConfig};
+use crate::config::{Config, LogFormat, ScheduleConfig};
 
 /// Current NDJSON IPC protocol version (ADR-0002).
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -132,6 +132,22 @@ pub struct DaemonAlert {
     pub dismissible: bool,
 }
 
+/// High-level daemon monitoring state reported in `daemon.status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MonitoringState {
+    Idle,
+    Paused,
+}
+
+impl std::fmt::Display for MonitoringState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => f.write_str("Idle"),
+            Self::Paused => f.write_str("Paused"),
+        }
+    }
+}
+
 /// Online `daemon.status` / `bpmute status --json` payload (ADR-0002, ADR-0009).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonStatus {
@@ -140,7 +156,7 @@ pub struct DaemonStatus {
     pub version: String,
     pub pid: u32,
     pub uptime_sec: u64,
-    pub monitoring_state: String,
+    pub monitoring_state: MonitoringState,
     pub armed: bool,
     pub paused: bool,
     pub paused_until: Option<String>,
@@ -178,6 +194,6 @@ pub struct ConfigSnapshotPayload {
     pub file_present: bool,
     pub config_path: String,
     pub log_filter: String,
-    pub log_format: String,
+    pub log_format: LogFormat,
     pub log_biometrics: bool,
 }

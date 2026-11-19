@@ -23,6 +23,12 @@ pub enum IpcClientError {
         #[source]
         source: io::Error,
     },
+    #[error("permission denied accessing daemon socket at {path}: {source}")]
+    PermissionDenied {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
     #[error("IPC server returned error [{code}]: {message}")]
     Server { code: String, message: String },
     #[error("IPC framing error: {0}")]
@@ -64,6 +70,10 @@ impl IpcClient {
                             source,
                         }
                     }
+                    io::ErrorKind::PermissionDenied => IpcClientError::PermissionDenied {
+                        path: socket_path.display().to_string(),
+                        source,
+                    },
                     _ => IpcClientError::Frame(FrameError::Io(source)),
                 })?;
 

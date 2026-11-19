@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use bpmute::config::LogFormat;
 use bpmute::logging::{
-    BiometricLogContext, EffectiveLogFormat, build_test_subscriber, format_wearable_label,
-    mask_mac, redact_macs_in_text, resolve_log_format,
+    BiometricLogContext, BiometricRedactingLayer, EffectiveLogFormat, build_test_subscriber,
+    format_wearable_label, mask_mac, redact_macs_in_text, resolve_log_format,
 };
 use bpmute::paths::MapEnv;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -78,6 +80,7 @@ fn journal_stream_auto_detection_selects_journald_or_pretty() {
 fn mac_masking_and_wearable_label_formatting() {
     assert_eq!(mask_mac("aa:bb:cc:dd:ee:05"), "..:EE:05");
     assert_eq!(mask_mac("AA-BB-CC-DD-EE-05"), "..:EE:05");
+    assert_eq!(mask_mac("..:ee:05"), "..:EE:05");
 
     assert_eq!(
         format_wearable_label(Some("Huawei Watch"), "aa:bb:cc:dd:ee:05", false),
@@ -183,4 +186,87 @@ fn explicit_log_biometrics_unlocks_raw_telemetry_and_full_mac() {
     assert!(output.contains("1043"));
     assert!(output.contains("D4:A9:28:11:22:C5"));
     assert!(!output.contains("[REDACTED]"));
+}
+
+struct RawCaptureLayer(Arc<Mutex<Vec<String>>>);
+
+struct RawCaptureVisitor<'a>(&'a mut String);
+
+impl Visit for RawCaptureVisitor<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={:?}", field.name(), value));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.push_str(&format!(" {}={}", field.name(), value));
+    }
+}
+
+impl<S> Layer<S> for RawCaptureLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: Context<'_, S>,
+    ) {
+        let mut line = format!("SPAN[{}]", attrs.metadata().name());
+        attrs.record(&mut RawCaptureVisitor(&mut line));
+        self.0.lock().unwrap().push(line);
+    }
+
+    fn on_record(
+        &self,
+        _span: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: Context<'_, S>,
+    ) {
+        let mut line = String::from("RECORD");
+        values.record(&mut RawCaptureVisitor(&mut line));
+        self.0.lock().unwrap().push(line);
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut line = format!("EVENT[{}]", event.metadata().level());
+        event.record(&mut RawCaptureVisitor(&mut line));
+        self.0.lock().unwrap().push(line);
+    }
+}
+
+#[test]
+fn redacting_wrapper_sanitizes_spans_and_events_for_unredacting_layers() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let wrapped = BiometricRedactingLayer::new(RawCaptureLayer(Arc::clone(&captured)), false);
+    let subscriber = tracing_subscriber::registry().with(wrapped);
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!(
+            "wearable_stream",
+            mac = "AA:BB:CC:DD:EE:FF",
+            bpm = tracing::field::Empty
+        );
+        span.record("bpm", 55.2);
+        let _guard = span.enter();
+        tracing::trace!(
+            hr = 56,
+            rr_ms = "[990, 1005]",
+            "raw packet from AA:BB:CC:DD:EE:FF"
+        );
+    });
+
+    let joined = captured.lock().unwrap().join("\n");
+    assert!(
+        !joined.contains("AA:BB:CC:DD:EE:FF"),
+        "full MAC leaked:\n{joined}"
+    );
+    assert!(!joined.contains("55.2"), "span bpm leaked:\n{joined}");
+    assert!(!joined.contains("56"), "event hr leaked:\n{joined}");
+    assert!(!joined.contains("990"), "event rr leaked:\n{joined}");
+    assert!(joined.contains("..:EE:FF"), "masked MAC missing:\n{joined}");
+    assert!(
+        joined.contains("[REDACTED]"),
+        "redaction marker missing:\n{joined}"
+    );
 }

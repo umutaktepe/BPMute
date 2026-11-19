@@ -378,3 +378,42 @@ async fn drop_oldest_backpressure_drops_stale_hr_samples_without_dropping_contro
 
     daemon.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn runtime_dry_run_survives_unrelated_config_updates_and_reloads() {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 12, 0, 0).unwrap();
+    let (daemon, paths) = start_virtual_daemon(&temp, start_utc).await;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client
+        .request("monitor.set_dry_run", json!({ "dry_run": true }))
+        .await
+        .unwrap();
+
+    // Unrelated config.update (sensitivity) must NOT clobber runtime dry_run.
+    client
+        .request(
+            "config.update",
+            json!({ "detection": { "sensitivity": "conservative" } }),
+        )
+        .await
+        .unwrap();
+    let st1 = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st1["dry_run"], true);
+
+    // Unrelated config.reload must also preserve runtime dry_run.
+    client.request("config.reload", json!({})).await.unwrap();
+    let st2 = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st2["dry_run"], true);
+
+    // Explicit config.update touching actions.dry_run updates runtime dry_run.
+    client
+        .request("config.update", json!({ "actions": { "dry_run": false } }))
+        .await
+        .unwrap();
+    let st3 = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st3["dry_run"], false);
+
+    daemon.shutdown().await;
+}

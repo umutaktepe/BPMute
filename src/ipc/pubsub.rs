@@ -144,24 +144,15 @@ impl EventBroker {
 
     /// Broadcasts a reliable control event to all active subscribers.
     pub fn publish_control(&self, event: &str, data: Value) {
-        let targets: Vec<Arc<SubscriberQueue>> = self
-            .subscribers
-            .lock()
-            .expect("broker mutex poisoned")
-            .values()
-            .cloned()
-            .collect();
-        if targets.is_empty() {
-            return;
-        }
-        let envelope = self.make_event(event, data);
-        for queue in targets {
-            queue.push_control(envelope.clone());
-        }
+        self.publish(EventLane::Control, event, data);
     }
 
     /// Broadcasts a droppable stream event (`HrSample`) to all active subscribers.
     pub fn publish_stream(&self, event: &str, data: Value) {
+        self.publish(EventLane::Stream, event, data);
+    }
+
+    fn publish(&self, lane: EventLane, event: &str, data: Value) {
         let targets: Vec<Arc<SubscriberQueue>> = self
             .subscribers
             .lock()
@@ -174,7 +165,15 @@ impl EventBroker {
         }
         let envelope = self.make_event(event, data);
         for queue in targets {
-            queue.push_stream(envelope.clone());
+            match lane {
+                EventLane::Control => queue.push_control(envelope.clone()),
+                EventLane::Stream => queue.push_stream(envelope.clone()),
+            }
         }
     }
+}
+
+enum EventLane {
+    Control,
+    Stream,
 }

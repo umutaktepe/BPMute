@@ -193,7 +193,7 @@ async fn process_line(
         other => {
             let resp = match core.handle_op(other, req.params) {
                 Ok(data) => ResponseEnvelope::ok(req.id, data),
-                Err((code, msg)) => ResponseEnvelope::err(req.id, code, msg),
+                Err(err) => ResponseEnvelope::err(req.id, err.code, err.message),
             };
             let _ = resp_tx.send(resp).await;
         }

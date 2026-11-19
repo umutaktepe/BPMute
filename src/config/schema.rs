@@ -29,6 +29,8 @@ pub enum ConfigError {
     LogFilter(String),
     #[error("failed to patch TOML document: {0}")]
     TomlEdit(String),
+    #[error("failed to initialize logging subscriber: {0}")]
+    LoggingInit(String),
 }
 
 impl ConfigError {
@@ -36,7 +38,10 @@ impl ConfigError {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::AlreadyExists(_) => ExitCode::PreconditionConflict,
-            Self::Io(_) => ExitCode::RuntimeError,
+            Self::Io(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                ExitCode::PermissionOrBackendRefusal
+            }
+            Self::Io(_) | Self::LoggingInit(_) => ExitCode::RuntimeError,
             Self::Parse(_)
             | Self::Validation(_)
             | Self::Env(_)

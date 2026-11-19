@@ -37,12 +37,38 @@ pub fn is_mac_field(name: &str) -> bool {
 }
 
 /// Masks a 6-octet MAC address (`AA:BB:CC:DD:EE:FF` or `aa-bb-cc-dd-ee-ff`) to `..:EE:FF`.
+///
+/// Idempotent when called on an already-masked `..:XX:YY` string.
 pub fn mask_mac(mac: &str) -> String {
     let trimmed = mac.trim();
     if let Some((x1, x2, y1, y2)) = parse_mac_tail(trimmed.as_bytes()) {
         format!("..:{x1}{x2}:{y1}{y2}")
+    } else if let Some((x1, x2, y1, y2)) = parse_already_masked_mac(trimmed.as_bytes()) {
+        format!("..:{x1}{x2}:{y1}{y2}")
     } else {
         "..:REDACTED".to_string()
+    }
+}
+
+fn parse_already_masked_mac(bytes: &[u8]) -> Option<(char, char, char, char)> {
+    if bytes.len() == 8
+        && bytes[0] == b'.'
+        && bytes[1] == b'.'
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+        && bytes[3].is_ascii_hexdigit()
+        && bytes[4].is_ascii_hexdigit()
+        && bytes[6].is_ascii_hexdigit()
+        && bytes[7].is_ascii_hexdigit()
+    {
+        Some((
+            (bytes[3] as char).to_ascii_uppercase(),
+            (bytes[4] as char).to_ascii_uppercase(),
+            (bytes[6] as char).to_ascii_uppercase(),
+            (bytes[7] as char).to_ascii_uppercase(),
+        ))
+    } else {
+        None
     }
 }
 

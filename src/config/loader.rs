@@ -10,7 +10,7 @@ use super::schema::{
     RawSamplesRetention, SessionEpochsRetention,
 };
 use super::template::DEFAULT_CONFIG_TEMPLATE;
-use crate::paths::{EnvSource, write_private_file_atomic};
+use crate::paths::{EnvSource, split_shell_words, write_private_file_atomic};
 
 /// CLI flag overrides applied with highest precedence over env vars and `config.toml`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -182,6 +182,35 @@ fn apply_env_overrides(config: &mut Config, env: &dyn EnvSource) -> Result<(), C
 
     if let Some(val) = non_empty_env(env, "BPMUTE_ACTIONS_PAUSE_MEDIA") {
         config.actions.pause_media = parse_env_bool("BPMUTE_ACTIONS_PAUSE_MEDIA", &val)?;
+    }
+    if let Some(val) = env.get("BPMUTE_ACTIONS_IGNORE_PLAYERS") {
+        let trimmed = val.trim();
+        config.actions.ignore_players = if trimmed.is_empty() {
+            Vec::new()
+        } else if trimmed.starts_with('[') {
+            serde_json::from_str::<Vec<String>>(trimmed)
+                .map_err(|err| ConfigError::Env(format!("BPMUTE_ACTIONS_IGNORE_PLAYERS: {err}")))?
+        } else {
+            trimmed
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .collect()
+        };
+    }
+    if let Some(val) = env.get("BPMUTE_ACTIONS_CUSTOM_COMMAND") {
+        let trimmed = val.trim();
+        config.actions.custom_command = if trimmed.is_empty() {
+            Vec::new()
+        } else if trimmed.starts_with('[') {
+            serde_json::from_str::<Vec<String>>(trimmed)
+                .map_err(|err| ConfigError::Env(format!("BPMUTE_ACTIONS_CUSTOM_COMMAND: {err}")))?
+        } else {
+            split_shell_words(trimmed).ok_or_else(|| {
+                ConfigError::Env(
+                    "BPMUTE_ACTIONS_CUSTOM_COMMAND: unclosed quote in command string".to_string(),
+                )
+            })?
+        };
     }
     if let Some(val) = non_empty_env(env, "BPMUTE_ACTIONS_CUSTOM_COMMAND_TIMEOUT_SEC") {
         config.actions.custom_command_timeout_sec = val.trim().parse().map_err(|_| {

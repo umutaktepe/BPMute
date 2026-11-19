@@ -3,6 +3,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
@@ -13,6 +14,9 @@ static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub trait EnvSource: Send + Sync {
     /// Retrieves an environment variable value by name, if present.
     fn get(&self, key: &str) -> Option<String>;
+
+    /// Returns an owned thread-safe handle to this environment source.
+    fn clone_arc(&self) -> Arc<dyn EnvSource>;
 }
 
 /// Process environment implementation backed by `std::env::var`.
@@ -22,6 +26,10 @@ pub struct ProcessEnv;
 impl EnvSource for ProcessEnv {
     fn get(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    fn clone_arc(&self) -> Arc<dyn EnvSource> {
+        Arc::new(*self)
     }
 }
 
@@ -46,6 +54,51 @@ impl EnvSource for MapEnv {
     fn get(&self, key: &str) -> Option<String> {
         self.0.get(key).cloned()
     }
+
+    fn clone_arc(&self) -> Arc<dyn EnvSource> {
+        Arc::new(self.clone())
+    }
+}
+
+/// Splits a whitespace/quote-delimited command string into argv tokens.
+pub fn split_shell_words(raw: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut token_started = false;
+
+    for ch in raw.chars() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                token_started = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                token_started = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if token_started {
+                    parts.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                token_started = true;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+    if token_started {
+        parts.push(current);
+    }
+
+    Some(parts)
 }
 
 /// Errors that can occur while resolving XDG/CLI/env filesystem paths.

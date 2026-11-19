@@ -2,13 +2,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Local, Utc};
+use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::config::{CliOverrides, ClockTime, ConfigPatch, LoadedConfig, patch_config_file};
 use crate::ipc::protocol::{
-    AlertSeverity, ConfigSnapshotPayload, DaemonAlert, DaemonStatus, PROTOCOL_VERSION, PauseMode,
-    PauseParams, SetDryRunParams, error_codes,
+    AlertSeverity, ConfigSnapshotPayload, DaemonAlert, DaemonStatus, ErrorPayload, MonitoringState,
+    PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope, SetDryRunParams, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -16,6 +17,17 @@ use crate::paths::{EnvSource, ResolvedPaths};
 use super::clock::DaemonClock;
 
 const CONFIG_RELOAD_ALERT_ID: &str = "config_reload_failed";
+
+fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
+    ErrorPayload {
+        code: code.to_string(),
+        message: message.into(),
+    }
+}
+
+fn serialize_json(value: impl Serialize) -> Result<Value, ErrorPayload> {
+    serde_json::to_value(value).map_err(|e| ipc_err(error_codes::INTERNAL_ERROR, e.to_string()))
+}
 
 /// Shared mutable daemon runtime state behind a short-lived synchronous mutex.
 pub struct DaemonCore {
@@ -87,9 +99,9 @@ impl DaemonCore {
 
         let armed = is_armed_locked(guard, self.clock.as_ref());
         let monitoring_state = if guard.paused {
-            "Paused".to_string()
+            MonitoringState::Paused
         } else {
-            "Idle".to_string()
+            MonitoringState::Idle
         };
 
         DaemonStatus {
@@ -119,7 +131,7 @@ impl DaemonCore {
             file_present: guard.loaded_config.file_present,
             config_path: self.paths.config_file.display().to_string(),
             log_filter: guard.loaded_config.log_filter.clone(),
-            log_format: guard.loaded_config.log_format.to_string(),
+            log_format: guard.loaded_config.log_format,
             log_biometrics: guard.loaded_config.log_biometrics,
         }
     }
@@ -132,10 +144,7 @@ impl DaemonCore {
     }
 
     /// Builds a `Snapshot` push envelope with current status and alerts.
-    pub fn make_snapshot_event(
-        &self,
-        status: &DaemonStatus,
-    ) -> crate::ipc::protocol::PushEventEnvelope {
+    pub fn make_snapshot_event(&self, status: &DaemonStatus) -> PushEventEnvelope {
         self.broker.make_event(
             "Snapshot",
             json!({
@@ -147,98 +156,81 @@ impl DaemonCore {
     }
 
     /// Dispatches an IPC command belonging to the `#15` tracer bullet surface.
-    pub fn handle_op(self: &Arc<Self>, op: &str, params: Value) -> Result<Value, (String, String)> {
+    pub fn handle_op(self: &Arc<Self>, op: &str, params: Value) -> Result<Value, ErrorPayload> {
         match op {
             "daemon.ping" => Ok(json!({ "pong": true, "v": PROTOCOL_VERSION })),
-            "daemon.status" => serde_json::to_value(self.status())
-                .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string())),
+            "daemon.status" => serialize_json(self.status()),
             "monitor.pause" => {
                 let parsed: PauseParams = serde_json::from_value(params).map_err(|e| {
-                    (
-                        error_codes::INVALID_PARAMS.to_string(),
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
                         format!("invalid monitor.pause params: {e}"),
                     )
                 })?;
-                let status = self.pause(parsed)?;
-                serde_json::to_value(status)
-                    .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string()))
+                serialize_json(self.pause(parsed)?)
             }
-            "monitor.resume" => {
-                let status = self.resume();
-                serde_json::to_value(status)
-                    .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string()))
-            }
+            "monitor.resume" => serialize_json(self.resume()),
             "monitor.set_dry_run" => {
                 let parsed: SetDryRunParams = serde_json::from_value(params).map_err(|e| {
-                    (
-                        error_codes::INVALID_PARAMS.to_string(),
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
                         format!("invalid monitor.set_dry_run params: {e}"),
                     )
                 })?;
-                let status = self.set_dry_run(parsed.dry_run);
-                serde_json::to_value(status)
-                    .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string()))
+                serialize_json(self.set_dry_run(parsed.dry_run))
             }
             "config.get" => {
                 let guard = self.inner.lock().expect("daemon state mutex poisoned");
-                let snapshot = self.build_config_snapshot_locked(&guard);
-                serde_json::to_value(snapshot)
-                    .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string()))
+                serialize_json(self.build_config_snapshot_locked(&guard))
             }
             "config.update" => {
                 let patch: ConfigPatch = serde_json::from_value(params).map_err(|e| {
-                    (
-                        error_codes::INVALID_CONFIG.to_string(),
+                    ipc_err(
+                        error_codes::INVALID_CONFIG,
                         format!("invalid config patch: {e}"),
                     )
                 })?;
-                let snapshot = self.update_config(&patch)?;
-                serde_json::to_value(snapshot)
-                    .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string()))
+                serialize_json(self.update_config(&patch)?)
             }
-            "config.reload" => {
-                let snapshot = self.reload_from_disk()?;
-                serde_json::to_value(snapshot)
-                    .map_err(|e| (error_codes::INTERNAL_ERROR.to_string(), e.to_string()))
-            }
-            _ => Err((
-                error_codes::UNKNOWN_OP.to_string(),
+            "config.reload" => serialize_json(self.reload_from_disk()?),
+            _ => Err(ipc_err(
+                error_codes::UNKNOWN_OP,
                 format!("unknown IPC operation '{op}'"),
             )),
         }
     }
 
-    fn pause(self: &Arc<Self>, params: PauseParams) -> Result<DaemonStatus, (String, String)> {
+    fn pause(self: &Arc<Self>, params: PauseParams) -> Result<DaemonStatus, ErrorPayload> {
         let mode = params.mode.unwrap_or(PauseMode::Indefinite);
         let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
 
         let (paused_until, sleep_duration) = match mode {
             PauseMode::Indefinite => {
                 if params.duration_sec.is_some() {
-                    return Err((
-                        error_codes::INVALID_PARAMS.to_string(),
-                        "duration_sec is only valid with mode = \"duration\"".to_string(),
+                    return Err(ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        "duration_sec is only valid with mode = \"duration\"",
                     ));
                 }
                 (None, None)
             }
             PauseMode::Duration => {
                 let secs = params.duration_sec.ok_or_else(|| {
-                    (
-                        error_codes::INVALID_PARAMS.to_string(),
-                        "duration_sec is required when mode = \"duration\"".to_string(),
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        "duration_sec is required when mode = \"duration\"",
                     )
                 })?;
                 if secs == 0 {
-                    return Err((
-                        error_codes::INVALID_PARAMS.to_string(),
-                        "duration_sec must be >= 1".to_string(),
+                    return Err(ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        "duration_sec must be >= 1",
                     ));
                 }
                 let secs_i64 = i64::try_from(secs).map_err(|_| {
-                    (
-                        error_codes::INVALID_PARAMS.to_string(),
-                        "duration_sec exceeds supported range".to_string(),
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        "duration_sec exceeds supported range",
                     )
                 })?;
                 let now = self.clock.now_local();
@@ -247,9 +239,9 @@ impl DaemonCore {
             }
             PauseMode::UntilMorning => {
                 if params.duration_sec.is_some() {
-                    return Err((
-                        error_codes::INVALID_PARAMS.to_string(),
-                        "duration_sec is not valid with mode = \"until_morning\"".to_string(),
+                    return Err(ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        "duration_sec is not valid with mode = \"until_morning\"",
                     ));
                 }
                 let now_local = self.clock.now_local();
@@ -341,26 +333,72 @@ impl DaemonCore {
         status
     }
 
-    fn update_config(
-        &self,
-        patch: &ConfigPatch,
-    ) -> Result<ConfigSnapshotPayload, (String, String)> {
+    fn update_config(&self, patch: &ConfigPatch) -> Result<ConfigSnapshotPayload, ErrorPayload> {
         let updated = patch_config_file(
             &self.paths.config_file,
             patch,
             self.env.as_ref(),
             &self.cli_overrides,
         )
-        .map_err(|err| (error_codes::INVALID_CONFIG.to_string(), err.to_string()))?;
+        .map_err(|err| ipc_err(error_codes::INVALID_CONFIG, err.to_string()))?;
 
+        let explicit_dry_run_patch = patch.actions.as_ref().and_then(|a| a.dry_run).is_some();
+        let snapshot = self.apply_new_config(
+            updated,
+            explicit_dry_run_patch,
+            "configuration updated and reloaded live",
+        );
+        Ok(snapshot)
+    }
+
+    /// Reloads `config.toml` from disk, preserving the last valid configuration on error.
+    pub fn reload_from_disk(&self) -> Result<ConfigSnapshotPayload, ErrorPayload> {
+        match LoadedConfig::load(
+            &self.paths.config_file,
+            self.env.as_ref(),
+            &self.cli_overrides,
+        ) {
+            Ok(reloaded) => Ok(self.apply_new_config(reloaded, false, "configuration reloaded")),
+            Err(err) => {
+                let err_msg = err.to_string();
+                let alerts_opt = {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    let changed = upsert_reload_alert(&mut guard.alerts, &err_msg);
+                    changed.then(|| guard.alerts.clone())
+                };
+
+                if let Some(alerts) = alerts_opt {
+                    self.broker
+                        .publish_control("AlertChanged", json!({ "alerts": alerts }));
+                }
+
+                tracing::error!(
+                    error = %err_msg,
+                    "configuration reload failed; preserving last valid in-memory config"
+                );
+                Err(ipc_err(error_codes::INVALID_CONFIG, err_msg))
+            }
+        }
+    }
+
+    fn apply_new_config(
+        &self,
+        new_loaded: LoadedConfig,
+        explicit_dry_run_patch: bool,
+        log_msg: &str,
+    ) -> ConfigSnapshotPayload {
         let (snapshot, state_changed_status, alerts_changed) = {
             let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
             let old_armed = is_armed_locked(&guard, self.clock.as_ref());
             let old_dry_run = guard.dry_run;
+            let old_cfg_dry_run = guard.loaded_config.config.actions.dry_run;
 
-            guard.loaded_config = updated;
-            if self.cli_overrides.dry_run.is_none() {
-                guard.dry_run = guard.loaded_config.config.actions.dry_run;
+            guard.loaded_config = new_loaded;
+            let new_cfg_dry_run = guard.loaded_config.config.actions.dry_run;
+            if (explicit_dry_run_patch && self.cli_overrides.dry_run.is_none())
+                || new_cfg_dry_run != old_cfg_dry_run
+            {
+                guard.dry_run = new_cfg_dry_run;
             }
 
             let cleared_alert = clear_reload_alert(&mut guard.alerts);
@@ -385,71 +423,8 @@ impl DaemonCore {
             self.publish_state_changed(&status);
         }
 
-        tracing::info!("configuration updated and reloaded live");
-        Ok(snapshot)
-    }
-
-    /// Reloads `config.toml` from disk, preserving the last valid configuration on error.
-    pub fn reload_from_disk(&self) -> Result<ConfigSnapshotPayload, (String, String)> {
-        match LoadedConfig::load(
-            &self.paths.config_file,
-            self.env.as_ref(),
-            &self.cli_overrides,
-        ) {
-            Ok(reloaded) => {
-                let (snapshot, state_changed_status, alerts_changed) = {
-                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-                    let old_armed = is_armed_locked(&guard, self.clock.as_ref());
-                    let old_dry_run = guard.dry_run;
-
-                    guard.loaded_config = reloaded;
-                    guard.dry_run = guard.loaded_config.config.actions.dry_run;
-
-                    let cleared = clear_reload_alert(&mut guard.alerts);
-                    let alerts_opt = cleared.then(|| guard.alerts.clone());
-
-                    let new_armed = is_armed_locked(&guard, self.clock.as_ref());
-                    let status_opt = (old_armed != new_armed || old_dry_run != guard.dry_run)
-                        .then(|| self.build_status_locked(&guard));
-
-                    let snapshot = self.build_config_snapshot_locked(&guard);
-                    (snapshot, status_opt, alerts_opt)
-                };
-
-                if let Some(alerts) = alerts_changed {
-                    self.broker
-                        .publish_control("AlertChanged", json!({ "alerts": alerts }));
-                }
-                if let Ok(val) = serde_json::to_value(&snapshot) {
-                    self.broker.publish_control("ConfigUpdated", val);
-                }
-                if let Some(status) = state_changed_status {
-                    self.publish_state_changed(&status);
-                }
-
-                tracing::info!("configuration reloaded");
-                Ok(snapshot)
-            }
-            Err(err) => {
-                let err_msg = err.to_string();
-                let alerts_opt = {
-                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-                    let changed = upsert_reload_alert(&mut guard.alerts, &err_msg);
-                    changed.then(|| guard.alerts.clone())
-                };
-
-                if let Some(alerts) = alerts_opt {
-                    self.broker
-                        .publish_control("AlertChanged", json!({ "alerts": alerts }));
-                }
-
-                tracing::error!(
-                    error = %err_msg,
-                    "configuration reload failed; preserving last valid in-memory config"
-                );
-                Err((error_codes::INVALID_CONFIG.to_string(), err_msg))
-            }
-        }
+        tracing::info!("{log_msg}");
+        snapshot
     }
 
     fn publish_state_changed(&self, status: &DaemonStatus) {

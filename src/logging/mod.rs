@@ -4,8 +4,9 @@ use std::fmt;
 use std::io::Write;
 
 use chrono::{SecondsFormat, Utc};
-use tracing::Subscriber;
 use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Dispatch, Event, Metadata, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -49,11 +50,13 @@ pub fn init_logging(loaded: &LoadedConfig, env: &dyn EnvSource) -> Result<(), Co
     match resolved_format {
         EffectiveLogFormat::Journald => match tracing_journald::Layer::new() {
             Ok(journald_layer) => {
+                let redacting_layer =
+                    BiometricRedactingLayer::new(journald_layer, loaded.log_biometrics);
                 let subscriber = tracing_subscriber::registry()
                     .with(filter)
-                    .with(journald_layer);
+                    .with(redacting_layer);
                 tracing::subscriber::set_global_default(subscriber)
-                    .map_err(|err| ConfigError::Validation(err.to_string()))?;
+                    .map_err(|err| ConfigError::LoggingInit(err.to_string()))?;
             }
             Err(err) => {
                 if loaded.log_format == LogFormat::Journald {
@@ -64,17 +67,24 @@ pub fn init_logging(loaded: &LoadedConfig, env: &dyn EnvSource) -> Result<(), Co
                     loaded.log_biometrics,
                     std::io::stderr,
                 );
-                let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+                let redacting_layer =
+                    BiometricRedactingLayer::new(fmt_layer, loaded.log_biometrics);
+                let subscriber = tracing_subscriber::registry()
+                    .with(filter)
+                    .with(redacting_layer);
                 tracing::subscriber::set_global_default(subscriber)
-                    .map_err(|e| ConfigError::Validation(e.to_string()))?;
+                    .map_err(|e| ConfigError::LoggingInit(e.to_string()))?;
             }
         },
         EffectiveLogFormat::Pretty | EffectiveLogFormat::Json => {
             let fmt_layer =
                 BiometricFmtLayer::new(resolved_format, loaded.log_biometrics, std::io::stderr);
-            let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+            let redacting_layer = BiometricRedactingLayer::new(fmt_layer, loaded.log_biometrics);
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(redacting_layer);
             tracing::subscriber::set_global_default(subscriber)
-                .map_err(|err| ConfigError::Validation(err.to_string()))?;
+                .map_err(|err| ConfigError::LoggingInit(err.to_string()))?;
         }
     }
 
@@ -99,8 +109,203 @@ where
 {
     let filter = EnvFilter::try_new(filter_expr)
         .map_err(|err| ConfigError::LogFilter(format!("'{filter_expr}': {err}")))?;
-    let layer = BiometricFmtLayer::new(format, log_biometrics, make_writer);
+    let layer = BiometricRedactingLayer::new(
+        BiometricFmtLayer::new(format, log_biometrics, make_writer),
+        log_biometrics,
+    );
     Ok(tracing_subscriber::registry().with(filter).with(layer))
+}
+
+fn sanitize_field_value(name: &str, raw: String, log_biometrics: bool) -> String {
+    if log_biometrics {
+        raw
+    } else if is_biometric_field(name) {
+        "[REDACTED]".to_string()
+    } else if is_mac_field(name) {
+        mask_mac(&raw)
+    } else {
+        redact_macs_in_text(&raw).into_owned()
+    }
+}
+
+/// Layer wrapper that sanitizes all span attributes, span records, and events before
+/// forwarding to an inner [`tracing_subscriber::Layer`] (such as `tracing_journald::Layer`).
+pub struct BiometricRedactingLayer<L> {
+    inner: L,
+    log_biometrics: bool,
+}
+
+impl<L> BiometricRedactingLayer<L> {
+    /// Wraps `inner`, enforcing biometric and MAC redaction unless `log_biometrics` is `true`.
+    pub fn new(inner: L, log_biometrics: bool) -> Self {
+        Self {
+            inner,
+            log_biometrics,
+        }
+    }
+}
+
+struct SlotSanitizingVisitor<'a> {
+    slots: &'a mut [Option<String>],
+}
+
+impl SlotSanitizingVisitor<'_> {
+    fn set_slot(&mut self, field: &Field, raw: String) {
+        if let Some(slot) = self.slots.get_mut(field.index()) {
+            *slot = Some(sanitize_field_value(field.name(), raw, false));
+        }
+    }
+}
+
+impl Visit for SlotSanitizingVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.set_slot(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.set_slot(field, format!("{value:?}"));
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.set_slot(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.set_slot(field, value.to_string());
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.set_slot(field, value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.set_slot(field, value.to_string());
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.set_slot(field, value.to_string());
+    }
+}
+
+impl<S, L> Layer<S> for BiometricRedactingLayer<L>
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    L: Layer<S> + 'static,
+{
+    fn on_register_dispatch(&self, subscriber: &Dispatch) {
+        self.inner.on_register_dispatch(subscriber);
+    }
+
+    fn on_layer(&mut self, subscriber: &mut S) {
+        self.inner.on_layer(subscriber);
+    }
+
+    fn register_callsite(
+        &self,
+        metadata: &'static Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        self.inner.register_callsite(metadata)
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>, ctx: Context<'_, S>) -> bool {
+        self.inner.enabled(metadata, ctx)
+    }
+
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if self.log_biometrics {
+            self.inner.on_new_span(attrs, id, ctx);
+            return;
+        }
+        let meta = attrs.metadata();
+        let field_set = meta.fields();
+        let mut slots = vec![None; field_set.len()];
+        attrs.record(&mut SlotSanitizingVisitor { slots: &mut slots });
+        let val_refs: Vec<Option<&dyn tracing::Value>> = slots
+            .iter()
+            .map(|s| s.as_ref().map(|v| v as &dyn tracing::Value))
+            .collect();
+        let vs = field_set.value_set_all(&val_refs);
+        let sanitized = if attrs.is_root() {
+            Attributes::new_root(meta, &vs)
+        } else if attrs.is_contextual() {
+            Attributes::new(meta, &vs)
+        } else {
+            Attributes::child_of(
+                attrs.parent().cloned().expect("explicit span parent"),
+                meta,
+                &vs,
+            )
+        };
+        self.inner.on_new_span(&sanitized, id, ctx);
+    }
+
+    fn on_record(&self, span: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        if self.log_biometrics {
+            self.inner.on_record(span, values, ctx);
+            return;
+        }
+        let Some(span_ref) = ctx.span(span) else {
+            return;
+        };
+        let meta = span_ref.metadata();
+        let field_set = meta.fields();
+        let mut slots = vec![None; field_set.len()];
+        values.record(&mut SlotSanitizingVisitor { slots: &mut slots });
+        let val_refs: Vec<Option<&dyn tracing::Value>> = slots
+            .iter()
+            .map(|s| s.as_ref().map(|v| v as &dyn tracing::Value))
+            .collect();
+        let vs = field_set.value_set_all(&val_refs);
+        let sanitized = Record::new(&vs);
+        drop(span_ref);
+        self.inner.on_record(span, &sanitized, ctx);
+    }
+
+    fn on_follows_from(&self, span: &Id, follows: &Id, ctx: Context<'_, S>) {
+        self.inner.on_follows_from(span, follows, ctx);
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, ctx: Context<'_, S>) -> bool {
+        self.inner.event_enabled(event, ctx)
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        if self.log_biometrics {
+            self.inner.on_event(event, ctx);
+            return;
+        }
+        let meta = event.metadata();
+        let field_set = meta.fields();
+        let mut slots = vec![None; field_set.len()];
+        event.record(&mut SlotSanitizingVisitor { slots: &mut slots });
+        let val_refs: Vec<Option<&dyn tracing::Value>> = slots
+            .iter()
+            .map(|s| s.as_ref().map(|v| v as &dyn tracing::Value))
+            .collect();
+        let vs = field_set.value_set_all(&val_refs);
+        let sanitized = if event.is_contextual() {
+            Event::new(meta, &vs)
+        } else {
+            Event::new_child_of(event.parent().cloned(), meta, &vs)
+        };
+        self.inner.on_event(&sanitized, ctx);
+    }
+
+    fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+        self.inner.on_enter(id, ctx);
+    }
+
+    fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
+        self.inner.on_exit(id, ctx);
+    }
+
+    fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        self.inner.on_close(id, ctx);
+    }
+
+    fn on_id_change(&self, old: &Id, new: &Id, ctx: Context<'_, S>) {
+        self.inner.on_id_change(old, new, ctx);
+    }
 }
 
 /// Pure-Rust formatting layer enforcing biometric and MAC address redaction across all levels.
@@ -125,7 +330,7 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
     W: for<'writer> MakeWriter<'writer> + 'static,
 {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let mut visitor = BiometricVisitor::new(self.log_biometrics);
         event.record(&mut visitor);
 
@@ -194,15 +399,7 @@ impl BiometricVisitor {
 
     fn record_value(&mut self, field: &Field, raw: String) {
         let name = field.name();
-        let sanitized = if self.log_biometrics {
-            raw
-        } else if is_biometric_field(name) {
-            "[REDACTED]".to_string()
-        } else if is_mac_field(name) {
-            mask_mac(&raw)
-        } else {
-            redact_macs_in_text(&raw).into_owned()
-        };
+        let sanitized = sanitize_field_value(name, raw, self.log_biometrics);
 
         if name == "message" {
             self.message = Some(sanitized);

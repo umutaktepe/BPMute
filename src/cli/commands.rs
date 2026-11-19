@@ -10,7 +10,7 @@ use crate::exit_code::ExitCode;
 use crate::ipc::protocol::ConfigSnapshotPayload;
 use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus};
 use crate::logging::init_logging;
-use crate::paths::{EnvSource, ResolvedPaths};
+use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
 
 use super::args::{Cli, Command, ConfigCommand};
 use super::duration::{PauseTarget, parse_pause_target};
@@ -79,8 +79,7 @@ async fn run_daemon<WErr: Write>(
         return err.exit_code();
     }
 
-    // Retain an owned copy of resolved env values for live reloads (`SIGHUP` / `config.reload`).
-    let env_arc: Arc<dyn EnvSource> = Arc::new(crate::paths::ProcessEnv);
+    let env_arc = env.clone_arc();
 
     let handle = match DaemonHandle::spawn(DaemonOptions {
         paths,
@@ -275,7 +274,7 @@ async fn run_config<WOut: Write, WErr: Write>(
                             file_present: loaded.file_present,
                             config_path: paths.config_file.display().to_string(),
                             log_filter: loaded.log_filter,
-                            log_format: loaded.log_format.to_string(),
+                            log_format: loaded.log_format,
                             log_biometrics: loaded.log_biometrics,
                         };
                         if let Err(err) = serde_json::to_writer_pretty(&mut *stdout, &snapshot) {
@@ -339,10 +338,19 @@ fn run_config_edit<WOut: Write, WErr: Write>(
         .or_else(|| env.get("EDITOR").filter(|v| !v.trim().is_empty()))
         .unwrap_or_else(|| "vi".to_string());
 
-    let Some((program, args)) = split_editor_command(&editor_raw) else {
+    let Some(parts) = split_shell_words(&editor_raw) else {
+        let _ = writeln!(
+            stderr,
+            "error: invalid quoted editor command '{editor_raw}'"
+        );
+        return ExitCode::UsageOrConfigError;
+    };
+    let mut parts_iter = parts.into_iter();
+    let Some(program) = parts_iter.next() else {
         let _ = writeln!(stderr, "error: empty editor command '{editor_raw}'");
         return ExitCode::UsageOrConfigError;
     };
+    let args: Vec<String> = parts_iter.collect();
 
     let status = match ProcessCommand::new(&program)
         .args(&args)
@@ -377,48 +385,6 @@ fn run_config_edit<WOut: Write, WErr: Write>(
     }
 }
 
-fn split_editor_command(raw: &str) -> Option<(String, Vec<String>)> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut token_started = false;
-
-    for ch in raw.chars() {
-        match ch {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                token_started = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                token_started = true;
-            }
-            c if c.is_whitespace() && !in_single && !in_double => {
-                if token_started {
-                    parts.push(std::mem::take(&mut current));
-                    token_started = false;
-                }
-            }
-            c => {
-                current.push(c);
-                token_started = true;
-            }
-        }
-    }
-
-    if in_single || in_double {
-        return None;
-    }
-    if token_started {
-        parts.push(current);
-    }
-
-    let mut iter = parts.into_iter();
-    let prog = iter.next()?;
-    Some((prog, iter.collect()))
-}
-
 async fn connect_or_report<WErr: Write>(
     paths: &ResolvedPaths,
     stderr: &mut WErr,
@@ -433,6 +399,10 @@ async fn connect_or_report<WErr: Write>(
                 }
                 ExitCode::DaemonOffline
             }
+            IpcClientError::PermissionDenied { .. } => {
+                let _ = writeln!(stderr, "error: {err}");
+                ExitCode::PermissionOrBackendRefusal
+            }
             other => {
                 let _ = writeln!(stderr, "error: {other}");
                 ExitCode::RuntimeError
@@ -444,6 +414,7 @@ fn report_ipc_error<WErr: Write>(err: IpcClientError, stderr: &mut WErr) -> Exit
     let _ = writeln!(stderr, "error: {err}");
     match err {
         IpcClientError::DaemonOffline { .. } => ExitCode::DaemonOffline,
+        IpcClientError::PermissionDenied { .. } => ExitCode::PermissionOrBackendRefusal,
         IpcClientError::Server { code, .. } => ExitCode::from_ipc_error_code(&code),
         IpcClientError::Frame(_)
         | IpcClientError::InvalidResponse(_)

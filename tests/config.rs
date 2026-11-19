@@ -502,3 +502,48 @@ fn invalid_patch_leaves_existing_file_untouched() {
     let _ = DetectionPatch::default();
     let _ = RetentionPatch::default();
 }
+
+#[test]
+fn list_env_overrides_and_permission_denied_exit_code_work() {
+    let env = MapEnv::new()
+        .with("BPMUTE_ACTIONS_IGNORE_PLAYERS", "vlc, spotify")
+        .with(
+            "BPMUTE_ACTIONS_CUSTOM_COMMAND",
+            "/usr/bin/notify-send \"sleep\"",
+        );
+    let loaded =
+        LoadedConfig::from_toml_str("schema_version = 1\n", &env, &CliOverrides::default())
+            .expect("list env overrides should parse cleanly");
+    assert_eq!(
+        loaded.config.actions.ignore_players,
+        vec!["vlc".to_string(), "spotify".to_string()]
+    );
+    assert_eq!(
+        loaded.config.actions.custom_command,
+        vec!["/usr/bin/notify-send".to_string(), "sleep".to_string()]
+    );
+
+    let json_env = MapEnv::new()
+        .with("BPMUTE_ACTIONS_IGNORE_PLAYERS", "[\"mpv\"]")
+        .with("BPMUTE_ACTIONS_CUSTOM_COMMAND", "[\"/bin/true\",\"--ok\"]");
+    let loaded_json =
+        LoadedConfig::from_toml_str("schema_version = 1\n", &json_env, &CliOverrides::default())
+            .expect("JSON array env overrides should parse");
+    assert_eq!(loaded_json.config.actions.ignore_players, vec!["mpv"]);
+    assert_eq!(
+        loaded_json.config.actions.custom_command,
+        vec!["/bin/true", "--ok"]
+    );
+
+    let bad_quote_env = MapEnv::new().with("BPMUTE_ACTIONS_CUSTOM_COMMAND", "\"unclosed");
+    let err = LoadedConfig::from_toml_str(
+        "schema_version = 1\n",
+        &bad_quote_env,
+        &CliOverrides::default(),
+    )
+    .expect_err("unclosed quote in BPMUTE_ACTIONS_CUSTOM_COMMAND must fail");
+    assert_eq!(err.exit_code(), ExitCode::UsageOrConfigError);
+
+    let perm_err = ConfigError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    assert_eq!(perm_err.exit_code(), ExitCode::PermissionOrBackendRefusal);
+}
