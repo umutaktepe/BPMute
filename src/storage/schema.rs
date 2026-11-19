@@ -57,8 +57,42 @@ pub fn enforce_private_db_permissions(db_path: &Path) -> Result<(), StorageError
     Ok(())
 }
 
+/// Creates an automatic WAL-safe `0600` pre-migration backup before schema alterations.
+pub fn backup_pre_migration(
+    conn: &Connection,
+    db_path: &Path,
+    user_version: i32,
+) -> Result<PathBuf, StorageError> {
+    let data_dir = db_path.parent().unwrap_or(Path::new("."));
+    let backups_dir = backups_dir_in_data_dir(data_dir);
+    if !backups_dir.try_exists().unwrap_or(false) {
+        fs::create_dir_all(&backups_dir)?;
+        fs::set_permissions(&backups_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let backup_path = backups_dir.join(format!(
+        "bpmute_backup_pre_migration_v{user_version}_{now_ms}.db"
+    ));
+
+    let mut dst = Connection::open(&backup_path)?;
+    let backup = rusqlite::backup::Backup::new(conn, &mut dst)?;
+    backup.run_to_completion(100, std::time::Duration::from_millis(50), None)?;
+    drop(backup);
+    drop(dst);
+
+    enforce_private_db_permissions(&backup_path)?;
+    Ok(backup_path)
+}
+
 /// Initializes a read-write SQLite WAL connection with `secure_delete` and `auto_vacuum = INCREMENTAL`.
-pub fn initialize_rw_connection(conn: &Connection) -> Result<(), StorageError> {
+/// Creates an automatic pre-migration backup if upgrading an existing older database schema version.
+pub fn initialize_rw_connection(
+    conn: &Connection,
+    db_path: Option<&Path>,
+) -> Result<(), StorageError> {
     conn.execute_batch(
         "PRAGMA busy_timeout = 5000;
          PRAGMA foreign_keys = ON;
@@ -74,6 +108,17 @@ pub fn initialize_rw_connection(conn: &Connection) -> Result<(), StorageError> {
              PRAGMA synchronous = NORMAL;",
         )?;
         conn.execute_batch(DDL_V1)?;
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
+        ))?;
+    } else if user_version < CURRENT_DB_SCHEMA_VERSION {
+        if let Some(path) = db_path {
+            let _ = backup_pre_migration(conn, path, user_version);
+        }
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;",
+        )?;
         conn.execute_batch(&format!(
             "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
         ))?;

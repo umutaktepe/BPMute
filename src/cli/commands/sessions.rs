@@ -22,7 +22,8 @@ use crate::storage::{
 
 use super::{
     OnlineOrOffline, ReplayCliArgs, confirm_action, connect_online_or_offline, ipc_request_typed,
-    open_existing_store_rw, report_ipc_error, report_storage_error, write_json_line,
+    open_existing_store_rw, report_ipc_error, report_storage_error, resolve_cli_path,
+    write_json_line,
 };
 
 pub(crate) fn run_replay<WOut: Write, WErr: Write>(
@@ -431,11 +432,7 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             format,
             no_anonymize,
         } => {
-            let abs_path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
+            let abs_path = resolve_cli_path(&path);
             let format_str = match format {
                 crate::cli::args::TraceFormatArg::Csv => "csv",
                 crate::cli::args::TraceFormatArg::Jsonl => "jsonl",

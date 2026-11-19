@@ -26,9 +26,9 @@ use crate::sleep_engine::{
 };
 
 pub use bundle::{
-    CURRENT_BUNDLE_SCHEMA_VERSION, CalibrationMetaBundleRecord, ImportMode, ImportSummary,
-    LedgerBundle, RawSampleBundleRecord, SessionBundleRecord, SessionEpochBundleRecord,
-    validate_bundle_payload,
+    CURRENT_BUNDLE_SCHEMA_VERSION, CalibrationMetaBundleRecord, ExportBundleOptions, ImportMode,
+    ImportSummary, LedgerBundle, RawSampleBundleRecord, SessionBundleRecord,
+    SessionEpochBundleRecord, validate_bundle_payload,
 };
 pub use lock::LedgerFileLock;
 pub use schema::{backups_dir_in_data_dir, db_exists, db_path_in_data_dir, lock_path_in_data_dir};

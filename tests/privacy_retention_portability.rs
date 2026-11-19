@@ -117,7 +117,7 @@ async fn test_retention_pruning_rolling_ttl_and_active_session_immunity() {
     let db_path = db_path_in_data_dir(&data_dir);
     let lock_path = lock_path_in_data_dir(&data_dir);
 
-    let (_worker, handle, _) =
+    let (worker, handle, _) =
         PersistenceWorker::spawn(&db_path, &lock_path, 1_700_000_000_000).unwrap();
 
     let desc = WearableDescriptor {
@@ -307,6 +307,7 @@ async fn test_retention_pruning_rolling_ttl_and_active_session_immunity() {
     assert_eq!(s3_detail2.epochs.len(), 1, "Active session still untouched");
 
     drop(handle);
+    worker.shutdown_and_join().unwrap();
 }
 
 #[tokio::test]
@@ -317,7 +318,7 @@ async fn test_sessions_delete_and_precondition_conflict_guardrail() {
     let lock_path = lock_path_in_data_dir(&paths.data_dir);
 
     let (s_closed_id, s_active_id) = {
-        let (_worker, handle, _) =
+        let (worker, handle, _) =
             PersistenceWorker::spawn(&db_path, &lock_path, 1_000_000).unwrap();
         let desc = WearableDescriptor {
             mac: "22:33:44:55:66:77".to_string(),
@@ -360,6 +361,7 @@ async fn test_sessions_delete_and_precondition_conflict_guardrail() {
             .unwrap();
 
         drop(handle);
+        worker.shutdown_and_join().unwrap();
         (s1, s2)
     };
 
@@ -398,7 +400,7 @@ async fn test_reversible_calibration_boundary_rebaseline_and_undo() {
 
     // Record 3 sessions to build up calibration priors
     {
-        let (_worker, handle, _) =
+        let (worker, handle, _) =
             PersistenceWorker::spawn(&db_path, &lock_path, 1_000_000).unwrap();
         let desc = WearableDescriptor {
             mac: "33:44:55:66:77:88".to_string(),
@@ -434,6 +436,7 @@ async fn test_reversible_calibration_boundary_rebaseline_and_undo() {
                 .unwrap();
         }
         drop(handle);
+        worker.shutdown_and_join().unwrap();
     }
 
     // Capture initial calibration state before boundary
@@ -495,7 +498,7 @@ async fn test_data_purge_raw_and_hard_wipe_guardrails() {
 
     // Populate store with wearable, sessions, raw samples, epochs
     {
-        let (_worker, handle, _) =
+        let (worker, handle, _) =
             PersistenceWorker::spawn(&db_path, &lock_path, 1_000_000).unwrap();
         let desc = WearableDescriptor {
             mac: "AA:BB:CC:DD:EE:01".to_string(),
@@ -547,10 +550,37 @@ async fn test_data_purge_raw_and_hard_wipe_guardrails() {
             .await
             .unwrap();
 
+        // Active session with raw samples (must be immune from purge-raw)
+        let s2 = handle
+            .open_session(OpenSessionRequest {
+                wearable_id: w_id.clone(),
+                start_ts_ms: 2_000_000,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .await
+            .unwrap();
+        handle
+            .append_epoch_and_raw(
+                s2.clone(),
+                None,
+                vec![(
+                    0,
+                    HrPacket {
+                        ts_ms: 2_001_000,
+                        bpm: 72.0,
+                        rr_ms: vec![830.0],
+                        contact_status: ContactStatus::Contact,
+                    },
+                )],
+            )
+            .await
+            .unwrap();
+
         drop(handle);
+        worker.shutdown_and_join().unwrap();
     }
 
-    // 1) Test data purge-raw
+    // 1) Test data purge-raw (closed session purged, active session immune)
     let (code, stdout, _) = run_inproc_cli(&["bpmute", "data", "purge-raw", "--yes"], &env).await;
     assert_eq!(code, ExitCode::Success);
     assert!(stdout.contains("Purged raw biometric samples"));
@@ -559,12 +589,22 @@ async fn test_data_purge_raw_and_hard_wipe_guardrails() {
         let store = LedgerStore::open_read_only(&db_path).unwrap().unwrap();
         store.get_storage_stats().unwrap()
     };
-    assert_eq!(stats_after_purge.raw_samples_count, 0);
-    assert_eq!(stats_after_purge.sessions_count, 1, "Sessions must remain");
+    assert_eq!(
+        stats_after_purge.raw_samples_count, 1,
+        "Active session raw sample must be immune from purge"
+    );
+    assert_eq!(stats_after_purge.sessions_count, 2, "Sessions must remain");
     assert_eq!(
         stats_after_purge.session_epochs_count, 1,
         "Epochs must remain"
     );
+
+    // Write a config file to verify wipe --all config removal behavior
+    if let Some(parent) = paths.config_file.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&paths.config_file, "detection_sensitivity = 'balanced'\n").unwrap();
+    assert!(paths.config_file.try_exists().unwrap());
 
     // 2) Test wipe non-interactive confirmation failure: requires --confirm WIPE
     let (code, _, err) = run_inproc_cli(&["bpmute", "data", "wipe"], &env).await;
@@ -598,8 +638,12 @@ async fn test_data_purge_raw_and_hard_wipe_guardrails() {
         stats_after_wipe.wearables_count, 1,
         "Enrolled wearable must be preserved without --all"
     );
+    assert!(
+        paths.config_file.try_exists().unwrap(),
+        "Config file must be preserved without --all"
+    );
 
-    // 4) Test wipe with --all: also clears enrolled wearables
+    // 4) Test wipe with --all: also clears enrolled wearables and config file
     let (code, stdout, _) = run_inproc_cli(
         &["bpmute", "data", "wipe", "--all", "--confirm", "WIPE"],
         &env,
@@ -607,6 +651,10 @@ async fn test_data_purge_raw_and_hard_wipe_guardrails() {
     .await;
     assert_eq!(code, ExitCode::Success);
     assert!(stdout.contains("Wiped all biometric session history"));
+    assert!(
+        !paths.config_file.try_exists().unwrap(),
+        "Config file must be removed when --all is specified"
+    );
 
     let stats_after_wipe_all = {
         let store = LedgerStore::open_read_only(&db_path).unwrap().unwrap();
@@ -626,7 +674,7 @@ async fn test_json_ledger_bundle_export_import_merge_and_replace_rollback() {
     let lock_path = lock_path_in_data_dir(&paths.data_dir);
 
     {
-        let (_worker, handle, _) =
+        let (worker, handle, _) =
             PersistenceWorker::spawn(&db_path, &lock_path, 5_000_000).unwrap();
         let desc = WearableDescriptor {
             mac: "44:55:66:77:88:99".to_string(),
@@ -679,6 +727,7 @@ async fn test_json_ledger_bundle_export_import_merge_and_replace_rollback() {
             .unwrap();
 
         drop(handle);
+        worker.shutdown_and_join().unwrap();
     }
 
     // 1) Export ledger bundle
@@ -720,8 +769,9 @@ async fn test_json_ledger_bundle_export_import_merge_and_replace_rollback() {
 
     // Initialize second db
     {
-        let (_worker, handle, _) = PersistenceWorker::spawn(&db2_path, &lock2_path, 1).unwrap();
+        let (worker, handle, _) = PersistenceWorker::spawn(&db2_path, &lock2_path, 1).unwrap();
         drop(handle);
+        worker.shutdown_and_join().unwrap();
     }
 
     // Import with --mode merge
@@ -806,7 +856,7 @@ async fn test_session_canonical_trace_export_and_replay_compatibility() {
     let lock_path = lock_path_in_data_dir(&paths.data_dir);
 
     let session_id = {
-        let (_worker, handle, _) =
+        let (worker, handle, _) =
             PersistenceWorker::spawn(&db_path, &lock_path, 1_700_000_000_000).unwrap();
         let desc = WearableDescriptor {
             mac: "55:66:77:88:99:AA".to_string(),
@@ -862,6 +912,7 @@ async fn test_session_canonical_trace_export_and_replay_compatibility() {
             .unwrap();
 
         drop(handle);
+        worker.shutdown_and_join().unwrap();
         sid
     };
 
@@ -943,7 +994,7 @@ async fn test_sqlite_online_backup_and_stats() {
     let lock_path = lock_path_in_data_dir(&paths.data_dir);
 
     {
-        let (_worker, handle, _) =
+        let (worker, handle, _) =
             PersistenceWorker::spawn(&db_path, &lock_path, 1_000_000).unwrap();
         let desc = WearableDescriptor {
             mac: "66:77:88:99:AA:BB".to_string(),
@@ -955,6 +1006,7 @@ async fn test_sqlite_online_backup_and_stats() {
         };
         handle.upsert_wearable(desc, 1_000_000).await.unwrap();
         drop(handle);
+        worker.shutdown_and_join().unwrap();
     }
 
     // 1) Test data backup

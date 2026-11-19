@@ -51,7 +51,7 @@ impl LedgerStore {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        initialize_rw_connection(&conn)?;
+        initialize_rw_connection(&conn, Some(db_path))?;
         enforce_private_db_permissions(db_path)?;
 
         Ok(Self {
@@ -336,12 +336,29 @@ impl LedgerStore {
         })
     }
 
-    /// Purges and zero-overwrites all `raw_samples` and reclaims storage via incremental vacuum.
+    /// Purges and zero-overwrites all `raw_samples` for closed sessions and reclaims storage via incremental vacuum.
     pub fn purge_raw_samples(&mut self) -> Result<usize, StorageError> {
         self.write_tx(|tx| {
-            let deleted = tx.execute("DELETE FROM raw_samples", [])?;
-            tx.execute("UPDATE sessions SET raw_samples_count = 0", [])?;
-            let _ = tx.execute("PRAGMA incremental_vacuum;", []);
+            let mut deleted = 0;
+            loop {
+                let count = tx.execute(
+                    "DELETE FROM raw_samples WHERE rowid IN (
+                        SELECT rowid FROM raw_samples
+                        WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed')
+                        LIMIT 500
+                    )",
+                    [],
+                )?;
+                deleted += count;
+                if count == 0 {
+                    break;
+                }
+            }
+            tx.execute(
+                "UPDATE sessions SET raw_samples_count = 0 WHERE status = 'closed'",
+                [],
+            )?;
+            let _ = tx.execute("PRAGMA incremental_vacuum(500);", []);
             Ok(deleted)
         })
     }
@@ -493,12 +510,10 @@ impl LedgerStore {
     pub fn export_bundle(
         &self,
         dest_path: &Path,
-        include_epochs: bool,
-        include_wearables: bool,
-        include_raw: bool,
+        options: ExportBundleOptions,
         now_ms: i64,
     ) -> Result<(), StorageError> {
-        let wearables = if include_wearables {
+        let wearables = if options.include_wearables {
             self.list_enrolled_wearables()?
         } else {
             Vec::new()
@@ -550,7 +565,7 @@ impl LedgerStore {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let session_epochs = if include_epochs {
+        let session_epochs = if options.include_epochs {
             let mut ep_stmt = self.conn.prepare(
                 "SELECT id, session_id, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m,
                         r_var_120s, ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s,
@@ -592,7 +607,7 @@ impl LedgerStore {
             Vec::new()
         };
 
-        let raw_samples = if include_raw {
+        let raw_samples = if options.include_raw {
             let mut raw_stmt = self.conn.prepare(
                 "SELECT id, session_id, seq, ts_ms, bpm, rr_ms_json, contact_status
                  FROM raw_samples ORDER BY session_id ASC, seq ASC",
@@ -1060,10 +1075,21 @@ pub(crate) fn prune_retention_in_tx(
         RawSamplesRetention::Disabled => {}
         RawSamplesRetention::Days(days) => {
             let cutoff_ms = now_ms - (days as i64 * 86_400_000);
-            raw_pruned = tx.execute(
-                "DELETE FROM raw_samples WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed') AND ts_ms < ?1",
-                params![cutoff_ms],
-            )?;
+            loop {
+                let count = tx.execute(
+                    "DELETE FROM raw_samples WHERE rowid IN (
+                        SELECT rowid FROM raw_samples
+                        WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed')
+                          AND ts_ms < ?1
+                        LIMIT 500
+                    )",
+                    params![cutoff_ms],
+                )?;
+                raw_pruned += count;
+                if count == 0 {
+                    break;
+                }
+            }
         }
         RawSamplesRetention::Unlimited => {}
     }
@@ -1071,10 +1097,21 @@ pub(crate) fn prune_retention_in_tx(
     match retention.session_epochs_days {
         SessionEpochsRetention::Days(days) => {
             let cutoff_ms = now_ms - (days as i64 * 86_400_000);
-            epochs_pruned = tx.execute(
-                "DELETE FROM session_epochs WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed') AND ts_ms < ?1",
-                params![cutoff_ms],
-            )?;
+            loop {
+                let count = tx.execute(
+                    "DELETE FROM session_epochs WHERE rowid IN (
+                        SELECT rowid FROM session_epochs
+                        WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed')
+                          AND ts_ms < ?1
+                        LIMIT 500
+                    )",
+                    params![cutoff_ms],
+                )?;
+                epochs_pruned += count;
+                if count == 0 {
+                    break;
+                }
+            }
         }
         SessionEpochsRetention::Unlimited => {}
     }

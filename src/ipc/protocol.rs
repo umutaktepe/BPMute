@@ -396,6 +396,16 @@ pub struct DataExportBundleParams {
     pub include_raw: bool,
 }
 
+impl DataExportBundleParams {
+    pub fn options(&self) -> crate::storage::ExportBundleOptions {
+        crate::storage::ExportBundleOptions {
+            include_epochs: self.include_epochs,
+            include_wearables: self.include_wearables,
+            include_raw: self.include_raw,
+        }
+    }
+}
+
 /// Parameters accepted by `data.import_bundle`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

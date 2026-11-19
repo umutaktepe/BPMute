@@ -903,7 +903,7 @@ impl DaemonCore {
                     .await
                     .map_err(storage_to_ipc_err)?;
                 self.apply_calibration_update(cal_state);
-                Ok(json!({ "deleted_id": deleted_id }))
+                Ok(json!({ "deleted_session_id": deleted_id, "deleted_id": deleted_id }))
             }
             "session.export_trace" => {
                 let parsed: SessionExportTraceParams =
@@ -1049,6 +1049,9 @@ impl DaemonCore {
                     .hard_wipe(parsed.all, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
+                if parsed.all && self.paths.config_file.try_exists().unwrap_or(false) {
+                    let _ = std::fs::remove_file(&self.paths.config_file);
+                }
                 self.apply_calibration_update(CalibrationState::default());
                 Ok(json!({ "wiped": true }))
             }
@@ -1075,16 +1078,11 @@ impl DaemonCore {
                             format!("invalid data.export_bundle params: {e}"),
                         )
                     })?;
+                let options = parsed.options();
                 let path = std::path::PathBuf::from(parsed.path);
                 let now_ms = self.clock.now_utc().timestamp_millis();
                 self.persistence
-                    .export_bundle(
-                        path.clone(),
-                        parsed.include_epochs,
-                        parsed.include_wearables,
-                        parsed.include_raw,
-                        now_ms,
-                    )
+                    .export_bundle(path.clone(), options, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
                 Ok(json!({ "path": path.to_string_lossy() }))

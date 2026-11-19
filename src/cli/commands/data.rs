@@ -6,13 +6,15 @@ use serde_json::json;
 use crate::cli::args::{DataCommand, ImportModeArg};
 use crate::cli::commands::{
     OnlineOrOffline, confirm_action, confirm_wipe, connect_online_or_offline,
-    open_existing_store_rw, report_ipc_error, report_storage_error, write_json_line,
+    open_existing_store_rw, report_ipc_error, report_storage_error, resolve_cli_path,
+    write_json_line,
 };
 use crate::exit_code::ExitCode;
 use crate::paths::ResolvedPaths;
 use crate::sleep_engine::CalibrationMaturity;
 use crate::storage::{
-    ImportMode, LedgerStore, StorageStats, db_path_in_data_dir, lock_path_in_data_dir,
+    ExportBundleOptions, ImportMode, LedgerStore, StorageStats, db_path_in_data_dir,
+    lock_path_in_data_dir,
 };
 
 pub(crate) async fn run_data<WOut: Write, WErr: Write>(
@@ -181,6 +183,9 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                         .await
                     {
                         Ok(_) => {
+                            if all && paths.config_file.try_exists().unwrap_or(false) {
+                                let _ = std::fs::remove_file(&paths.config_file);
+                            }
                             if all {
                                 let _ = writeln!(
                                     stdout,
@@ -210,6 +215,9 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                     };
                     match store.hard_wipe(all, now_ms) {
                         Ok(_) => {
+                            if all && paths.config_file.try_exists().unwrap_or(false) {
+                                let _ = std::fs::remove_file(&paths.config_file);
+                            }
                             if all {
                                 let _ = writeln!(
                                     stdout,
@@ -236,10 +244,11 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
             include_wearables,
             include_raw,
         } => {
-            let abs_path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
+            let abs_path = resolve_cli_path(&path);
+            let options = ExportBundleOptions {
+                include_epochs,
+                include_wearables,
+                include_raw,
             };
             let now_ms = Utc::now().timestamp_millis();
             match connect_online_or_offline(paths, stderr).await {
@@ -248,10 +257,11 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                         .request(
                             "data.export_bundle",
                             json!({
+                                "path": abs_path.to_string_lossy(),
                                 "destination_path": abs_path.to_string_lossy(),
-                                "include_epochs": include_epochs,
-                                "include_wearables": include_wearables,
-                                "include_raw": include_raw,
+                                "include_epochs": options.include_epochs,
+                                "include_wearables": options.include_wearables,
+                                "include_raw": options.include_raw,
                             }),
                         )
                         .await
@@ -279,13 +289,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                         Ok(s) => s,
                         Err(code) => return code,
                     };
-                    match store.export_bundle(
-                        &abs_path,
-                        include_epochs,
-                        include_wearables,
-                        include_raw,
-                        now_ms,
-                    ) {
+                    match store.export_bundle(&abs_path, options, now_ms) {
                         Ok(()) => {
                             let _ = writeln!(
                                 stdout,
@@ -307,11 +311,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
             force,
             yes,
         } => {
-            let abs_path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
+            let abs_path = resolve_cli_path(&path);
 
             if mode == ImportModeArg::Replace {
                 match confirm_action(
@@ -405,11 +405,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
         }
 
         DataCommand::Backup { path } => {
-            let abs_path = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
+            let abs_path = resolve_cli_path(&path);
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {

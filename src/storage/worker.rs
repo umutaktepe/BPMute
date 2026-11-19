@@ -10,9 +10,9 @@ use crate::config::RetentionConfig;
 use crate::replay::TraceFormat;
 use crate::sleep_engine::{Epoch, HrPacket};
 use crate::storage::{
-    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, ImportMode, ImportSummary,
-    LedgerStore, OpenSessionRequest, PruneSummary, SessionFullDetail, SessionListPage,
-    SetFeedbackRequest, StorageError, StorageStats, WearableDescriptor,
+    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, ExportBundleOptions, ImportMode,
+    ImportSummary, LedgerStore, OpenSessionRequest, PruneSummary, SessionFullDetail,
+    SessionListPage, SetFeedbackRequest, StorageError, StorageStats, WearableDescriptor,
 };
 
 enum DbCommand {
@@ -117,9 +117,7 @@ enum DbCommand {
     },
     ExportBundle {
         dest_path: PathBuf,
-        include_epochs: bool,
-        include_wearables: bool,
-        include_raw: bool,
+        options: ExportBundleOptions,
         now_ms: i64,
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
@@ -230,12 +228,26 @@ impl PersistenceWorker {
             .await;
         }
     }
+
+    /// Signals shutdown and blocks synchronously until the worker thread exits.
+    pub fn shutdown_and_join(mut self) -> Result<(), StorageError> {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(DbCommand::Shutdown);
+        }
+        if let Some(j) = self.join.take() {
+            j.join().map_err(|_| StorageError::WorkerStopped)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PersistenceWorker {
     fn drop(&mut self) {
         if let Some(tx) = self.tx.take() {
             let _ = tx.send(DbCommand::Shutdown);
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
         }
     }
 }
@@ -364,19 +376,11 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         }
         DbCommand::ExportBundle {
             dest_path,
-            include_epochs,
-            include_wearables,
-            include_raw,
+            options,
             now_ms,
             reply,
         } => {
-            let _ = reply.send(store.export_bundle(
-                &dest_path,
-                include_epochs,
-                include_wearables,
-                include_raw,
-                now_ms,
-            ));
+            let _ = reply.send(store.export_bundle(&dest_path, options, now_ms));
         }
         DbCommand::ImportBundle {
             src_path,
@@ -631,16 +635,12 @@ impl PersistenceHandle {
     pub async fn export_bundle(
         &self,
         dest_path: PathBuf,
-        include_epochs: bool,
-        include_wearables: bool,
-        include_raw: bool,
+        options: ExportBundleOptions,
         now_ms: i64,
     ) -> Result<(), StorageError> {
         self.call(|reply| DbCommand::ExportBundle {
             dest_path,
-            include_epochs,
-            include_wearables,
-            include_raw,
+            options,
             now_ms,
             reply,
         })

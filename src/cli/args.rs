@@ -338,12 +338,14 @@ pub enum DataCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
 pub enum TraceFormatArg {
     Csv,
     Jsonl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
 pub enum ImportModeArg {
     Merge,
     Replace,

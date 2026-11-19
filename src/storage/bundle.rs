@@ -17,6 +17,14 @@ pub enum ImportMode {
     Replace,
 }
 
+/// Selection options controlling which entity tables to include in a Ledger Bundle export.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportBundleOptions {
+    pub include_epochs: bool,
+    pub include_wearables: bool,
+    pub include_raw: bool,
+}
+
 impl std::str::FromStr for ImportMode {
     type Err = String;
 

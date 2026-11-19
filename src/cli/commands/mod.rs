@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
@@ -645,7 +645,7 @@ pub(crate) fn confirm_wipe<WOut: Write, WErr: Write>(
         return Err(ExitCode::UsageOrConfigError);
     }
     let target = if all {
-        "ALL biometric and device data (including enrolled wearables)"
+        "ALL biometric and wearable data (including enrolled wearables)"
     } else {
         "biometric session history and calibration"
     };
@@ -664,5 +664,14 @@ pub(crate) fn confirm_wipe<WOut: Write, WErr: Write>(
     } else {
         let _ = writeln!(stdout, "Aborted: confirmation mismatch.");
         Ok(false)
+    }
+}
+
+/// Normalizes a CLI destination or source path to an absolute path.
+pub(crate) fn resolve_cli_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
     }
 }
