@@ -28,6 +28,29 @@ pub use schema::{db_exists, db_path_in_data_dir, lock_path_in_data_dir};
 pub use store::LedgerStore;
 pub use worker::PersistenceWorker;
 
+/// Canonical default address type for Bluetooth LE devices.
+pub fn default_address_type() -> String {
+    "public".to_string()
+}
+
+/// Metadata describing an enrolled Wearable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrolledWearable {
+    pub id: String,
+    pub mac: String,
+    pub mac_masked: String,
+    pub address_type: String,
+    pub alias: Option<String>,
+    pub advertised_name: Option<String>,
+    pub supports_rr: bool,
+    pub supports_contact: bool,
+    pub hr_var_floor: f64,
+    pub typical_sqi: Option<f64>,
+    pub enrolled_at_ms: i64,
+    pub last_seen_at_ms: i64,
+    pub active: bool,
+}
+
 /// Errors returned by SQLite WAL storage, `flock` locking, or the persistence worker.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -139,6 +162,8 @@ impl FromStr for SessionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WearableDescriptor {
     pub mac: String,
+    #[serde(default = "default_address_type")]
+    pub address_type: String,
     pub alias: Option<String>,
     pub advertised_name: Option<String>,
     pub supports_rr: bool,

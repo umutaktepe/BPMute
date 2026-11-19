@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::calibration::CalibrationState;
 use crate::sleep_engine::{Epoch, HrPacket};
 use crate::storage::{
-    AcceptShiftResult, CloseSessionRequest, LedgerStore, OpenSessionRequest, SessionFullDetail,
-    SessionListPage, SetFeedbackRequest, StorageError, WearableDescriptor,
+    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, LedgerStore, OpenSessionRequest,
+    SessionFullDetail, SessionListPage, SetFeedbackRequest, StorageError, WearableDescriptor,
 };
 
 enum DbCommand {
@@ -18,6 +18,19 @@ enum DbCommand {
         desc: WearableDescriptor,
         now_ms: i64,
         reply: oneshot::Sender<Result<String, StorageError>>,
+    },
+    ListWearables {
+        reply: oneshot::Sender<Result<Vec<EnrolledWearable>, StorageError>>,
+    },
+    RenameWearable {
+        id_or_prefix: String,
+        new_alias: Option<String>,
+        reply: oneshot::Sender<Result<EnrolledWearable, StorageError>>,
+    },
+    UnenrollWearable {
+        id_or_prefix: String,
+        delete_sessions: bool,
+        reply: oneshot::Sender<Result<EnrolledWearable, StorageError>>,
     },
     OpenSession {
         req: OpenSessionRequest,
@@ -166,6 +179,23 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         } => {
             let _ = reply.send(store.upsert_wearable(&desc, now_ms));
         }
+        DbCommand::ListWearables { reply } => {
+            let _ = reply.send(store.list_enrolled_wearables());
+        }
+        DbCommand::RenameWearable {
+            id_or_prefix,
+            new_alias,
+            reply,
+        } => {
+            let _ = reply.send(store.rename_wearable(&id_or_prefix, new_alias.as_deref()));
+        }
+        DbCommand::UnenrollWearable {
+            id_or_prefix,
+            delete_sessions,
+            reply,
+        } => {
+            let _ = reply.send(store.unenroll_wearable(&id_or_prefix, delete_sessions));
+        }
         DbCommand::OpenSession { req, reply } => {
             let _ = reply.send(store.open_session(&req));
         }
@@ -235,6 +265,36 @@ impl PersistenceHandle {
         self.call(|reply| DbCommand::UpsertWearable {
             desc,
             now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn list_wearables(&self) -> Result<Vec<EnrolledWearable>, StorageError> {
+        self.call(|reply| DbCommand::ListWearables { reply }).await
+    }
+
+    pub async fn rename_wearable(
+        &self,
+        id_or_prefix: String,
+        new_alias: Option<String>,
+    ) -> Result<EnrolledWearable, StorageError> {
+        self.call(|reply| DbCommand::RenameWearable {
+            id_or_prefix,
+            new_alias,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn unenroll_wearable(
+        &self,
+        id_or_prefix: String,
+        delete_sessions: bool,
+    ) -> Result<EnrolledWearable, StorageError> {
+        self.call(|reply| DbCommand::UnenrollWearable {
+            id_or_prefix,
+            delete_sessions,
             reply,
         })
         .await

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::BufReader;
@@ -14,12 +15,15 @@ use super::protocol::{
 };
 use super::pubsub::SubscriberQueue;
 
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Serves a single multiplexed NDJSON client connection until disconnect, shutdown, or oversized frame.
 pub async fn handle_connection(
     stream: UnixStream,
     core: Arc<DaemonCore>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -76,7 +80,15 @@ pub async fn handle_connection(
                         if line.trim().is_empty() {
                             continue;
                         }
-                        process_line(&line, &core, &resp_tx, &sub_watch_tx, &mut active_sub_id).await;
+                        process_line(
+                            &line,
+                            &core,
+                            &resp_tx,
+                            &sub_watch_tx,
+                            &mut active_sub_id,
+                            client_id,
+                        )
+                        .await;
                     }
                     Err(FrameError::TooLarge { max_bytes }) => {
                         let _ = resp_tx
@@ -106,6 +118,7 @@ pub async fn handle_connection(
     if let Some(sub_id) = active_sub_id.take() {
         core.broker.unsubscribe(sub_id);
     }
+    core.on_client_disconnected(client_id);
     let _ = sub_watch_tx.send(None);
     drop(resp_tx);
     let _ = writer_task.await;
@@ -117,6 +130,7 @@ async fn process_line(
     resp_tx: &mpsc::Sender<ResponseEnvelope>,
     sub_watch_tx: &watch::Sender<Option<Arc<SubscriberQueue>>>,
     active_sub_id: &mut Option<u64>,
+    client_id: u64,
 ) {
     let raw: Value = match serde_json::from_str(line) {
         Ok(val) => val,
@@ -191,7 +205,7 @@ async fn process_line(
                 .await;
         }
         other => {
-            let resp = match core.handle_op(other, req.params).await {
+            let resp = match core.handle_op(other, req.params, client_id).await {
                 Ok(data) => ResponseEnvelope::ok(req.id, data),
                 Err(err) => ResponseEnvelope::err(req.id, err.code, err.message),
             };

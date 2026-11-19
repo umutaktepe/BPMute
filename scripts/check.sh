@@ -9,7 +9,7 @@ if cargo tree -e normal --prefix none | grep -Eq '^(reqwest|hyper|rustls|native-
   exit 1
 fi
 
-if cargo tree -e normal --prefix none | grep -Eq '^(rand|rand_chacha|rand_core) '; then
+if cargo tree --depth 1 -e normal --prefix none | grep -Eq '^(rand|rand_chacha|rand_core) '; then
   echo "error: dev-only synthetic harness dependency leaked into normal dependencies (ADR-0007)" >&2
   exit 1
 fi

@@ -19,6 +19,7 @@ tracing = "0.1"
 tracing-journald = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7", "serde"] }
+zbus = { version = "4.4", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 rand = "0.8"

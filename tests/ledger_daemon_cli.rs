@@ -113,6 +113,7 @@ fn sqlite_wal_pragmas_permissions_uuidv7_and_flock_coordination() {
             .upsert_wearable(
                 &WearableDescriptor {
                     mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                    address_type: "public".to_string(),
                     alias: Some("Band".to_string()),
                     advertised_name: Some("Watch".to_string()),
                     supports_rr: true,
@@ -173,6 +174,7 @@ async fn persistence_worker_round_trip_determinism_and_uuidv7_records() {
         .upsert_wearable(
             WearableDescriptor {
                 mac: "11:22:33:44:55:66".to_string(),
+                address_type: "public".to_string(),
                 alias: Some("Polar H10".to_string()),
                 advertised_name: Some("Polar H10".to_string()),
                 supports_rr: true,
@@ -388,6 +390,7 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
     );
     let desc = WearableDescriptor {
         mac: "AA:BB:CC:DD:EE:11".to_string(),
+        address_type: "public".to_string(),
         alias: Some("Polar Strap".to_string()),
         advertised_name: Some("Polar H10".to_string()),
         supports_rr: true,
@@ -592,6 +595,7 @@ async fn live_daemon_respects_raw_samples_opt_out_and_shift_ipc_controls() {
     );
     let desc = WearableDescriptor {
         mac: "AA:BB:CC:DD:EE:22".to_string(),
+        address_type: "public".to_string(),
         alias: Some("GT5".to_string()),
         advertised_name: Some("HUAWEI WATCH GT 5".to_string()),
         supports_rr: false,
@@ -784,6 +788,7 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
     );
     let desc = WearableDescriptor {
         mac: "AA:BB:CC:DD:EE:33".to_string(),
+        address_type: "public".to_string(),
         alias: Some("DualStrap".to_string()),
         advertised_name: Some("DualStrap".to_string()),
         supports_rr: true,
@@ -1058,6 +1063,7 @@ async fn cli_accept_shift_and_dismiss_shift_end_to_end() {
             .upsert_wearable(
                 &WearableDescriptor {
                     mac: "AA:BB:CC:DD:EE:44".to_string(),
+                    address_type: "public".to_string(),
                     alias: Some("ShiftWatch".to_string()),
                     advertised_name: None,
                     supports_rr: true,
@@ -1151,6 +1157,7 @@ async fn cli_accept_shift_and_dismiss_shift_end_to_end() {
             .upsert_wearable(
                 &WearableDescriptor {
                     mac: "AA:BB:CC:DD:EE:55".to_string(),
+                    address_type: "public".to_string(),
                     alias: None,
                     advertised_name: None,
                     supports_rr: false,
@@ -1226,6 +1233,7 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
 
     let wearable_a = WearableDescriptor {
         mac: "AA:BB:CC:DD:EE:01".to_string(),
+        address_type: "public".to_string(),
         alias: Some("Wearable A".to_string()),
         advertised_name: Some("Wearable A".to_string()),
         supports_rr: true,
@@ -1233,6 +1241,7 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
     };
     let wearable_b = WearableDescriptor {
         mac: "AA:BB:CC:DD:EE:02".to_string(),
+        address_type: "public".to_string(),
         alias: Some("Wearable B".to_string()),
         advertised_name: Some("Wearable B".to_string()),
         supports_rr: false,
@@ -1403,6 +1412,7 @@ async fn eacces_on_data_dir_or_ledger_db_maps_to_exit_code_5() {
             .upsert_wearable(
                 &WearableDescriptor {
                     mac: "AA:BB:CC:DD:EE:99".to_string(),
+                    address_type: "public".to_string(),
                     alias: None,
                     advertised_name: None,
                     supports_rr: false,

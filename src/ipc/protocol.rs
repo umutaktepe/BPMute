@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::calibration::{CalibrationState, FeedbackVerdict};
 use crate::config::{ClockTime, Config, LogFormat, PatchField, ScheduleConfig};
-use crate::sleep_engine::{ContactStatus, DetectorState, Epoch};
-use crate::storage::SessionFullDetail;
+use crate::sleep_engine::{ContactStatus, DetectorState, Epoch, StreamStatus};
+use crate::storage::{EnrolledWearable, SessionFullDetail};
 
 /// Current NDJSON IPC protocol version (ADR-0002).
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -375,4 +375,74 @@ pub struct SessionClosedEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationUpdatedEvent {
     pub calibration: CalibrationState,
+}
+
+/// Discovered Bluetooth LE wearable observed during enrollment discovery scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredWearable {
+    pub address: String,
+    pub address_type: String,
+    pub name: Option<String>,
+    pub rssi: Option<i16>,
+    pub paired: bool,
+    pub already_enrolled: bool,
+}
+
+/// Enrolled wearable status including live connectivity and battery percentage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrolledWearableStatus {
+    #[serde(flatten)]
+    pub wearable: EnrolledWearable,
+    pub status: StreamStatus,
+    pub battery: Option<u8>,
+}
+
+/// Parameters for `wearable.rename`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WearableRenameParams {
+    pub id: String,
+    pub alias: Option<String>,
+}
+
+/// Parameters for `wearable.connect`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WearableConnectParams {
+    pub id: String,
+}
+
+/// Parameters for `wearable.unenroll`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WearableUnenrollParams {
+    pub id: String,
+    #[serde(default)]
+    pub forget_bluez: bool,
+    #[serde(default)]
+    pub delete_sessions: bool,
+}
+
+/// Parameters for `wearable.enroll_start`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnrollStartParams {
+    pub timeout_sec: Option<u32>,
+}
+
+/// Parameters for `wearable.enroll_select`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollSelectParams {
+    pub address: String,
+    pub alias: Option<String>,
+}
+
+/// Parameters for `wearable.enroll_auth_response`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EnrollAuthResponseParams {
+    pub confirmed: Option<bool>,
+    pub passkey: Option<u32>,
+    pub pincode: Option<String>,
 }

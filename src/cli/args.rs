@@ -99,6 +99,62 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigCommand,
     },
+    /// Manage enrolled BLE Heart Rate Service wearables.
+    Wearables {
+        #[command(subcommand)]
+        action: WearablesCommand,
+    },
+    /// Interactively scan and enroll a standard BLE 0x180D Wearable.
+    Enroll {
+        /// Explicit MAC address to enroll (bypasses discovery list).
+        #[arg(long, value_name = "MAC")]
+        address: Option<String>,
+        /// Optional alias to assign to the enrolled wearable.
+        #[arg(long, value_name = "NAME")]
+        alias: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WearablesCommand {
+    /// List enrolled Wearables.
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename an enrolled Wearable's alias.
+    Rename {
+        /// Wearable UUIDv7 ID or unambiguous prefix.
+        id: String,
+        /// New alias name.
+        alias: String,
+    },
+    /// Request connection to an enrolled Wearable.
+    Connect {
+        /// Wearable UUIDv7 ID or unambiguous prefix.
+        id: String,
+    },
+    /// Unenroll a Wearable, removing it from BPMute's allowlist.
+    Unenroll {
+        /// Wearable UUIDv7 ID or unambiguous prefix.
+        id: String,
+        /// Also remove BlueZ system pairing/device record (Adapter1.RemoveDevice).
+        #[arg(long)]
+        forget_bluez: bool,
+        /// Also delete historical Monitoring Sessions associated with this Wearable.
+        #[arg(long)]
+        delete_sessions: bool,
+    },
+    /// Interactively scan and enroll a standard BLE 0x180D Wearable.
+    Enroll {
+        /// Explicit MAC address to enroll (bypasses discovery list).
+        #[arg(long, value_name = "MAC")]
+        address: Option<String>,
+        /// Optional alias to assign to the enrolled wearable.
+        #[arg(long, value_name = "NAME")]
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

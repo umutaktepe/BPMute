@@ -1,3 +1,4 @@
+pub mod bluetooth;
 pub mod calibration;
 pub mod cli;
 pub mod config;

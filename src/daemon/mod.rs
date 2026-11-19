@@ -162,6 +162,11 @@ impl DaemonHandle {
         &self.socket_path
     }
 
+    /// Returns a reference to the shared [`DaemonCore`].
+    pub fn core(&self) -> &Arc<DaemonCore> {
+        &self.core
+    }
+
     /// Publishes an `HrSample` stream event through the drop-oldest broker.
     pub fn publish_hr_sample(&self, sample: Value) {
         self.core.publish_hr_sample(sample);

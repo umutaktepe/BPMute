@@ -23,9 +23,9 @@ use crate::storage::schema::{
     initialize_rw_connection,
 };
 use crate::storage::{
-    AcceptShiftResult, CloseSessionRequest, OpenSessionRequest, SessionFullDetail,
-    SessionListEntry, SessionListPage, SessionReplayBundle, SessionStatus, SetFeedbackRequest,
-    StorageError, WearableDescriptor, WearableInfo,
+    AcceptShiftResult, CloseSessionRequest, EnrolledWearable, OpenSessionRequest,
+    SessionFullDetail, SessionListEntry, SessionListPage, SessionReplayBundle, SessionStatus,
+    SetFeedbackRequest, StorageError, WearableDescriptor, WearableInfo,
 };
 
 /// Synchronous SQLite WAL store backing both the persistence worker and offline CLI commands.
@@ -133,6 +133,11 @@ impl LedgerStore {
                 "wearable MAC address must not be empty".to_string(),
             ));
         }
+        let address_type = if desc.address_type.trim().is_empty() {
+            "public"
+        } else {
+            desc.address_type.trim().to_ascii_lowercase().leak()
+        };
 
         let new_id = generate_uuid_v7_with(&self.uuid_ctx, now_ms);
         self.write_tx(|tx| {
@@ -147,15 +152,17 @@ impl LedgerStore {
             if let Some(id) = existing {
                 tx.execute(
                     "UPDATE wearables
-                     SET alias = COALESCE(?2, alias),
-                         advertised_name = COALESCE(?3, advertised_name),
-                         supports_rr = supports_rr OR ?4,
-                         supports_contact = supports_contact OR ?5,
-                         last_seen_at_ms = ?6,
+                     SET address_type = ?2,
+                         alias = COALESCE(?3, alias),
+                         advertised_name = COALESCE(?4, advertised_name),
+                         supports_rr = supports_rr OR ?5,
+                         supports_contact = supports_contact OR ?6,
+                         last_seen_at_ms = ?7,
                          active = 1
                      WHERE id = ?1",
                     params![
                         id,
+                        address_type,
                         desc.alias,
                         desc.advertised_name,
                         i32::from(desc.supports_rr),
@@ -167,12 +174,13 @@ impl LedgerStore {
             } else {
                 tx.execute(
                     "INSERT INTO wearables (
-                         id, mac, alias, advertised_name, supports_rr, supports_contact,
+                         id, mac, address_type, alias, advertised_name, supports_rr, supports_contact,
                          hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, 1)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 1)",
                     params![
                         new_id,
                         mac,
+                        address_type,
                         desc.alias,
                         desc.advertised_name,
                         i32::from(desc.supports_rr),
@@ -183,6 +191,98 @@ impl LedgerStore {
                 )?;
                 Ok(new_id)
             }
+        })
+    }
+
+    /// Lists enrolled Wearables (active allowlist entries).
+    pub fn list_enrolled_wearables(&self) -> Result<Vec<EnrolledWearable>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, mac, address_type, alias, advertised_name, supports_rr, supports_contact,
+                    hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active
+             FROM wearables
+             WHERE active = 1
+             ORDER BY last_seen_at_ms DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let mac: String = row.get(1)?;
+                Ok(EnrolledWearable {
+                    id: row.get(0)?,
+                    mac_masked: mask_mac(&mac),
+                    mac,
+                    address_type: row.get(2)?,
+                    alias: row.get(3)?,
+                    advertised_name: row.get(4)?,
+                    supports_rr: row.get::<_, i64>(5)? != 0,
+                    supports_contact: row.get::<_, i64>(6)? != 0,
+                    hr_var_floor: row.get(7)?,
+                    typical_sqi: row.get(8)?,
+                    enrolled_at_ms: row.get(9)?,
+                    last_seen_at_ms: row.get(10)?,
+                    active: row.get::<_, i64>(11)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetches an enrolled Wearable by UUIDv7 ID or unambiguous prefix.
+    pub fn get_wearable(&self, id_or_prefix: &str) -> Result<EnrolledWearable, StorageError> {
+        let id = resolve_wearable_id(&self.conn, id_or_prefix)?;
+        load_enrolled_wearable_in_conn(&self.conn, &id)
+    }
+
+    /// Renames a Wearable's alias by UUIDv7 ID or unambiguous prefix.
+    pub fn rename_wearable(
+        &mut self,
+        id_or_prefix: &str,
+        new_alias: Option<&str>,
+    ) -> Result<EnrolledWearable, StorageError> {
+        self.write_tx(|tx| {
+            let id = resolve_wearable_id(tx, id_or_prefix)?;
+            tx.execute(
+                "UPDATE wearables SET alias = ?2 WHERE id = ?1",
+                params![id, new_alias],
+            )?;
+            load_enrolled_wearable_in_conn(tx, &id)
+        })
+    }
+
+    /// Unenrolls a Wearable by UUIDv7 ID or unambiguous prefix.
+    ///
+    /// By default (`delete_sessions = false`), only BPMute's active allowlist entry is removed
+    /// (`active = 0`), preserving historical `Monitoring Sessions`.
+    /// When `delete_sessions = true`, all associated sessions and telemetry are deleted.
+    pub fn unenroll_wearable(
+        &mut self,
+        id_or_prefix: &str,
+        delete_sessions: bool,
+    ) -> Result<EnrolledWearable, StorageError> {
+        self.write_tx(|tx| {
+            let id = resolve_wearable_id(tx, id_or_prefix)?;
+            if delete_sessions {
+                tx.execute(
+                    "DELETE FROM session_feedback WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
+                    params![id],
+                )?;
+                tx.execute(
+                    "DELETE FROM session_epochs WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
+                    params![id],
+                )?;
+                tx.execute(
+                    "DELETE FROM raw_samples WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
+                    params![id],
+                )?;
+                tx.execute(
+                    "DELETE FROM sessions WHERE wearable_id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.execute(
+                "UPDATE wearables SET active = 0 WHERE id = ?1",
+                params![id],
+            )?;
+            load_enrolled_wearable_in_conn(tx, &id)
         })
     }
 
@@ -1002,6 +1102,79 @@ fn resolve_session_id(conn: &Connection, id_or_prefix: &str) -> Result<String, S
             "session prefix '{trimmed}' matches multiple sessions; provide more characters"
         ))),
     }
+}
+
+fn resolve_wearable_id(conn: &Connection, id_or_prefix: &str) -> Result<String, StorageError> {
+    let trimmed = id_or_prefix.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::Validation(
+            "wearable ID or prefix must not be empty".to_string(),
+        ));
+    }
+
+    let exact: Option<String> = conn
+        .query_row(
+            "SELECT id FROM wearables WHERE id = ?1",
+            params![trimmed],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = exact {
+        return Ok(id);
+    }
+
+    let escaped = trimmed
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
+    let mut stmt = conn.prepare("SELECT id FROM wearables WHERE id LIKE ?1 ESCAPE '\\' LIMIT 2")?;
+    let matches: Vec<String> = stmt
+        .query_map(params![pattern], |r| r.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    match matches.len() {
+        0 => Err(StorageError::NotFound(format!(
+            "wearable '{trimmed}' not found"
+        ))),
+        1 => Ok(matches.into_iter().next().expect("single match present")),
+        _ => Err(StorageError::AmbiguousId(format!(
+            "wearable prefix '{trimmed}' matches multiple wearables; provide more characters"
+        ))),
+    }
+}
+
+fn load_enrolled_wearable_in_conn(
+    conn: &Connection,
+    wearable_id: &str,
+) -> Result<EnrolledWearable, StorageError> {
+    conn.query_row(
+        "SELECT id, mac, address_type, alias, advertised_name, supports_rr, supports_contact,
+                hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active
+         FROM wearables
+         WHERE id = ?1",
+        params![wearable_id],
+        |row| {
+            let mac: String = row.get(1)?;
+            Ok(EnrolledWearable {
+                id: row.get(0)?,
+                mac_masked: mask_mac(&mac),
+                mac,
+                address_type: row.get(2)?,
+                alias: row.get(3)?,
+                advertised_name: row.get(4)?,
+                supports_rr: row.get::<_, i64>(5)? != 0,
+                supports_contact: row.get::<_, i64>(6)? != 0,
+                hr_var_floor: row.get(7)?,
+                typical_sqi: row.get(8)?,
+                enrolled_at_ms: row.get(9)?,
+                last_seen_at_ms: row.get(10)?,
+                active: row.get::<_, i64>(11)? != 0,
+            })
+        },
+    )
+    .optional()?
+    .ok_or_else(|| StorageError::NotFound(format!("wearable '{wearable_id}' not found")))
 }
 
 fn load_session_record(

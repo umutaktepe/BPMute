@@ -77,6 +77,10 @@ pub fn initialize_rw_connection(conn: &Connection) -> Result<(), StorageError> {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;",
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE wearables ADD COLUMN address_type TEXT NOT NULL DEFAULT 'public';",
+            [],
+        );
     } else {
         return Err(StorageError::Validation(format!(
             "unsupported SQLite ledger schema version {user_version}; expected {CURRENT_DB_SCHEMA_VERSION}"
@@ -104,6 +108,7 @@ const DDL_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS wearables (
     id TEXT PRIMARY KEY,
     mac TEXT NOT NULL UNIQUE,
+    address_type TEXT NOT NULL DEFAULT 'public',
     alias TEXT,
     advertised_name TEXT,
     supports_rr INTEGER NOT NULL DEFAULT 0,

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,15 +14,17 @@ use crate::config::{
 };
 use crate::ipc::protocol::{
     AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
-    EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode,
-    PauseParams, PushEventEnvelope, SessionClosedEvent, SessionGetParams, SessionListParams,
-    SetDryRunParams, SetFeedbackParams, SetSeedParams, error_codes,
+    DiscoveredWearable, EnrollAuthResponseParams, EnrollSelectParams, EnrollStartParams,
+    EnrolledWearableStatus, EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState,
+    PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope, SessionClosedEvent,
+    SessionGetParams, SessionListParams, SetDryRunParams, SetFeedbackParams, SetSeedParams,
+    WearableConnectParams, WearableRenameParams, WearableUnenrollParams, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
-use crate::sleep_engine::DetectorState;
+use crate::sleep_engine::{DetectorState, StreamStatus};
 use crate::storage::worker::PersistenceHandle;
-use crate::storage::{SessionFullDetail, SetFeedbackRequest, StorageError};
+use crate::storage::{SessionFullDetail, SetFeedbackRequest, StorageError, WearableDescriptor};
 
 use super::clock::DaemonClock;
 
@@ -73,6 +75,16 @@ struct InnerState {
     hr_ring_buffer: VecDeque<HrSampleEvent>,
     alerts: Vec<DaemonAlert>,
     started_at: tokio::time::Instant,
+    enrollment: Option<EnrollmentLock>,
+    discovered_wearables: Vec<DiscoveredWearable>,
+    wearable_statuses: HashMap<String, StreamStatus>,
+    wearable_batteries: HashMap<String, u8>,
+}
+
+struct EnrollmentLock {
+    client_id: u64,
+    started_at_ms: i64,
+    timeout_ms: i64,
 }
 
 /// Initialization parameters for [`DaemonCore::new`].
@@ -136,6 +148,10 @@ impl DaemonCore {
                 hr_ring_buffer: VecDeque::with_capacity(MAX_HR_RING_BUFFER_LEN),
                 alerts,
                 started_at,
+                enrollment: None,
+                discovered_wearables: Vec::new(),
+                wearable_statuses: HashMap::new(),
+                wearable_batteries: HashMap::new(),
             }),
         }
     }
@@ -248,6 +264,7 @@ impl DaemonCore {
         self: &Arc<Self>,
         op: &str,
         params: Value,
+        client_id: u64,
     ) -> Result<Value, ErrorPayload> {
         match op {
             "daemon.ping" => Ok(json!({ "pong": true, "v": PROTOCOL_VERSION })),
@@ -375,10 +392,206 @@ impl DaemonCore {
                 self.apply_calibration_update(cal_state.clone());
                 serialize_json(cal_state)
             }
+            "wearable.list" => {
+                let enrolled = self
+                    .persistence
+                    .list_wearables()
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                let guard = self.inner.lock().expect("daemon state mutex poisoned");
+                let statuses: Vec<EnrolledWearableStatus> = enrolled
+                    .into_iter()
+                    .map(|w| {
+                        let status = guard
+                            .wearable_statuses
+                            .get(&w.mac)
+                            .copied()
+                            .unwrap_or(StreamStatus::Disconnected);
+                        let battery = guard.wearable_batteries.get(&w.mac).copied();
+                        EnrolledWearableStatus {
+                            wearable: w,
+                            status,
+                            battery,
+                        }
+                    })
+                    .collect();
+                Ok(json!({ "wearables": statuses }))
+            }
+            "wearable.rename" => {
+                let parsed: WearableRenameParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid wearable.rename params: {e}"),
+                    )
+                })?;
+                let updated = self
+                    .persistence
+                    .rename_wearable(parsed.id, parsed.alias)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                Ok(json!({ "wearable": updated }))
+            }
+            "wearable.connect" => {
+                let parsed: WearableConnectParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid wearable.connect params: {e}"),
+                        )
+                    })?;
+                Ok(
+                    json!({ "ok": true, "message": format!("connection requested for {}", parsed.id) }),
+                )
+            }
+            "wearable.unenroll" => {
+                let parsed: WearableUnenrollParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid wearable.unenroll params: {e}"),
+                        )
+                    })?;
+                let unenrolled = self
+                    .persistence
+                    .unenroll_wearable(parsed.id, parsed.delete_sessions)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    guard.wearable_statuses.remove(&unenrolled.mac);
+                    guard.wearable_batteries.remove(&unenrolled.mac);
+                }
+                Ok(json!({ "wearable": unenrolled }))
+            }
+            "wearable.enroll_start" => {
+                let parsed: EnrollStartParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid wearable.enroll_start params: {e}"),
+                    )
+                })?;
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let timeout_sec = parsed.timeout_sec.unwrap_or(30).clamp(5, 120);
+                let timeout_ms = (timeout_sec as i64) * 1000;
+
+                let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                if let Some(ref lock) = guard.enrollment {
+                    let expired = now_ms >= lock.started_at_ms + lock.timeout_ms;
+                    if !expired && lock.client_id != client_id {
+                        return Err(ipc_err(
+                            error_codes::ENROLLMENT_IN_PROGRESS,
+                            "another enrollment session is currently in progress",
+                        ));
+                    }
+                }
+                guard.enrollment = Some(EnrollmentLock {
+                    client_id,
+                    started_at_ms: now_ms,
+                    timeout_ms,
+                });
+                let devices = guard.discovered_wearables.clone();
+                Ok(json!({ "devices": devices }))
+            }
+            "wearable.enroll_select" => {
+                let parsed: EnrollSelectParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid wearable.enroll_select params: {e}"),
+                    )
+                })?;
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    match guard.enrollment {
+                        Some(ref lock) if lock.client_id == client_id => {
+                            guard.enrollment = None;
+                        }
+                        Some(_) => {
+                            return Err(ipc_err(
+                                error_codes::PRECONDITION_FAILED,
+                                "enrollment session is owned by another client",
+                            ));
+                        }
+                        None => {
+                            return Err(ipc_err(
+                                error_codes::PRECONDITION_FAILED,
+                                "no active enrollment session",
+                            ));
+                        }
+                    }
+                }
+                let norm_mac = parsed.address.trim().to_ascii_uppercase();
+                let is_rpa =
+                    crate::bluetooth::dbus::is_resolvable_private_address(&norm_mac, "random");
+                let mut warnings = Vec::new();
+                let hints: Vec<String> = Vec::new();
+                if is_rpa {
+                    warnings.push("Wearable uses a rotating Resolvable Private Address (RPA). Bonding ensures auto-reconnection persists.".to_string());
+                }
+
+                let desc = WearableDescriptor {
+                    mac: norm_mac,
+                    address_type: "random".to_string(),
+                    alias: parsed.alias,
+                    advertised_name: None,
+                    supports_rr: false,
+                    supports_contact: true,
+                };
+                let w_id = self
+                    .persistence
+                    .upsert_wearable(desc, now_ms)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                let list = self
+                    .persistence
+                    .list_wearables()
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                let enrolled = list.into_iter().find(|w| w.id == w_id).ok_or_else(|| {
+                    ipc_err(
+                        error_codes::INTERNAL_ERROR,
+                        "failed to load newly enrolled wearable",
+                    )
+                })?;
+                Ok(json!({
+                    "wearable": enrolled,
+                    "warnings": warnings,
+                    "hints": hints,
+                }))
+            }
+            "wearable.enroll_cancel" => {
+                let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                guard.enrollment = None;
+                guard.discovered_wearables.clear();
+                Ok(json!({ "ok": true }))
+            }
+            "wearable.enroll_auth_response" => {
+                let _parsed: EnrollAuthResponseParams =
+                    serde_json::from_value(params).map_err(|e| {
+                        ipc_err(
+                            error_codes::INVALID_PARAMS,
+                            format!("invalid wearable.enroll_auth_response params: {e}"),
+                        )
+                    })?;
+                Ok(json!({ "ok": true }))
+            }
             _ => Err(ipc_err(
                 error_codes::UNKNOWN_OP,
                 format!("unknown IPC operation '{op}'"),
             )),
+        }
+    }
+
+    /// Automatically cancels any active enrollment owned by `client_id` when the socket disconnects.
+    pub fn on_client_disconnected(&self, client_id: u64) {
+        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+        if matches!(guard.enrollment, Some(ref lock) if lock.client_id == client_id) {
+            tracing::info!(
+                client_id,
+                "enrollment auto-cancelled due to client socket disconnect"
+            );
+            guard.enrollment = None;
+            guard.discovered_wearables.clear();
         }
     }
 
