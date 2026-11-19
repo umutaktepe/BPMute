@@ -35,3 +35,15 @@ _Avoid_: Night, run, recording, log
 **Anomalous Session**:
 A Monitoring Session flagged as physiologically uncharacteristic (such as illness or alcohol intake) so detection relies solely on within-session relative shifts and calibration updates are quarantined.
 _Avoid_: Bad night, outlier, error session
+
+**Grace Period**:
+The cancellable countdown window between sleep-onset confirmation and executing the configured Sleep Action Pipeline, during which desktop activity, explicit cancellation, or physiological arousal can abort execution.
+_Avoid_: Countdown, delay, warning window, buffer
+
+**Sleep Action Pipeline**:
+The ordered sequence of desktop and system actions (such as pausing media, running a custom hook, locking the screen, or suspending the host) executed when a Grace Period expires uncancelled.
+_Avoid_: Trigger, automation, macro, action list
+
+**Snooze**:
+A temporary user-initiated suppression of sleep triggers during a Grace Period that pauses automation without recording a false-positive calibration penalty.
+_Avoid_: Postpone, mute, cancel (reserve cancellation for waking false positives)
