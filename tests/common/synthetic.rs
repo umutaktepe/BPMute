@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared test harness items are used selectively by separate integration test binaries"
+)]
 
 use bpmute::sleep_engine::{ContactStatus, EngineEvent, HrPacket, StreamState, StreamStatus};
 use rand::Rng;

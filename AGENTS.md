@@ -11,3 +11,7 @@ Issues and specs are tracked in GitHub Issues (`umutaktepe/BPMute`) via the `gh`
 ### Domain docs
 
 Single-context layout (`GLOSSARY.md` and `docs/adr/` at the repo root). See `docs/agents/domain.md`.
+
+## Verification
+
+Run `./scripts/check.sh` before finishing any change.
