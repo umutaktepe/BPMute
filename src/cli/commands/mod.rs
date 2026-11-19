@@ -16,9 +16,11 @@ use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
 use crate::storage::{LedgerStore, StorageError, db_exists, db_path_in_data_dir};
 
+pub mod monitor;
 pub mod sessions;
 pub mod wearables;
 
+use monitor::{run_cancel, run_snooze, run_test_trigger};
 use sessions::{run_calibration, run_replay, run_sessions};
 use wearables::{run_enroll, run_wearables};
 
@@ -55,6 +57,13 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
         Command::Status { json } => run_status(&paths, json, stdout, stderr).await,
         Command::Pause { target } => run_pause(&paths, target.as_deref(), stdout, stderr).await,
         Command::Resume => run_resume(&paths, stdout, stderr).await,
+        Command::Cancel => run_cancel(&paths.socket_path, stdout, stderr).await,
+        Command::Snooze { duration } => {
+            run_snooze(&paths.socket_path, duration.as_deref(), stdout, stderr).await
+        }
+        Command::TestTrigger { grace_sec } => {
+            run_test_trigger(&paths.socket_path, grace_sec, stdout, stderr).await
+        }
         Command::Replay {
             file,
             session,
@@ -133,6 +142,8 @@ async fn run_daemon<WErr: Write>(
         clock,
         wearable_source: Some(wearable_source),
         install_signals: true,
+        action_executor: Some(Arc::new(crate::actions::SystemActionExecutor)),
+        notifier: Some(Arc::new(crate::actions::DesktopNotifier)),
     })
     .await
     {

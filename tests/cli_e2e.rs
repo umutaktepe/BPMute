@@ -118,6 +118,8 @@ async fn virtual_time_cli_pause_resume_and_config_reload_e2e() {
         clock,
         wearable_source: None,
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();

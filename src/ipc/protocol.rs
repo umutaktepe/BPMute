@@ -357,6 +357,16 @@ pub struct HrSampleEvent {
     pub session_id: Option<String>,
 }
 
+/// Control event payload pushed as `GraceTick` during active `Grace Period`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraceTickEvent {
+    pub session_id: String,
+    pub remaining_sec: u32,
+    pub total_sec: u32,
+    pub power_action: crate::config::PowerAction,
+    pub dry_run: bool,
+}
+
 /// Control event payload pushed as `EpochUpdate` every 15-second `Epoch`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpochUpdateEvent {

@@ -84,6 +84,8 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
         clock: clock.clone(),
         wearable_source: Some(wearable_source),
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();

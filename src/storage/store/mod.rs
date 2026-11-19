@@ -99,6 +99,13 @@ impl LedgerStore {
         Ok(recompute_calibration(&input))
     }
 
+    /// Executes `PRAGMA wal_checkpoint(TRUNCATE)` for atomic synchronization before sleep.
+    pub fn flush_wal(&self) -> Result<(), StorageError> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// Sets or clears the Day-1 sleeping-HR seed and recomputes `calibration_state`.
     pub fn set_day1_seed_and_recompute(
         &mut self,

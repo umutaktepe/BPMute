@@ -29,6 +29,8 @@ async fn spawn_test_daemon(temp: &TempDir) -> (DaemonHandle, ResolvedPaths) {
         clock,
         wearable_source: None,
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();

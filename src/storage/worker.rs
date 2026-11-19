@@ -74,6 +74,9 @@ enum DbCommand {
         now_ms: i64,
         reply: oneshot::Sender<Result<CalibrationState, StorageError>>,
     },
+    FlushWal {
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
 }
 
 /// Clonable async handle for dispatching SQLite operations to [`PersistenceWorker`].
@@ -242,10 +245,16 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         DbCommand::DismissShiftAndRecompute { now_ms, reply } => {
             let _ = reply.send(store.dismiss_shift_and_recompute(now_ms));
         }
+        DbCommand::FlushWal { reply } => {
+            let _ = reply.send(store.flush_wal());
+        }
     }
 }
 
 impl PersistenceHandle {
+    pub async fn flush_wal(&self) -> Result<(), StorageError> {
+        self.call(|reply| DbCommand::FlushWal { reply }).await
+    }
     async fn call<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<Result<T, StorageError>>) -> DbCommand,

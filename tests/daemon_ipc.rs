@@ -39,6 +39,8 @@ async fn start_virtual_daemon(
         clock,
         wearable_source: None,
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .expect("daemon should start");
@@ -80,6 +82,8 @@ async fn daemon_socket_permissions_ping_status_and_framing_guards() {
         clock: std::sync::Arc::new(VirtualClock::starting_at(start_utc)),
         wearable_source: None,
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await;
     assert!(dup.is_err(), "cannot steal live daemon socket");

@@ -8,6 +8,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use thiserror::Error;
@@ -16,17 +17,16 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::{
-    CliOverrides, DetectionConfig, LoadedConfig, PowerAction, RawSamplesRetention,
-};
+use crate::actions::traits::{ActionExecutor, Notifier};
+use crate::config::{CliOverrides, DetectionConfig, LoadedConfig, RawSamplesRetention};
 use crate::ipc::protocol::{EpochUpdateEvent, HrSampleEvent};
 use crate::ipc::pubsub::EventBroker;
 use crate::ipc::server::handle_connection;
 use crate::logging::BiometricLogContext;
 use crate::paths::{EnvSource, ResolvedPaths, ensure_private_dir};
 use crate::sleep_engine::{
-    DetectorState, EngineConfig, EngineEvent, EngineOutput, GraceOutcome, HrPacket,
-    SessionEndReason, SleepEngine,
+    DetectorState, EngineConfig, EngineEvent, EngineOutput, GraceAbortReason, GraceOutcome,
+    HrPacket, SessionEndReason, SleepEngine, StreamStatus,
 };
 use crate::storage::{
     CloseSessionRequest, OpenSessionRequest, PersistenceWorker, StorageError, db_path_in_data_dir,
@@ -50,7 +50,7 @@ pub enum DaemonError {
     Storage(#[from] StorageError),
 }
 
-enum EngineControlEvent {
+pub enum EngineControlEvent {
     GraceOutcome(GraceOutcome),
 }
 
@@ -63,6 +63,8 @@ pub struct DaemonOptions {
     pub clock: Arc<dyn DaemonClock>,
     pub wearable_source: Option<Arc<dyn WearableSource>>,
     pub install_signals: bool,
+    pub action_executor: Option<Arc<dyn ActionExecutor>>,
+    pub notifier: Option<Arc<dyn Notifier>>,
 }
 
 /// Running background daemon instance with graceful shutdown and IPC control handles.
@@ -101,6 +103,14 @@ impl DaemonHandle {
         let broker = Arc::new(EventBroker::default());
         let initial_detection = opts.loaded_config.config.detection.clone();
         let initial_retention = opts.loaded_config.config.retention.raw_samples_days;
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<EngineControlEvent>(32);
+
+        let action_executor = opts
+            .action_executor
+            .unwrap_or_else(|| Arc::new(crate::actions::FakeActionExecutor::new()));
+        let notifier = opts
+            .notifier
+            .unwrap_or_else(|| Arc::new(crate::actions::FakeNotifier::new()));
 
         let core = Arc::new(DaemonCore::new(DaemonCoreInit {
             paths: opts.paths,
@@ -112,13 +122,15 @@ impl DaemonHandle {
             shutdown_rx: shutdown_rx.clone(),
             persistence: persistence_handle,
             initial_calibration,
+            action_executor,
+            notifier,
+            engine_ctrl_tx: ctrl_tx.clone(),
         }));
 
         let wearable_source = opts
             .wearable_source
             .unwrap_or_else(|| Arc::new(NullWearableSource));
         let wearable_rx = wearable_source.subscribe(shutdown_rx.clone());
-        let (ctrl_tx, ctrl_rx) = mpsc::channel::<EngineControlEvent>(32);
 
         let monitor_task = tokio::spawn(run_monitoring_loop(
             Arc::clone(&core),
@@ -132,6 +144,14 @@ impl DaemonHandle {
         let core_clone = Arc::clone(&core);
         let socket_for_task = socket_path.clone();
         let install_signals = opts.install_signals;
+
+        if install_signals {
+            let core_sleep = Arc::clone(&core);
+            let mut shutdown_sleep = shutdown_rx.clone();
+            tokio::spawn(async move {
+                run_logind_sleep_listener(core_sleep, &mut shutdown_sleep).await;
+            });
+        }
 
         let accept_task = tokio::spawn(async move {
             run_accept_loop(
@@ -294,6 +314,11 @@ impl MonitoringContext {
                 };
                 self.switch_wearable_if_needed(&wearable_id, state.ts_ms)
                     .await;
+                if state.status == StreamStatus::SignalLost
+                    || state.status == StreamStatus::Disconnected
+                {
+                    self.core.signal_signal_lost().await;
+                }
                 let outputs = self.engine.handle_event(EngineEvent::StreamState(state));
                 self.process_outputs(&wearable_id, outputs).await;
             }
@@ -413,12 +438,15 @@ impl MonitoringContext {
                         });
                     }
                 }
-                EngineOutput::StateChanged { to, .. } => {
+                EngineOutput::StateChanged { to, ts_ms, .. } => {
                     self.core.set_detector_phase(
                         to,
                         self.active_session_id.clone(),
                         self.active_wearable_id.clone(),
                     );
+                    if to == DetectorState::Confirmed {
+                        self.core.handle_confirmed_sleep_onset(ts_ms).await;
+                    }
                 }
                 EngineOutput::SessionEnded(summary) => {
                     if let Some(sid) = self.active_session_id.take() {
@@ -439,6 +467,8 @@ impl MonitoringContext {
                             .now_utc()
                             .timestamp_millis()
                             .max(summary.end_ts_ms);
+                        let trigger_power = self.core.take_trigger_power_action();
+                        let is_rapid = self.core.take_rapid_resume();
                         match self
                             .core
                             .persistence
@@ -446,8 +476,8 @@ impl MonitoringContext {
                                 CloseSessionRequest {
                                     session_id: sid,
                                     summary,
-                                    trigger_power_action: PowerAction::None,
-                                    rapid_resume_within_5m: false,
+                                    trigger_power_action: trigger_power,
+                                    rapid_resume_within_5m: is_rapid,
                                 },
                                 close_now_ms,
                             )
@@ -471,9 +501,12 @@ impl MonitoringContext {
                         self.active_wearable_id.clone(),
                     );
                 }
-                EngineOutput::GraceAbortRequested { .. }
-                | EngineOutput::FalsePositiveRecorded { .. }
-                | EngineOutput::GapResolved { .. } => {}
+                EngineOutput::GraceAbortRequested { reason, .. } => {
+                    if reason == GraceAbortReason::PhysiologicalArousal {
+                        self.core.signal_arousal_abort().await;
+                    }
+                }
+                EngineOutput::FalsePositiveRecorded { .. } | EngineOutput::GapResolved { .. } => {}
             }
         }
     }
@@ -636,4 +669,68 @@ async fn run_accept_loop(
         let _ = handle.await;
     }
     let _ = fs::remove_file(socket_path);
+}
+
+async fn run_logind_sleep_listener(core: Arc<DaemonCore>, shutdown: &mut watch::Receiver<bool>) {
+    let conn = match zbus::Connection::system().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::debug!("system bus unavailable for logind sleep listener: {err}");
+            return;
+        }
+    };
+
+    let manager = match crate::actions::system::LogindManagerProxy::new(&conn).await {
+        Ok(m) => m,
+        Err(err) => {
+            tracing::debug!("LogindManagerProxy unavailable: {err}");
+            return;
+        }
+    };
+
+    let mut sleep_stream = match manager.receive_prepare_for_sleep().await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::debug!("failed to subscribe to PrepareForSleep signal: {err}");
+            return;
+        }
+    };
+
+    // Acquire unprivileged systemd-logind delay sleep inhibitor
+    let mut inhibitor_guard = manager
+        .inhibit("sleep", "BPMute", "atomic SQLite WAL flush", "delay")
+        .await
+        .ok();
+
+    use zbus::export::ordered_stream::OrderedStreamExt;
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            Some(signal) = sleep_stream.next() => {
+                if let Ok(args) = signal.args() {
+                    let start = args.start;
+                    if start {
+                        tracing::info!("systemd-logind PrepareForSleep(true) received; executing <= 2s atomic SQLite WAL flush");
+                        core.signal_prepare_for_sleep(true).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            core.persistence.flush_wal(),
+                        )
+                        .await;
+                        // Release delay inhibitor FD so logind can proceed to suspend
+                        drop(inhibitor_guard.take());
+                    } else {
+                        tracing::info!("systemd-logind PrepareForSleep(false) received; system resumed");
+                        core.signal_prepare_for_sleep(false).await;
+                        // Re-acquire delay sleep inhibitor for future sleep cycles
+                        inhibitor_guard = manager
+                            .inhibit("sleep", "BPMute", "atomic SQLite WAL flush", "delay")
+                            .await
+                            .ok();
+                    }
+                }
+            }
+        }
+    }
+    drop(inhibitor_guard);
 }

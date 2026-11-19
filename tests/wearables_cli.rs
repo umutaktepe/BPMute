@@ -178,6 +178,8 @@ async fn wearables_cli_online_end_to_end() {
         clock,
         wearable_source: None,
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();

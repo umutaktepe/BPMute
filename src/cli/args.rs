@@ -62,6 +62,19 @@ pub enum Command {
     },
     /// Resume Sleep Action Pipeline triggers after a pause.
     Resume,
+    /// Cancel an active Grace Period countdown ("Cancel (I'm Awake)").
+    Cancel,
+    /// Snooze sleep triggers during an active Grace Period without calibration penalty.
+    Snooze {
+        /// Optional snooze duration (e.g. `30m`, `1h`); defaults to configured snooze duration.
+        duration: Option<String>,
+    },
+    /// Exercise notifications and state transitions via a test trigger without executing Sleep Action Pipeline side effects.
+    TestTrigger {
+        /// Optional custom Grace Period duration in seconds (10–300 s).
+        #[arg(long, value_name = "SEC")]
+        grace_sec: Option<u32>,
+    },
     /// Replay a recorded session (--session <id>) or canonical CSV/JSONL trace read-only through the sleep-onset engine.
     Replay {
         /// Path to canonical CSV or JSONL trace file.

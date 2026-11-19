@@ -5,12 +5,15 @@ use std::time::Duration;
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
+use crate::actions::grace::{GraceControlCmd, GraceCoordinator, GraceRunOutcome, GraceRunParams};
+use crate::actions::pipeline::{PipelineContext, SleepActionPipeline};
+use crate::actions::traits::{ActionExecutor, Notifier};
 use crate::calibration::CalibrationState;
 use crate::config::{
-    CliOverrides, ClockTime, ConfigPatch, DetectionConfig, LoadedConfig, RawSamplesRetention,
-    patch_config_file,
+    CliOverrides, ClockTime, ConfigPatch, DetectionConfig, LoadedConfig, PowerAction,
+    RawSamplesRetention, patch_config_file,
 };
 use crate::ipc::protocol::{
     AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
@@ -22,7 +25,7 @@ use crate::ipc::protocol::{
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
-use crate::sleep_engine::{DetectorState, StreamStatus};
+use crate::sleep_engine::{DetectorState, GraceOutcome, GraceResult, StreamStatus};
 use crate::storage::worker::PersistenceHandle;
 use crate::storage::{SessionFullDetail, SetFeedbackRequest, StorageError, WearableDescriptor};
 
@@ -56,6 +59,16 @@ pub struct DaemonCore {
     pub broker: Arc<EventBroker>,
     pub shutdown_rx: watch::Receiver<bool>,
     pub persistence: PersistenceHandle,
+    pub action_executor: Arc<dyn ActionExecutor>,
+    pub notifier: Arc<dyn Notifier>,
+    pub pipeline: Arc<SleepActionPipeline>,
+    pub coordinator: Arc<GraceCoordinator>,
+    pub engine_ctrl_tx: mpsc::Sender<super::EngineControlEvent>,
+    active_grace_tx: Mutex<Option<mpsc::Sender<GraceControlCmd>>>,
+    active_grace_params: Mutex<Option<GraceRunParams>>,
+    pub sleep_triggered_at: Mutex<Option<i64>>,
+    pub trigger_power_action: Mutex<PowerAction>,
+    pub rapid_resume_within_5m: Mutex<bool>,
     calibration_tx: watch::Sender<CalibrationState>,
     config_tx: watch::Sender<(DetectionConfig, RawSamplesRetention)>,
     inner: Mutex<InnerState>,
@@ -98,6 +111,9 @@ pub struct DaemonCoreInit {
     pub shutdown_rx: watch::Receiver<bool>,
     pub persistence: PersistenceHandle,
     pub initial_calibration: CalibrationState,
+    pub action_executor: Arc<dyn ActionExecutor>,
+    pub notifier: Arc<dyn Notifier>,
+    pub engine_ctrl_tx: mpsc::Sender<super::EngineControlEvent>,
 }
 
 impl DaemonCore {
@@ -113,6 +129,9 @@ impl DaemonCore {
             shutdown_rx,
             persistence,
             initial_calibration,
+            action_executor,
+            notifier,
+            engine_ctrl_tx,
         } = init;
         let dry_run = loaded_config.config.actions.dry_run;
         let started_at = clock.now_instant();
@@ -124,6 +143,17 @@ impl DaemonCore {
         let mut alerts = Vec::new();
         sync_shift_alert_locked(&mut alerts, &initial_calibration);
 
+        let pipeline = Arc::new(SleepActionPipeline::new(
+            Arc::clone(&action_executor),
+            Arc::clone(&notifier),
+            Arc::clone(&clock),
+        ));
+        let coordinator = Arc::new(GraceCoordinator::new(
+            Arc::clone(&notifier),
+            Arc::clone(&clock),
+            Arc::clone(&broker),
+        ));
+
         Self {
             paths,
             env,
@@ -132,6 +162,16 @@ impl DaemonCore {
             broker,
             shutdown_rx,
             persistence,
+            action_executor,
+            notifier,
+            pipeline,
+            coordinator,
+            engine_ctrl_tx,
+            active_grace_tx: Mutex::new(None),
+            active_grace_params: Mutex::new(None),
+            sleep_triggered_at: Mutex::new(None),
+            trigger_power_action: Mutex::new(PowerAction::None),
+            rapid_resume_within_5m: Mutex::new(false),
             calibration_tx,
             config_tx,
             inner: Mutex::new(InnerState {
@@ -236,6 +276,342 @@ impl DaemonCore {
         }
     }
 
+    /// Returns whether the daemon is currently running an active Grace Period.
+    pub fn is_in_grace_period(&self) -> bool {
+        self.active_grace_tx.lock().unwrap().is_some()
+    }
+
+    /// Returns whether sleep triggers are currently armed.
+    pub fn is_armed(&self) -> bool {
+        let guard = self.inner.lock().expect("daemon state mutex poisoned");
+        is_armed_locked(&guard, self.clock.as_ref())
+    }
+
+    /// Returns whether runtime or configuration dry-run mode is active.
+    pub fn is_dry_run(&self) -> bool {
+        let guard = self.inner.lock().expect("daemon state mutex poisoned");
+        guard.dry_run || guard.loaded_config.config.actions.dry_run
+    }
+
+    pub fn set_active_grace(&self, tx: mpsc::Sender<GraceControlCmd>, params: GraceRunParams) {
+        let mut guard_tx = self.active_grace_tx.lock().unwrap();
+        let mut guard_p = self.active_grace_params.lock().unwrap();
+        *guard_tx = Some(tx);
+        *guard_p = Some(params);
+    }
+
+    pub fn clear_active_grace(&self) {
+        let mut guard_tx = self.active_grace_tx.lock().unwrap();
+        let mut guard_p = self.active_grace_params.lock().unwrap();
+        *guard_tx = None;
+        *guard_p = None;
+    }
+
+    pub async fn cancel_grace(&self) -> Result<(), ErrorPayload> {
+        let tx = self.active_grace_tx.lock().unwrap().clone();
+        if let Some(sender) = tx {
+            let _ = sender.send(GraceControlCmd::Cancel).await;
+            Ok(())
+        } else {
+            Err(ipc_err(
+                error_codes::PRECONDITION_FAILED,
+                "no active grace period to cancel",
+            ))
+        }
+    }
+
+    pub async fn snooze_grace(&self, duration_sec: Option<u32>) -> Result<u32, ErrorPayload> {
+        let tx = self.active_grace_tx.lock().unwrap().clone();
+        if let Some(sender) = tx {
+            let default_sec = {
+                let guard = self.inner.lock().unwrap();
+                guard.loaded_config.config.actions.snooze_duration_min * 60
+            };
+            let eff = duration_sec.unwrap_or(default_sec);
+            let _ = sender
+                .send(GraceControlCmd::Snooze {
+                    duration_sec: Some(eff),
+                })
+                .await;
+            Ok(eff)
+        } else {
+            Err(ipc_err(
+                error_codes::PRECONDITION_FAILED,
+                "no active grace period to snooze",
+            ))
+        }
+    }
+
+    pub async fn signal_arousal_abort(&self) {
+        let tx = self.active_grace_tx.lock().unwrap().clone();
+        if let Some(sender) = tx {
+            let _ = sender.send(GraceControlCmd::ArousalAbort).await;
+        }
+    }
+
+    pub async fn signal_signal_lost(&self) {
+        let tx = self.active_grace_tx.lock().unwrap().clone();
+        if let Some(sender) = tx {
+            let _ = sender.send(GraceControlCmd::SignalLost).await;
+        }
+    }
+
+    pub async fn signal_prepare_for_sleep(&self, start: bool) {
+        if start {
+            let tx = self.active_grace_tx.lock().unwrap().clone();
+            if let Some(sender) = tx {
+                let _ = sender.send(GraceControlCmd::PrepareForSleep).await;
+            }
+        } else {
+            let triggered_at = *self.sleep_triggered_at.lock().unwrap();
+            if let Some(ts) = triggered_at {
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let elapsed_ms = now_ms.saturating_sub(ts);
+                if elapsed_ms < 300_000 {
+                    *self.rapid_resume_within_5m.lock().unwrap() = true;
+                    self.deliver_grace_outcome(GraceOutcome {
+                        ts_ms: now_ms,
+                        outcome: GraceResult::PostTriggerRapidWake,
+                    })
+                    .await;
+                } else {
+                    *self.rapid_resume_within_5m.lock().unwrap() = false;
+                }
+                *self.sleep_triggered_at.lock().unwrap() = None;
+            }
+        }
+    }
+
+    pub fn take_trigger_power_action(&self) -> PowerAction {
+        let mut guard = self.trigger_power_action.lock().unwrap();
+        let act = *guard;
+        *guard = PowerAction::None;
+        act
+    }
+
+    pub fn take_rapid_resume(&self) -> bool {
+        let mut guard = self.rapid_resume_within_5m.lock().unwrap();
+        let r = *guard;
+        *guard = false;
+        r
+    }
+
+    pub async fn start_test_trigger(
+        self: &Arc<Self>,
+        grace_sec: Option<u32>,
+    ) -> Result<u32, ErrorPayload> {
+        if self.is_in_grace_period() {
+            return Err(ipc_err(
+                error_codes::CONFLICT,
+                "grace period is already active",
+            ));
+        }
+        let (params, eff_sec) = {
+            let guard = self.inner.lock().unwrap();
+            let mut cfg = guard.loaded_config.config.actions.clone();
+            let eff_sec = grace_sec.unwrap_or_else(|| cfg.effective_grace_period_sec());
+            cfg.grace_period_sec = Some(eff_sec);
+            let params = GraceRunParams {
+                session_id: "test-trigger-session".to_string(),
+                wearable_id: "test-trigger-wearable".to_string(),
+                config: cfg,
+                dry_run: true,
+            };
+            (params, eff_sec)
+        };
+
+        let (tx, rx) = mpsc::channel(8);
+        self.set_active_grace(tx, params.clone());
+
+        let core = Arc::clone(self);
+        tokio::spawn(async move {
+            let outcome = core.coordinator.run(params, rx).await;
+            core.clear_active_grace();
+            if let GraceRunOutcome::Completed(gr) = outcome
+                && gr.outcome == GraceResult::Expired
+            {
+                let ctx = PipelineContext {
+                    session_id: "test-trigger-session".to_string(),
+                    wearable_id: "test-trigger-wearable".to_string(),
+                    event: "dry_run".to_string(),
+                    dry_run: true,
+                };
+                let cfg = core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .loaded_config
+                    .config
+                    .actions
+                    .clone();
+                let _ = core.pipeline.execute(&ctx, &cfg).await;
+            }
+        });
+
+        Ok(eff_sec)
+    }
+
+    pub async fn deliver_grace_outcome(&self, outcome: GraceOutcome) {
+        let _ = self
+            .engine_ctrl_tx
+            .send(super::EngineControlEvent::GraceOutcome(outcome))
+            .await;
+    }
+
+    pub async fn handle_confirmed_sleep_onset(self: &Arc<Self>, ts_ms: i64) {
+        let (is_paused, cfg, session_id, wearable_id) = {
+            let guard = self.inner.lock().unwrap();
+            (
+                guard.paused,
+                guard.loaded_config.config.clone(),
+                guard
+                    .active_session_id
+                    .clone()
+                    .unwrap_or_else(|| "default-session".to_string()),
+                guard
+                    .active_wearable_id
+                    .clone()
+                    .unwrap_or_else(|| "default-wearable".to_string()),
+            )
+        };
+
+        if is_paused {
+            tracing::info!(
+                "sleep onset confirmed but triggers are paused; transitioning silently to Sleeping"
+            );
+            self.deliver_grace_outcome(GraceOutcome {
+                ts_ms,
+                outcome: GraceResult::Expired,
+            })
+            .await;
+            return;
+        }
+
+        if cfg.schedule.active_hours_enabled
+            && !cfg
+                .schedule
+                .is_within_active_hours(self.clock.now_local().time())
+        {
+            tracing::info!(
+                "sleep onset confirmed but outside active hours; transitioning silently to Sleeping"
+            );
+            self.deliver_grace_outcome(GraceOutcome {
+                ts_ms,
+                outcome: GraceResult::Expired,
+            })
+            .await;
+            return;
+        }
+
+        if cfg.actions.pause_media
+            && cfg.actions.custom_command.is_empty()
+            && !cfg.actions.lock_screen
+            && cfg.actions.power_action == PowerAction::None
+        {
+            let has_playing = self
+                .action_executor
+                .has_playing_players(&cfg.actions.ignore_players)
+                .await
+                .unwrap_or(false);
+            if !has_playing {
+                tracing::info!(
+                    "strictly pause_media pipeline with 0 active players; skipping Grace Period and transitioning silently to Sleeping"
+                );
+                self.deliver_grace_outcome(GraceOutcome {
+                    ts_ms,
+                    outcome: GraceResult::Expired,
+                })
+                .await;
+                return;
+            }
+        }
+
+        let params = GraceRunParams {
+            session_id: session_id.clone(),
+            wearable_id: wearable_id.clone(),
+            config: cfg.actions.clone(),
+            dry_run: self.is_dry_run(),
+        };
+
+        let (tx, rx) = mpsc::channel(8);
+        self.set_active_grace(tx, params.clone());
+
+        let core = Arc::clone(self);
+        tokio::spawn(async move {
+            let outcome = core.coordinator.run(params, rx).await;
+            core.clear_active_grace();
+            match outcome {
+                GraceRunOutcome::Completed(gr) => {
+                    if gr.outcome == GraceResult::Expired {
+                        let ctx = PipelineContext {
+                            session_id,
+                            wearable_id,
+                            event: "sleep_trigger".to_string(),
+                            dry_run: core.is_dry_run(),
+                        };
+                        let res = core
+                            .pipeline
+                            .execute(&ctx, &cfg.actions)
+                            .await
+                            .unwrap_or_default();
+                        *core.sleep_triggered_at.lock().unwrap() = Some(gr.ts_ms);
+                        *core.trigger_power_action.lock().unwrap() = cfg.actions.power_action;
+
+                        if cfg.actions.power_action == PowerAction::None
+                            && !res.paused_players.is_empty()
+                            && !core.is_dry_run()
+                        {
+                            let c_watch = Arc::clone(&core);
+                            let paused_targets = res.paused_players.clone();
+                            tokio::spawn(async move {
+                                if c_watch
+                                    .action_executor
+                                    .watch_mpris_resume(&paused_targets)
+                                    .await
+                                {
+                                    tracing::info!(
+                                        "MPRIS player resumed playback within 5-min post-trigger watch; recording FP"
+                                    );
+                                    let now_ms = c_watch.clock.now_utc().timestamp_millis();
+                                    c_watch
+                                        .deliver_grace_outcome(GraceOutcome {
+                                            ts_ms: now_ms,
+                                            outcome: GraceResult::PostTriggerRapidWake,
+                                        })
+                                        .await;
+                                }
+                            });
+                        }
+                    }
+                    if !core.is_dry_run() {
+                        core.deliver_grace_outcome(gr).await;
+                    }
+                }
+                GraceRunOutcome::AsymmetricSignalLost => {
+                    let ctx = PipelineContext {
+                        session_id,
+                        wearable_id,
+                        event: "sleep_trigger".to_string(),
+                        dry_run: core.is_dry_run(),
+                    };
+                    let mut non_disruptive = cfg.actions.clone();
+                    non_disruptive.custom_command.clear();
+                    non_disruptive.lock_screen = false;
+                    non_disruptive.power_action = PowerAction::None;
+                    let _ = core.pipeline.execute(&ctx, &non_disruptive).await;
+                    if !core.is_dry_run() {
+                        let now_ms = core.clock.now_utc().timestamp_millis();
+                        core.deliver_grace_outcome(GraceOutcome {
+                            ts_ms: now_ms,
+                            outcome: GraceResult::Expired,
+                        })
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
     /// Registers a subscriber and builds its initial `Snapshot` push event.
     pub fn subscribe(&self) -> (u64, Arc<SubscriberQueue>, DaemonStatus) {
         let status = self.status();
@@ -287,6 +663,38 @@ impl DaemonCore {
                     )
                 })?;
                 serialize_json(self.set_dry_run(parsed.dry_run))
+            }
+            "monitor.cancel_grace" => {
+                self.cancel_grace().await?;
+                Ok(json!({ "cancelled": true }))
+            }
+            "monitor.snooze_grace" => {
+                let dur_sec = params
+                    .get("duration_sec")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .or_else(|| {
+                        params
+                            .get("duration_min")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| (v * 60) as u32)
+                    });
+                let dur = self.snooze_grace(dur_sec).await?;
+                Ok(json!({ "snoozed": true, "duration_sec": dur }))
+            }
+            "monitor.test_trigger" => {
+                let grace_sec = params
+                    .get("grace_sec")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .or_else(|| {
+                        params
+                            .get("grace_period_sec")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32)
+                    });
+                let eff_sec = self.start_test_trigger(grace_sec).await?;
+                Ok(json!({ "test_trigger_started": true, "grace_period_sec": eff_sec }))
             }
             "config.get" => {
                 let guard = self.inner.lock().expect("daemon state mutex poisoned");

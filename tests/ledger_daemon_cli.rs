@@ -368,6 +368,8 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
         clock,
         wearable_source: Some(Arc::new(wearable_source)),
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();
@@ -580,6 +582,8 @@ async fn live_daemon_respects_raw_samples_opt_out_and_shift_ipc_controls() {
         clock,
         wearable_source: Some(Arc::new(wearable_source)),
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();
@@ -767,6 +771,8 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
         clock,
         wearable_source: Some(Arc::new(wearable_source)),
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();
@@ -977,7 +983,7 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
     assert_eq!(code, ExitCode::Success, "stderr: {err}");
     let cal_online: CalibrationState = serde_json::from_str(&cal_out).unwrap();
     assert_eq!(cal_online.day1_seed_sleep_hr, Some(55.0));
-    assert_eq!(cal_online.valid_sessions, 1);
+    assert_eq!(cal_online.valid_sessions, 2);
 
     // 5) Shutdown daemon and verify offline CLI parity & dual-fidelity `replay --session`!
     daemon.shutdown().await;
@@ -1115,6 +1121,8 @@ async fn cli_accept_shift_and_dismiss_shift_end_to_end() {
         clock,
         wearable_source: None,
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();
@@ -1222,6 +1230,8 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
         clock,
         wearable_source: Some(Arc::new(wearable_source)),
         install_signals: false,
+        action_executor: None,
+        notifier: None,
     })
     .await
     .unwrap();
