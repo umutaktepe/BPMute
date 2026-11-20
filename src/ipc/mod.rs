@@ -6,7 +6,7 @@ pub mod server;
 
 pub use client::{IpcClient, IpcClientError};
 pub use protocol::{
-    DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthReply, EnrolledWearableStatus,
-    EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent, OfflineStatus,
-    PairingPrompt, PauseMode,
+    DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
+    EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
+    OfflineStatus, PairingPrompt, PauseMode, alert_ids,
 };

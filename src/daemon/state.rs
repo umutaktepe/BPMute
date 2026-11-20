@@ -9,7 +9,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::actions::grace::{GraceControlCmd, GraceCoordinator, GraceRunOutcome, GraceRunParams};
 use crate::actions::pipeline::{PipelineContext, SleepActionPipeline};
-use crate::actions::traits::{ActionExecutor, Notifier};
+use crate::actions::traits::{ActionExecutor, BoxFuture, Notifier, PowerActionResult};
+use crate::bluetooth::agent::{AgentAuthRequest, ENROLLMENT_AGENT_PATH, EnrollmentAgent};
+use crate::bluetooth::dbus::AgentManager1Proxy;
 use crate::calibration::CalibrationState;
 use crate::config::{
     CliOverrides, ClockTime, ConfigPatch, DetectionConfig, LoadedConfig, PowerAction,
@@ -21,15 +23,16 @@ use crate::idle::{
 use crate::ipc::protocol::{
     AlertSeverity, CalibrationSetBoundaryParams, CalibrationUpdatedEvent, ConfigSnapshotPayload,
     DaemonAlert, DaemonStatus, DataBackupSqliteParams, DataExportBundleParams, DataHardWipeParams,
-    DataImportBundleParams, DiscoveredWearable, EnrollAuthReply, EnrollAuthResponseParams,
-    EnrollSelectParams, EnrollStartParams, EnrolledWearableStatus, EnrollmentUpdateEvent,
-    EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION,
-    PairingPrompt, PauseMode, PauseParams, PushEventEnvelope, SessionClosedEvent,
-    SessionDeleteParams, SessionExportTraceParams, SessionGetParams, SessionListParams,
-    SetDryRunParams, SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableRenameParams,
-    WearableUnenrollParams, error_codes,
+    DataImportBundleParams, DiscoveredWearable, EnrollAuthResponseParams, EnrollSelectParams,
+    EnrollStartParams, EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent,
+    ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PairingPrompt, PauseMode,
+    PauseParams, PushEventEnvelope, SessionClosedEvent, SessionDeleteParams,
+    SessionExportTraceParams, SessionGetParams, SessionListParams, SetDryRunParams,
+    SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableRenameParams,
+    WearableUnenrollParams, alert_ids, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
+use crate::logging::mask_mac;
 use crate::paths::{EnvSource, ResolvedPaths};
 use crate::sleep_engine::{DetectorState, GraceOutcome, GraceResult, StreamStatus};
 use crate::storage::ImportMode;
@@ -38,11 +41,105 @@ use crate::storage::{SessionFullDetail, SetFeedbackRequest, StorageError, Wearab
 
 use super::clock::DaemonClock;
 
-const CONFIG_RELOAD_ALERT_ID: &str = "config_reload_failed";
-const PERSISTENT_SHIFT_ALERT_ID: &str = "calibration_persistent_shift";
-const DEGRADED_IDLE_ALERT_ID: &str = "idle_backend_degraded";
-const INHIBITOR_SENSITIVE_ALERT_ID: &str = "idle_backend_inhibitor_sensitive";
 const MAX_HR_RING_BUFFER_LEN: usize = 1_800; // 30 min at 1 Hz
+
+/// Narrow async boundary for BLE bonding and interactive `Agent1` pairing during enrollment.
+pub trait EnrollmentPairingHook: Send + Sync {
+    /// Sets device trust and optionally executes BLE SMP pairing bridged through `DaemonCore`.
+    fn bond_and_pair<'a>(
+        &'a self,
+        core: &'a Arc<DaemonCore>,
+        mac: &'a str,
+        pair: bool,
+    ) -> BoxFuture<'a, Result<(), String>>;
+}
+
+/// No-op [`EnrollmentPairingHook`] used in hermetic tests that do not inject a pairing harness.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopEnrollmentDriver;
+
+impl EnrollmentPairingHook for NoopEnrollmentDriver {
+    fn bond_and_pair<'a>(
+        &'a self,
+        _core: &'a Arc<DaemonCore>,
+        _mac: &'a str,
+        _pair: bool,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Production BlueZ [`EnrollmentPairingHook`] registering a temporary enrollment-scoped `Agent1`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BluezEnrollmentDriver;
+
+impl EnrollmentPairingHook for BluezEnrollmentDriver {
+    fn bond_and_pair<'a>(
+        &'a self,
+        core: &'a Arc<DaemonCore>,
+        mac: &'a str,
+        pair: bool,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let Some(conn) = try_system_conn().await else {
+                return Ok(());
+            };
+            let _ = crate::bluetooth::operations::stop_le_discovery(&conn, "/org/bluez/hci0").await;
+
+            if !pair {
+                let _ =
+                    crate::bluetooth::operations::bond_and_trust_device(&conn, mac, false).await;
+                return Ok(());
+            }
+
+            let (auth_tx, mut auth_rx) = mpsc::channel::<AgentAuthRequest>(8);
+            let agent = EnrollmentAgent::new(auth_tx);
+            let agent_path = zbus::zvariant::ObjectPath::try_from(ENROLLMENT_AGENT_PATH)
+                .map_err(|e| format!("invalid agent path: {e}"))?;
+
+            let registered_obj = conn
+                .object_server()
+                .at(agent_path.clone(), agent)
+                .await
+                .is_ok();
+            let agent_mgr = AgentManager1Proxy::new(&conn).await.ok();
+            let mut registered_mgr = false;
+            if let Some(ref mgr) = agent_mgr
+                && mgr
+                    .register_agent(agent_path.as_ref(), "KeyboardDisplay")
+                    .await
+                    .is_ok()
+            {
+                registered_mgr = true;
+            }
+
+            let core_bridge = Arc::clone(core);
+            let bridge_task = tokio::spawn(async move {
+                while let Some(req) = auth_rx.recv().await {
+                    core_bridge.bridge_agent_auth_request(req).await;
+                }
+            });
+
+            let res = crate::bluetooth::operations::bond_and_trust_device(&conn, mac, true)
+                .await
+                .map_err(|e| format!("Bluetooth pairing failed: {e}"));
+
+            bridge_task.abort();
+            let _ = bridge_task.await;
+            if registered_mgr && let Some(ref mgr) = agent_mgr {
+                let _ = mgr.unregister_agent(agent_path.as_ref()).await;
+            }
+            if registered_obj {
+                let _ = conn
+                    .object_server()
+                    .remove::<EnrollmentAgent, _>(agent_path)
+                    .await;
+            }
+
+            res
+        })
+    }
+}
 
 fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
@@ -71,6 +168,7 @@ pub struct DaemonCore {
     pub action_executor: Arc<dyn ActionExecutor>,
     pub notifier: Arc<dyn Notifier>,
     pub idle_probe: Arc<dyn IdleProbe>,
+    pub enrollment_driver: Arc<dyn EnrollmentPairingHook>,
     pub pipeline: Arc<SleepActionPipeline>,
     pub coordinator: Arc<GraceCoordinator>,
     pub engine_ctrl_tx: mpsc::Sender<super::EngineControlEvent>,
@@ -102,7 +200,9 @@ struct InnerState {
     discovered_wearables: Vec<DiscoveredWearable>,
     wearable_statuses: HashMap<String, StreamStatus>,
     wearable_batteries: HashMap<String, u8>,
-    active_auth_reply: Option<tokio::sync::oneshot::Sender<EnrollAuthReply>>,
+    wearable_body_locations: HashMap<String, String>,
+    playing_players_count: Option<usize>,
+    active_auth_reply: Option<tokio::sync::oneshot::Sender<EnrollAuthResponseParams>>,
 }
 
 struct EnrollmentLock {
@@ -125,6 +225,7 @@ pub struct DaemonCoreInit {
     pub action_executor: Arc<dyn ActionExecutor>,
     pub notifier: Arc<dyn Notifier>,
     pub idle_probe: Arc<dyn IdleProbe>,
+    pub enrollment_driver: Arc<dyn EnrollmentPairingHook>,
     pub engine_ctrl_tx: mpsc::Sender<super::EngineControlEvent>,
 }
 
@@ -144,6 +245,7 @@ impl DaemonCore {
             action_executor,
             notifier,
             idle_probe,
+            enrollment_driver,
             engine_ctrl_tx,
         } = init;
         let dry_run = loaded_config.config.actions.dry_run;
@@ -184,6 +286,7 @@ impl DaemonCore {
             action_executor,
             notifier,
             idle_probe,
+            enrollment_driver,
             pipeline,
             coordinator,
             engine_ctrl_tx,
@@ -212,6 +315,8 @@ impl DaemonCore {
                 discovered_wearables: Vec::new(),
                 wearable_statuses: HashMap::new(),
                 wearable_batteries: HashMap::new(),
+                wearable_body_locations: HashMap::new(),
+                playing_players_count: None,
                 active_auth_reply: None,
             }),
         }
@@ -284,7 +389,54 @@ impl DaemonCore {
             log_biometrics: guard.loaded_config.log_biometrics,
             alerts: guard.alerts.clone(),
             idle_backend: Some(self.idle_probe.backend_kind().display_name().to_string()),
+            playing_players_count: guard.playing_players_count,
         }
+    }
+
+    /// Probes active non-ignored MPRIS2 players side-effect-freely and stores the latest count.
+    pub async fn refresh_playing_players_count(&self) {
+        let ignore_players = {
+            let guard = self.inner.lock().expect("daemon state mutex poisoned");
+            guard.loaded_config.config.actions.ignore_players.clone()
+        };
+        let count = self
+            .action_executor
+            .count_playing_players(&ignore_players)
+            .await
+            .ok();
+        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+        guard.playing_players_count = count;
+    }
+
+    /// Updates the live stream status for a wearable keyed by normalized MAC address.
+    pub fn set_wearable_status(&self, mac: &str, status: StreamStatus) {
+        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+        guard
+            .wearable_statuses
+            .insert(mac.trim().to_ascii_uppercase(), status);
+    }
+
+    /// Updates cached battery and body sensor location metadata for a wearable.
+    pub fn set_wearable_metadata(
+        &self,
+        mac: &str,
+        battery: Option<u8>,
+        body_location: Option<String>,
+    ) {
+        let norm = mac.trim().to_ascii_uppercase();
+        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+        if let Some(pct) = battery {
+            guard.wearable_batteries.insert(norm.clone(), pct);
+        }
+        if let Some(loc) = body_location {
+            guard.wearable_body_locations.insert(norm, loc);
+        }
+    }
+
+    /// Populates discovered BlueZ wearables returned by `wearable.enroll_start` in integration tests.
+    pub fn seed_discovered_wearables(&self, wearables: Vec<DiscoveredWearable>) {
+        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+        guard.discovered_wearables = wearables;
     }
 
     fn build_config_snapshot_locked(&self, guard: &InnerState) -> ConfigSnapshotPayload {
@@ -643,6 +795,15 @@ impl DaemonCore {
                             .execute(&ctx, &eff_actions)
                             .await
                             .unwrap_or_default();
+                        match res.power_action_result {
+                            Some(PowerActionResult::RefusedInhibited(ref reason)) => {
+                                core.set_logind_inhibited_alert(Some(reason));
+                            }
+                            Some(PowerActionResult::Executed) => {
+                                core.set_logind_inhibited_alert(None);
+                            }
+                            _ => {}
+                        }
                         *core.sleep_triggered_at.lock().unwrap() = Some(gr.ts_ms);
                         *core.trigger_power_action.lock().unwrap() = eff_actions.power_action;
 
@@ -782,7 +943,10 @@ impl DaemonCore {
     ) -> Result<Value, ErrorPayload> {
         match op {
             "daemon.ping" => Ok(json!({ "pong": true, "v": PROTOCOL_VERSION })),
-            "daemon.status" => serialize_json(self.status()),
+            "daemon.status" => {
+                self.refresh_playing_players_count().await;
+                serialize_json(self.status())
+            }
             "monitor.pause" => {
                 let parsed: PauseParams = serde_json::from_value(params).map_err(|e| {
                     ipc_err(
@@ -1119,16 +1283,19 @@ impl DaemonCore {
                 let statuses: Vec<EnrolledWearableStatus> = enrolled
                     .into_iter()
                     .map(|w| {
+                        let norm = w.mac.to_ascii_uppercase();
                         let status = guard
                             .wearable_statuses
-                            .get(&w.mac)
+                            .get(&norm)
                             .copied()
                             .unwrap_or(StreamStatus::Disconnected);
-                        let battery = guard.wearable_batteries.get(&w.mac).copied();
+                        let battery = guard.wearable_batteries.get(&norm).copied();
+                        let body_location = guard.wearable_body_locations.get(&norm).cloned();
                         EnrolledWearableStatus {
                             wearable: w,
                             status,
                             battery,
+                            body_location,
                         }
                     })
                     .collect();
@@ -1189,9 +1356,11 @@ impl DaemonCore {
                     .await
                     .map_err(storage_to_ipc_err)?;
                 {
+                    let norm = unenrolled.mac.to_ascii_uppercase();
                     let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-                    guard.wearable_statuses.remove(&unenrolled.mac);
-                    guard.wearable_batteries.remove(&unenrolled.mac);
+                    guard.wearable_statuses.remove(&norm);
+                    guard.wearable_batteries.remove(&norm);
+                    guard.wearable_body_locations.remove(&norm);
                 }
                 if parsed.forget_bluez
                     && let Some(conn) = try_system_conn().await
@@ -1256,11 +1425,9 @@ impl DaemonCore {
                 let now_ms = self.clock.now_utc().timestamp_millis();
                 let norm_mac = parsed.address.trim().to_ascii_uppercase();
                 let (discovered, is_rpa, address_type, advertised_name) = {
-                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    let guard = self.inner.lock().expect("daemon state mutex poisoned");
                     match guard.enrollment {
-                        Some(ref lock) if lock.client_id == client_id => {
-                            guard.enrollment = None;
-                        }
+                        Some(ref lock) if lock.client_id == client_id => {}
                         Some(_) => {
                             return Err(ipc_err(
                                 error_codes::PRECONDITION_FAILED,
@@ -1300,6 +1467,22 @@ impl DaemonCore {
                     (discovered, is_rpa, address_type, advertised_name)
                 };
 
+                let pair_result = Arc::clone(&self.enrollment_driver)
+                    .bond_and_pair(self, &norm_mac, is_rpa)
+                    .await;
+
+                {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    if matches!(guard.enrollment, Some(ref lock) if lock.client_id == client_id) {
+                        guard.enrollment = None;
+                    }
+                    guard.active_auth_reply = None;
+                }
+
+                if let Err(err) = pair_result {
+                    return Err(ipc_err(error_codes::BACKEND_REFUSED, err));
+                }
+
                 let mut warnings = Vec::new();
                 let mut hints = Vec::new();
                 if is_rpa {
@@ -1312,7 +1495,7 @@ impl DaemonCore {
                 }
 
                 let desc = WearableDescriptor {
-                    mac: norm_mac.clone(),
+                    mac: norm_mac,
                     address_type,
                     alias: parsed.alias,
                     advertised_name,
@@ -1336,16 +1519,6 @@ impl DaemonCore {
                     )
                 })?;
 
-                if let Some(conn) = try_system_conn().await {
-                    let _ =
-                        crate::bluetooth::operations::stop_le_discovery(&conn, "/org/bluez/hci0")
-                            .await;
-                    let _ = crate::bluetooth::operations::bond_and_trust_device(
-                        &conn, &norm_mac, is_rpa,
-                    )
-                    .await;
-                }
-
                 Ok(json!({
                     "wearable": enrolled,
                     "warnings": warnings,
@@ -1360,7 +1533,7 @@ impl DaemonCore {
                 let (changed, alerts) = {
                     let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                     let before = guard.alerts.len();
-                    guard.alerts.retain(|a| a.id != id);
+                    guard.alerts.retain(|a| a.id != id || !a.dismissible);
                     (guard.alerts.len() != before, guard.alerts.clone())
                 };
                 if changed {
@@ -1394,7 +1567,7 @@ impl DaemonCore {
                     guard.active_auth_reply.take()
                 };
                 if let Some(tx) = reply_tx {
-                    let _ = tx.send(parsed.into());
+                    let _ = tx.send(parsed);
                 }
                 Ok(json!({ "ok": true }))
             }
@@ -1419,19 +1592,19 @@ impl DaemonCore {
         }
     }
 
-    /// Triggers an interactive Agent1 pairing prompt pushed over IPC for testing or BlueZ bridging.
+    /// Triggers an interactive Agent1 pairing prompt pushed over IPC for BlueZ/test bridging.
     pub fn trigger_pairing_prompt(
         &self,
         prompt: PairingPrompt,
-    ) -> tokio::sync::oneshot::Receiver<EnrollAuthReply> {
+    ) -> tokio::sync::oneshot::Receiver<EnrollAuthResponseParams> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let devices = {
+        let wearables = {
             let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
             guard.active_auth_reply = Some(tx);
             guard.discovered_wearables.clone()
         };
         let event = EnrollmentUpdateEvent {
-            devices,
+            wearables,
             pairing_prompt: Some(prompt),
             remaining_sec: Some(30),
         };
@@ -1439,6 +1612,93 @@ impl DaemonCore {
             self.broker.publish_control("EnrollmentUpdate", v);
         }
         rx
+    }
+
+    /// Bridges an incoming `AgentAuthRequest` to the enrolling client over IPC and forwards its response.
+    pub async fn bridge_agent_auth_request(&self, req: AgentAuthRequest) {
+        match req {
+            AgentAuthRequest::Confirmation {
+                device,
+                passkey,
+                reply,
+            } => {
+                let wearable = self.resolve_wearable_label(&device);
+                let rx =
+                    self.trigger_pairing_prompt(PairingPrompt::Confirmation { passkey, wearable });
+                let confirmed = rx.await.ok().and_then(|r| r.confirmed).unwrap_or(false);
+                let _ = reply.send(confirmed);
+            }
+            AgentAuthRequest::Passkey { device, reply } => {
+                let wearable = self.resolve_wearable_label(&device);
+                let rx = self.trigger_pairing_prompt(PairingPrompt::Passkey { wearable });
+                let passkey = match rx.await {
+                    Ok(r) if r.confirmed != Some(false) => r.passkey,
+                    _ => None,
+                };
+                let _ = reply.send(passkey);
+            }
+            AgentAuthRequest::PinCode { device, reply } => {
+                let wearable = self.resolve_wearable_label(&device);
+                let rx = self.trigger_pairing_prompt(PairingPrompt::PinCode { wearable });
+                let pincode = match rx.await {
+                    Ok(r) if r.confirmed != Some(false) => r.pincode.filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                let _ = reply.send(pincode);
+            }
+            AgentAuthRequest::Authorization { reply, .. } => {
+                let _ = reply.send(true);
+            }
+        }
+    }
+
+    /// Upserts or clears the dismissible `logind` inhibitor refusal alert and broadcasts `AlertChanged`.
+    pub fn set_logind_inhibited_alert(&self, reason: Option<&str>) {
+        let alerts_opt = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            let changed = match reason {
+                Some(r) => upsert_alert(
+                    &mut guard.alerts,
+                    DaemonAlert {
+                        id: alert_ids::LOGIND_INHIBITED.to_string(),
+                        kind: alert_ids::LOGIND_INHIBITED.to_string(),
+                        severity: AlertSeverity::Warn,
+                        message: format!(
+                            "Sleep action blocked by logind inhibitor ({r}); media remains paused."
+                        ),
+                        dismissible: true,
+                    },
+                ),
+                None => {
+                    let before = guard.alerts.len();
+                    guard.alerts.retain(|a| a.id != alert_ids::LOGIND_INHIBITED);
+                    guard.alerts.len() != before
+                }
+            };
+            changed.then(|| guard.alerts.clone())
+        };
+        if let Some(alerts) = alerts_opt {
+            self.broker
+                .publish_control("AlertChanged", json!({ "alerts": alerts }));
+        }
+    }
+
+    fn resolve_wearable_label(&self, path_or_mac: &str) -> String {
+        let mac = if let Some(pos) = path_or_mac.rfind("/dev_") {
+            path_or_mac[pos + 5..].replace('_', ":")
+        } else {
+            path_or_mac.to_string()
+        };
+        let guard = self.inner.lock().expect("daemon state mutex poisoned");
+        if let Some(found) = guard
+            .discovered_wearables
+            .iter()
+            .find(|w| w.address.eq_ignore_ascii_case(&mac))
+            && let Some(ref name) = found.name
+        {
+            return name.clone();
+        }
+        mask_mac(&mac)
     }
 
     /// Records a live `HrSampleEvent` into the 30-minute ring buffer and pushes `HrSample`.
@@ -1784,7 +2044,7 @@ fn is_armed_locked(guard: &InnerState, clock: &dyn DaemonClock) -> bool {
 
 fn clear_reload_alert(alerts: &mut Vec<DaemonAlert>) -> bool {
     let before = alerts.len();
-    alerts.retain(|a| a.id != CONFIG_RELOAD_ALERT_ID);
+    alerts.retain(|a| a.id != alert_ids::CONFIG_RELOAD_FAILED);
     alerts.len() != before
 }
 
@@ -1793,8 +2053,8 @@ fn upsert_reload_alert(alerts: &mut Vec<DaemonAlert>, err_msg: &str) -> bool {
     upsert_alert(
         alerts,
         DaemonAlert {
-            id: CONFIG_RELOAD_ALERT_ID.to_string(),
-            kind: CONFIG_RELOAD_ALERT_ID.to_string(),
+            id: alert_ids::CONFIG_RELOAD_FAILED.to_string(),
+            kind: alert_ids::CONFIG_RELOAD_FAILED.to_string(),
             severity: AlertSeverity::Error,
             message,
             dismissible: true,
@@ -1811,8 +2071,8 @@ fn sync_shift_alert_locked(alerts: &mut Vec<DaemonAlert>, state: &CalibrationSta
         upsert_alert(
             alerts,
             DaemonAlert {
-                id: PERSISTENT_SHIFT_ALERT_ID.to_string(),
-                kind: PERSISTENT_SHIFT_ALERT_ID.to_string(),
+                id: alert_ids::PERSISTENT_SHIFT.to_string(),
+                kind: alert_ids::PERSISTENT_SHIFT.to_string(),
                 severity: AlertSeverity::Warn,
                 message,
                 dismissible: true,
@@ -1820,7 +2080,7 @@ fn sync_shift_alert_locked(alerts: &mut Vec<DaemonAlert>, state: &CalibrationSta
         )
     } else {
         let before = alerts.len();
-        alerts.retain(|a| a.id != PERSISTENT_SHIFT_ALERT_ID);
+        alerts.retain(|a| a.id != alert_ids::PERSISTENT_SHIFT);
         alerts.len() != before
     }
 }
@@ -1838,8 +2098,8 @@ fn sync_idle_alerts_locked(
         changed |= upsert_alert(
             alerts,
             DaemonAlert {
-                id: DEGRADED_IDLE_ALERT_ID.to_string(),
-                kind: DEGRADED_IDLE_ALERT_ID.to_string(),
+                id: alert_ids::DEGRADED_IDLE.to_string(),
+                kind: alert_ids::DEGRADED_IDLE.to_string(),
                 severity: AlertSeverity::Warn,
                 message: "No desktop idle backend available. Destructive power actions run in degraded mode with a 90s Grace Period safety floor.".to_string(),
                 dismissible: false,
@@ -1847,7 +2107,7 @@ fn sync_idle_alerts_locked(
         );
     } else {
         let before = alerts.len();
-        alerts.retain(|a| a.id != DEGRADED_IDLE_ALERT_ID);
+        alerts.retain(|a| a.id != alert_ids::DEGRADED_IDLE);
         changed |= alerts.len() != before;
     }
 
@@ -1855,8 +2115,8 @@ fn sync_idle_alerts_locked(
         changed |= upsert_alert(
             alerts,
             DaemonAlert {
-                id: INHIBITOR_SENSITIVE_ALERT_ID.to_string(),
-                kind: INHIBITOR_SENSITIVE_ALERT_ID.to_string(),
+                id: alert_ids::INHIBITOR_SENSITIVE.to_string(),
+                kind: alert_ids::INHIBITOR_SENSITIVE.to_string(),
                 severity: AlertSeverity::Info,
                 message: "Idle detection using Wayland ext-idle-notify-v1 v1 (inhibitor-sensitive: media playback idle inhibitors may suppress idle detection).".to_string(),
                 dismissible: false,
@@ -1864,7 +2124,7 @@ fn sync_idle_alerts_locked(
         );
     } else {
         let before = alerts.len();
-        alerts.retain(|a| a.id != INHIBITOR_SENSITIVE_ALERT_ID);
+        alerts.retain(|a| a.id != alert_ids::INHIBITOR_SENSITIVE);
         changed |= alerts.len() != before;
     }
 

@@ -4,8 +4,11 @@ use crate::calibration::CalibrationState;
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
-    PairingPrompt, PauseParams,
+    PauseParams,
 };
+
+/// Tick cadence of the interactive TUI event loop in milliseconds.
+pub const TUI_TICK_MS: u32 = 250;
 
 /// Events routed into the TUI event loop.
 #[derive(Debug, Clone)]
@@ -42,7 +45,6 @@ pub enum IpcEvent {
     WearablesUpdated(Vec<EnrolledWearableStatus>),
     EnrollmentDiscovered(Vec<DiscoveredWearable>),
     EnrollmentUpdate(EnrollmentUpdateEvent),
-    PairingPrompt(PairingPrompt),
     OpCompleted {
         op: String,
         success: bool,
@@ -81,5 +83,5 @@ pub enum TuiCommand {
     DismissAlert {
         id: String,
     },
-    RefreshWearables,
+    RefreshStatus,
 }

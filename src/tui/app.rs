@@ -1,12 +1,12 @@
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Clear, Paragraph, Widget};
 
-use super::event::{IpcEvent, TuiCommand, TuiEvent};
+use super::event::{IpcEvent, TUI_TICK_MS, TuiCommand, TuiEvent};
 use super::sparkline::HrSparklineData;
 use super::theme::Theme;
+use super::views::centered_rect;
 use super::views::dashboard::render_dashboard;
 use super::views::footer::render_footer;
 use super::views::header::{render_global_banner, render_header};
@@ -14,9 +14,10 @@ use super::views::help::render_help;
 use super::views::history::render_history;
 use super::views::settings::render_settings;
 use super::views::wearables::render_wearables;
+use crate::config::PowerAction;
 use crate::ipc::protocol::{
-    DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
-    EnrolledWearableStatus, MonitoringState, PairingPrompt, PauseMode, PauseParams,
+    DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, MonitoringState,
+    PairingPrompt, alert_ids,
 };
 use crate::sleep_engine::{CalibrationMaturity, Epoch, StreamStatus};
 
@@ -59,9 +60,15 @@ pub struct GraceState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingPromptModalState {
-    Confirmation { passkey: u32, device: String },
-    Passkey { device: String, input: String },
-    PinCode { device: String, input: String },
+    Confirmation { passkey: u32, wearable: String },
+    Passkey { wearable: String, input: String },
+    PinCode { wearable: String, input: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnenrollButton {
+    Confirm,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,10 +79,12 @@ pub enum ModalState {
         selected_idx: usize,
     },
     EnrollmentModal {
-        scanning_timer_sec: u32,
-        selected_device_idx: usize,
+        scanning_remaining_ms: u32,
+        selected_discovered_idx: usize,
         alias_input: String,
         alias_focused: bool,
+        enrolling: bool,
+        error_message: Option<String>,
         pairing_prompt: Option<PairingPromptModalState>,
     },
     RenameModal {
@@ -87,7 +96,7 @@ pub enum ModalState {
         wearable: EnrolledWearableStatus,
         forget_bluez: bool,
         delete_sessions: bool,
-        selected_button: usize, // 0 = Confirm, 1 = Cancel
+        selected_button: UnenrollButton,
     },
 }
 
@@ -98,6 +107,7 @@ pub struct TuiApp {
     pub modal: ModalState,
     pub should_quit: bool,
     pub daemon_connected: bool,
+    pub last_viewport_width: u16,
 
     // Live daemon status
     pub daemon_status: Option<DaemonStatus>,
@@ -105,9 +115,9 @@ pub struct TuiApp {
     pub armed: bool,
     pub dry_run: bool,
     pub idle_backend: Option<String>,
-    pub playing_players_count: usize,
+    pub playing_players_count: Option<usize>,
 
-    // biometrics & sparkline
+    // Biometrics & sparkline
     pub sparkline_data: HrSparklineData,
     pub latest_bpm: Option<f64>,
     pub contact_ok: bool,
@@ -115,37 +125,42 @@ pub struct TuiApp {
     pub latest_epoch: Option<Epoch>,
     pub calibration_maturity: CalibrationMaturity,
 
-    // alerts & grace
+    // Alerts & Grace Period
     pub alerts: Vec<DaemonAlert>,
     pub grace_state: Option<GraceState>,
 
-    // diagnostics
+    // Diagnostics
     pub is_diagnostics_open: bool,
 
-    // wearables
+    // Wearables
     pub enrolled_wearables: Vec<EnrolledWearableStatus>,
     pub selected_wearable_idx: usize,
     pub discovered_wearables: Vec<DiscoveredWearable>,
 
-    // systemd service setup check
+    // systemd --user service detection
     pub systemd_service_installed: bool,
 }
 
 impl TuiApp {
     pub fn new(no_mouse: bool, ascii: bool, no_color: bool) -> Self {
+        Self::new_with_theme(no_mouse, Theme::new(no_color, ascii), false)
+    }
+
+    pub fn new_with_theme(no_mouse: bool, theme: Theme, systemd_service_installed: bool) -> Self {
         Self {
-            theme: Theme::new(no_color, ascii),
+            theme,
             no_mouse,
             active_tab: Tab::Dashboard,
             modal: ModalState::None,
             should_quit: false,
             daemon_connected: false,
+            last_viewport_width: 80,
             daemon_status: None,
             monitoring_state: MonitoringState::Idle,
             armed: true,
             dry_run: false,
             idle_backend: None,
-            playing_players_count: 0,
+            playing_players_count: None,
             sparkline_data: HrSparklineData::new(),
             latest_bpm: None,
             contact_ok: true,
@@ -158,7 +173,7 @@ impl TuiApp {
             enrolled_wearables: Vec::new(),
             selected_wearable_idx: 0,
             discovered_wearables: Vec::new(),
-            systemd_service_installed: false,
+            systemd_service_installed,
         }
     }
 
@@ -166,13 +181,11 @@ impl TuiApp {
         match self.modal {
             ModalState::RenameModal { .. } => true,
             ModalState::EnrollmentModal {
+                enrolling: false,
                 alias_focused: true,
-                ref pairing_prompt,
+                pairing_prompt: None,
                 ..
-            } => !matches!(
-                pairing_prompt,
-                Some(PairingPromptModalState::Confirmation { .. })
-            ),
+            } => true,
             ModalState::EnrollmentModal {
                 ref pairing_prompt, ..
             } => matches!(
@@ -196,7 +209,22 @@ impl TuiApp {
     }
 
     pub fn has_persistent_shift_alert(&self) -> bool {
-        self.alerts.iter().any(|a| a.id == "persistent_shift")
+        self.alerts
+            .iter()
+            .any(|a| a.id == alert_ids::PERSISTENT_SHIFT)
+    }
+
+    pub fn open_enrollment_modal(&mut self) -> TuiCommand {
+        self.modal = ModalState::EnrollmentModal {
+            scanning_remaining_ms: 30_000,
+            selected_discovered_idx: 0,
+            alias_input: String::new(),
+            alias_focused: false,
+            enrolling: false,
+            error_message: None,
+            pairing_prompt: None,
+        };
+        TuiCommand::EnrollStart(Some(30))
     }
 
     pub fn handle_event(&mut self, event: TuiEvent) -> Option<TuiCommand> {
@@ -211,49 +239,76 @@ impl TuiApp {
             }
             TuiEvent::Tick => self.tick(),
             TuiEvent::Ipc(ipc) => self.handle_ipc(*ipc),
-            TuiEvent::Resize(_, _) => None,
+            TuiEvent::Resize(width, _) => {
+                self.last_viewport_width = width;
+                None
+            }
         }
     }
 
     pub fn tick(&mut self) -> Option<TuiCommand> {
-        // Decrement scanning timer if enrollment modal active
         if let ModalState::EnrollmentModal {
-            ref mut scanning_timer_sec,
+            ref mut scanning_remaining_ms,
+            enrolling: false,
             ..
         } = self.modal
         {
-            *scanning_timer_sec = scanning_timer_sec.saturating_sub(1);
+            *scanning_remaining_ms = scanning_remaining_ms.saturating_sub(TUI_TICK_MS);
         }
         None
+    }
+
+    fn apply_daemon_status(&mut self, status: DaemonStatus) {
+        self.daemon_connected = true;
+        self.monitoring_state = status.monitoring_state;
+        self.armed = status.armed;
+        self.dry_run = status.dry_run;
+        self.idle_backend = status.idle_backend.clone();
+        self.playing_players_count = status.playing_players_count;
+        self.alerts = status.alerts.clone();
+        if status.monitoring_state != MonitoringState::Confirmed
+            && self
+                .grace_state
+                .as_ref()
+                .is_none_or(|g| g.session_id != "test-trigger-session")
+        {
+            self.grace_state = None;
+        }
+        self.daemon_status = Some(status);
+    }
+
+    fn handle_disconnected(&mut self) {
+        self.daemon_connected = false;
+        self.daemon_status = None;
+        self.monitoring_state = MonitoringState::Idle;
+        self.grace_state = None;
+        self.latest_bpm = None;
+        self.latest_p_sleep = None;
+        self.latest_epoch = None;
+        self.contact_ok = false;
+        self.playing_players_count = None;
+        self.alerts.clear();
+        self.discovered_wearables.clear();
+        if self.modal != ModalState::Help {
+            self.modal = ModalState::None;
+        }
     }
 
     pub fn handle_ipc(&mut self, ipc: IpcEvent) -> Option<TuiCommand> {
         match ipc {
             IpcEvent::Connected(status) => {
-                self.daemon_connected = true;
-                self.monitoring_state = status.monitoring_state;
-                self.armed = status.armed;
-                self.dry_run = status.dry_run;
-                self.idle_backend = status.idle_backend.clone();
-                self.alerts = status.alerts.clone();
-                self.daemon_status = Some(status);
+                self.apply_daemon_status(status);
             }
             IpcEvent::Disconnected => {
-                self.daemon_connected = false;
-                self.monitoring_state = MonitoringState::Idle;
+                self.handle_disconnected();
             }
             IpcEvent::Snapshot {
                 status,
                 hr_ring_buffer,
                 alerts,
             } => {
-                self.daemon_connected = true;
-                self.monitoring_state = status.monitoring_state;
-                self.armed = status.armed;
-                self.dry_run = status.dry_run;
-                self.idle_backend = status.idle_backend.clone();
+                self.apply_daemon_status(status);
                 self.alerts = alerts;
-                self.daemon_status = Some(status);
                 self.sparkline_data.set_samples(hr_ring_buffer);
                 self.latest_bpm = self.sparkline_data.latest_bpm();
             }
@@ -264,49 +319,48 @@ impl TuiApp {
                 self.sparkline_data.push_sample(sample);
             }
             IpcEvent::GraceTick(tick) => {
-                let mut planned = Vec::new();
-                match tick.power_action {
-                    crate::config::PowerAction::Suspend => {
-                        planned.push("Pause Media".into());
-                        planned.push("Suspend".into());
-                    }
-                    crate::config::PowerAction::Poweroff => {
-                        planned.push("Pause Media".into());
-                        planned.push("Power Off".into());
-                    }
-                    _ => {
-                        planned.push("Pause Media".into());
-                    }
+                if tick.remaining_sec == 0 {
+                    self.grace_state = None;
+                } else {
+                    let planned = if !tick.planned_steps.is_empty() {
+                        tick.planned_steps
+                    } else {
+                        match tick.power_action {
+                            PowerAction::Suspend => vec!["Pause Media".into(), "Suspend".into()],
+                            PowerAction::Poweroff => {
+                                vec!["Pause Media".into(), "Power Off".into()]
+                            }
+                            PowerAction::None => vec!["Pause Media".into()],
+                        }
+                    };
+                    self.grace_state = Some(GraceState {
+                        session_id: tick.session_id,
+                        remaining_sec: tick.remaining_sec,
+                        total_sec: tick.total_sec,
+                        planned_actions: planned,
+                        dry_run: tick.dry_run,
+                    });
                 }
-                self.grace_state = Some(GraceState {
-                    session_id: tick.session_id,
-                    remaining_sec: tick.remaining_sec,
-                    total_sec: tick.total_sec,
-                    planned_actions: planned,
-                    dry_run: tick.dry_run,
-                });
             }
             IpcEvent::EpochUpdate(epoch_ev) => {
-                self.latest_epoch = Some(epoch_ev.epoch.clone());
                 self.latest_p_sleep = Some(epoch_ev.epoch.p_sleep);
+                if epoch_ev.epoch.baseline_mu_hr.is_finite() && epoch_ev.epoch.baseline_mu_hr > 0.0
+                {
+                    self.sparkline_data.quiet_wake_baseline = Some(epoch_ev.epoch.baseline_mu_hr);
+                }
+                self.latest_epoch = Some(epoch_ev.epoch);
             }
             IpcEvent::StateChanged(status) => {
-                self.monitoring_state = status.monitoring_state;
-                self.armed = status.armed;
-                self.dry_run = status.dry_run;
-                self.alerts = status.alerts.clone();
-                self.idle_backend = status.idle_backend.clone();
-                if status.monitoring_state != MonitoringState::Confirmed {
-                    self.grace_state = None;
-                }
-                self.daemon_status = Some(status);
+                self.apply_daemon_status(status);
             }
             IpcEvent::AlertChanged(alerts) => {
                 self.alerts = alerts;
             }
             IpcEvent::CalibrationUpdated(cal) => {
                 self.calibration_maturity = cal.maturity;
-                self.sparkline_data.quiet_wake_baseline = cal.mu_wake;
+                if let Some(mu_wake) = cal.mu_wake {
+                    self.sparkline_data.quiet_wake_baseline = Some(mu_wake);
+                }
                 self.sparkline_data.sleeping_hr = cal.mu_sleep;
             }
             IpcEvent::WearablesUpdated(wearables) => {
@@ -317,591 +371,92 @@ impl TuiApp {
             }
             IpcEvent::EnrollmentDiscovered(discovered) => {
                 self.discovered_wearables = discovered;
+                if let ModalState::EnrollmentModal {
+                    ref mut selected_discovered_idx,
+                    ..
+                } = self.modal
+                    && *selected_discovered_idx >= self.discovered_wearables.len()
+                {
+                    *selected_discovered_idx = self.discovered_wearables.len().saturating_sub(1);
+                }
             }
             IpcEvent::EnrollmentUpdate(update) => {
-                self.discovered_wearables = update.devices;
-                if let Some(prompt) = update.pairing_prompt {
-                    let prompt_modal = match prompt {
-                        PairingPrompt::Confirmation { passkey, device } => {
-                            PairingPromptModalState::Confirmation { passkey, device }
-                        }
-                        PairingPrompt::Passkey { device } => PairingPromptModalState::Passkey {
-                            device,
-                            input: String::new(),
-                        },
-                        PairingPrompt::PinCode { device } => PairingPromptModalState::PinCode {
-                            device,
-                            input: String::new(),
-                        },
-                    };
-                    if let ModalState::EnrollmentModal {
-                        ref mut pairing_prompt,
-                        ..
-                    } = self.modal
-                    {
+                self.discovered_wearables = update.wearables;
+                if let ModalState::EnrollmentModal {
+                    ref mut pairing_prompt,
+                    ref mut scanning_remaining_ms,
+                    ref mut selected_discovered_idx,
+                    ..
+                } = self.modal
+                {
+                    if *selected_discovered_idx >= self.discovered_wearables.len() {
+                        *selected_discovered_idx =
+                            self.discovered_wearables.len().saturating_sub(1);
+                    }
+                    if let Some(rem) = update.remaining_sec {
+                        *scanning_remaining_ms = rem.saturating_mul(1000);
+                    }
+                    if let Some(prompt) = update.pairing_prompt {
+                        let prompt_modal = match prompt {
+                            PairingPrompt::Confirmation { passkey, wearable } => {
+                                PairingPromptModalState::Confirmation { passkey, wearable }
+                            }
+                            PairingPrompt::Passkey { wearable } => {
+                                PairingPromptModalState::Passkey {
+                                    wearable,
+                                    input: String::new(),
+                                }
+                            }
+                            PairingPrompt::PinCode { wearable } => {
+                                PairingPromptModalState::PinCode {
+                                    wearable,
+                                    input: String::new(),
+                                }
+                            }
+                        };
                         *pairing_prompt = Some(prompt_modal);
                     }
                 }
             }
-            IpcEvent::PairingPrompt(prompt) => {
-                let prompt_modal = match prompt {
-                    PairingPrompt::Confirmation { passkey, device } => {
-                        PairingPromptModalState::Confirmation { passkey, device }
-                    }
-                    PairingPrompt::Passkey { device } => PairingPromptModalState::Passkey {
-                        device,
-                        input: String::new(),
-                    },
-                    PairingPrompt::PinCode { device } => PairingPromptModalState::PinCode {
-                        device,
-                        input: String::new(),
-                    },
-                };
-                if let ModalState::EnrollmentModal {
-                    ref mut pairing_prompt,
-                    ..
-                } = self.modal
-                {
-                    *pairing_prompt = Some(prompt_modal);
-                }
-            }
-            IpcEvent::OpCompleted { op, success, .. } => {
+            IpcEvent::OpCompleted {
+                op,
+                success,
+                message,
+            } => {
                 if success && (op == "monitor.cancel_grace" || op == "monitor.snooze_grace") {
                     self.grace_state = None;
+                }
+                if op == "wearable.enroll_select" {
+                    if success {
+                        if matches!(self.modal, ModalState::EnrollmentModal { .. }) {
+                            self.modal = ModalState::None;
+                        }
+                    } else if let ModalState::EnrollmentModal {
+                        ref mut enrolling,
+                        ref mut pairing_prompt,
+                        ref mut error_message,
+                        ..
+                    } = self.modal
+                    {
+                        *enrolling = false;
+                        *pairing_prompt = None;
+                        *error_message =
+                            Some(message.unwrap_or_else(|| "Enrollment failed".to_string()));
+                    }
+                } else if !success
+                    && op == "wearable.enroll_start"
+                    && let ModalState::EnrollmentModal {
+                        ref mut scanning_remaining_ms,
+                        ref mut error_message,
+                        ..
+                    } = self.modal
+                {
+                    *scanning_remaining_ms = 0;
+                    *error_message = message;
                 }
             }
         }
         None
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiCommand> {
-        // 1. If text input is focused, suspend all global hotkeys and handle typing!
-        if self.is_input_focused() {
-            return self.handle_text_input_key(key);
-        }
-
-        // 2. Handle active modals
-        match self.modal {
-            ModalState::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-                ) {
-                    self.modal = ModalState::None;
-                }
-                return None;
-            }
-            ModalState::PausePopover {
-                ref mut selected_idx,
-            } => match key.code {
-                KeyCode::Esc => {
-                    self.modal = ModalState::None;
-                    return None;
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    *selected_idx = selected_idx.saturating_sub(1);
-                    return None;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected_idx < 4 {
-                        *selected_idx += 1;
-                    }
-                    return None;
-                }
-                KeyCode::Char('1') => {
-                    *selected_idx = 0;
-                    return self.confirm_pause_selection(0);
-                }
-                KeyCode::Char('2') => {
-                    *selected_idx = 1;
-                    return self.confirm_pause_selection(1);
-                }
-                KeyCode::Char('3') => {
-                    *selected_idx = 2;
-                    return self.confirm_pause_selection(2);
-                }
-                KeyCode::Char('4') => {
-                    *selected_idx = 3;
-                    return self.confirm_pause_selection(3);
-                }
-                KeyCode::Char('5') => {
-                    *selected_idx = 4;
-                    return self.confirm_pause_selection(4);
-                }
-                KeyCode::Enter => {
-                    let sel = *selected_idx;
-                    return self.confirm_pause_selection(sel);
-                }
-                _ => return None,
-            },
-            ModalState::EnrollmentModal {
-                ref mut selected_device_idx,
-                ref mut alias_focused,
-                ref pairing_prompt,
-                ..
-            } => {
-                if let Some(prompt) = pairing_prompt {
-                    if let PairingPromptModalState::Confirmation { .. } = prompt {
-                        if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
-                            self.modal = ModalState::None;
-                            return Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                                confirmed: Some(true),
-                                passkey: None,
-                                pincode: None,
-                            }));
-                        } else if key.code == KeyCode::Char('n')
-                            || key.code == KeyCode::Char('N')
-                            || key.code == KeyCode::Esc
-                        {
-                            self.modal = ModalState::None;
-                            return Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                                confirmed: Some(false),
-                                passkey: None,
-                                pincode: None,
-                            }));
-                        }
-                    }
-                    return None;
-                }
-
-                match key.code {
-                    KeyCode::Esc => {
-                        self.modal = ModalState::None;
-                        return Some(TuiCommand::EnrollCancel);
-                    }
-                    KeyCode::Tab => {
-                        *alias_focused = !*alias_focused;
-                        return None;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selected_device_idx = selected_device_idx.saturating_sub(1);
-                        return None;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if !self.discovered_wearables.is_empty()
-                            && *selected_device_idx + 1 < self.discovered_wearables.len()
-                        {
-                            *selected_device_idx += 1;
-                        }
-                        return None;
-                    }
-                    KeyCode::Enter => {
-                        if let Some(dev) = self.discovered_wearables.get(*selected_device_idx) {
-                            let addr = dev.address.clone();
-                            let alias = if let ModalState::EnrollmentModal {
-                                ref alias_input, ..
-                            } = self.modal
-                            {
-                                if alias_input.trim().is_empty() {
-                                    None
-                                } else {
-                                    Some(alias_input.trim().to_string())
-                                }
-                            } else {
-                                None
-                            };
-                            self.modal = ModalState::None;
-                            return Some(TuiCommand::EnrollSelect {
-                                address: addr,
-                                alias,
-                            });
-                        }
-                        return None;
-                    }
-                    _ => return None,
-                }
-            }
-            ModalState::UnenrollModal {
-                ref mut forget_bluez,
-                ref mut delete_sessions,
-                ref mut selected_button,
-                ref wearable,
-            } => match key.code {
-                KeyCode::Esc => {
-                    self.modal = ModalState::None;
-                    return None;
-                }
-                KeyCode::Char('1') => {
-                    *forget_bluez = !*forget_bluez;
-                    return None;
-                }
-                KeyCode::Char('2') => {
-                    *delete_sessions = !*delete_sessions;
-                    return None;
-                }
-                KeyCode::Char(' ') => {
-                    if *selected_button == 0 {
-                        *forget_bluez = !*forget_bluez;
-                    } else {
-                        *delete_sessions = !*delete_sessions;
-                    }
-                    return None;
-                }
-                KeyCode::Tab
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => {
-                    *selected_button = if *selected_button == 0 { 1 } else { 0 };
-                    return None;
-                }
-                KeyCode::Enter => {
-                    if *selected_button == 0 {
-                        let id = wearable.wearable.id.clone();
-                        let fb = *forget_bluez;
-                        let ds = *delete_sessions;
-                        self.modal = ModalState::None;
-                        return Some(TuiCommand::WearableUnenroll {
-                            id,
-                            forget_bluez: fb,
-                            delete_sessions: ds,
-                        });
-                    } else {
-                        self.modal = ModalState::None;
-                        return None;
-                    }
-                }
-                _ => return None,
-            },
-            ModalState::RenameModal { .. } => {
-                // Handled in handle_text_input_key
-                return None;
-            }
-            ModalState::None => {}
-        }
-
-        // 3. Global hotkeys when no modal is open
-        match key.code {
-            KeyCode::Char('q') => {
-                self.should_quit = true;
-                None
-            }
-            KeyCode::Char('?') => {
-                self.modal = ModalState::Help;
-                None
-            }
-            // Tab switching
-            KeyCode::Char('1') => {
-                self.active_tab = Tab::Dashboard;
-                None
-            }
-            KeyCode::Char('2') => {
-                self.active_tab = Tab::History;
-                None
-            }
-            KeyCode::Char('3') => {
-                self.active_tab = Tab::Wearables;
-                None
-            }
-            KeyCode::Char('4') => {
-                self.active_tab = Tab::Settings;
-                None
-            }
-            KeyCode::Tab => {
-                self.active_tab = self.active_tab.next();
-                None
-            }
-            KeyCode::BackTab => {
-                self.active_tab = self.active_tab.prev();
-                None
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.active_tab = self.active_tab.prev();
-                None
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.active_tab = self.active_tab.next();
-                None
-            }
-            // List selection
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.active_tab == Tab::Wearables
-                    && self.selected_wearable_idx + 1 < self.enrolled_wearables.len()
-                {
-                    self.selected_wearable_idx += 1;
-                }
-                None
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.active_tab == Tab::Wearables {
-                    self.selected_wearable_idx = self.selected_wearable_idx.saturating_sub(1);
-                }
-                None
-            }
-            // Global Grace period controls
-            KeyCode::Char('c') if self.grace_state.is_some() => Some(TuiCommand::CancelGrace),
-            KeyCode::Char('s') if self.grace_state.is_some() => Some(TuiCommand::SnoozeGrace(None)),
-
-            // Tab-specific controls
-            _ => match self.active_tab {
-                Tab::Dashboard => match key.code {
-                    KeyCode::Char('d') => {
-                        self.is_diagnostics_open = !self.is_diagnostics_open;
-                        None
-                    }
-                    KeyCode::Char('p') if self.daemon_connected => {
-                        self.modal = ModalState::PausePopover { selected_idx: 0 };
-                        None
-                    }
-                    KeyCode::Char('e') if self.enrolled_wearables.is_empty() => {
-                        self.active_tab = Tab::Wearables;
-                        self.modal = ModalState::EnrollmentModal {
-                            scanning_timer_sec: 30,
-                            selected_device_idx: 0,
-                            alias_input: String::new(),
-                            alias_focused: false,
-                            pairing_prompt: None,
-                        };
-                        Some(TuiCommand::EnrollStart(Some(30)))
-                    }
-                    KeyCode::Char('a') if self.has_persistent_shift_alert() => {
-                        Some(TuiCommand::AcceptShift)
-                    }
-                    KeyCode::Char('i') if self.has_persistent_shift_alert() => {
-                        Some(TuiCommand::DismissShift)
-                    }
-                    KeyCode::Char('x') => {
-                        if let Some(alert) = self.active_alert() {
-                            let id = alert.id.clone();
-                            self.alerts.retain(|a| a.id != id);
-                            Some(TuiCommand::DismissAlert { id })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                },
-                Tab::Wearables => match key.code {
-                    KeyCode::Char('e') if self.daemon_connected => {
-                        self.modal = ModalState::EnrollmentModal {
-                            scanning_timer_sec: 30,
-                            selected_device_idx: 0,
-                            alias_input: String::new(),
-                            alias_focused: false,
-                            pairing_prompt: None,
-                        };
-                        Some(TuiCommand::EnrollStart(Some(30)))
-                    }
-                    KeyCode::Char('n') if !self.enrolled_wearables.is_empty() => {
-                        let w = &self.enrolled_wearables[self.selected_wearable_idx];
-                        let cur = w.wearable.alias.clone().unwrap_or_default();
-                        self.modal = ModalState::RenameModal {
-                            wearable_id: w.wearable.id.clone(),
-                            current_alias: cur.clone(),
-                            input: cur,
-                        };
-                        None
-                    }
-                    KeyCode::Char('c') if !self.enrolled_wearables.is_empty() => {
-                        let id = self.enrolled_wearables[self.selected_wearable_idx]
-                            .wearable
-                            .id
-                            .clone();
-                        Some(TuiCommand::WearableConnect { id })
-                    }
-                    KeyCode::Char('u') if !self.enrolled_wearables.is_empty() => {
-                        let w = self.enrolled_wearables[self.selected_wearable_idx].clone();
-                        self.modal = ModalState::UnenrollModal {
-                            wearable: w,
-                            forget_bluez: false,
-                            delete_sessions: false,
-                            selected_button: 0,
-                        };
-                        None
-                    }
-                    _ => None,
-                },
-                _ => None,
-            },
-        }
-    }
-
-    fn handle_text_input_key(&mut self, key: KeyEvent) -> Option<TuiCommand> {
-        match self.modal {
-            ModalState::RenameModal {
-                ref wearable_id,
-                ref input,
-                ..
-            } => match key.code {
-                KeyCode::Esc => {
-                    self.modal = ModalState::None;
-                    None
-                }
-                KeyCode::Enter => {
-                    let w_id = wearable_id.clone();
-                    let new_alias = if input.trim().is_empty() {
-                        None
-                    } else {
-                        Some(input.trim().to_string())
-                    };
-                    self.modal = ModalState::None;
-                    Some(TuiCommand::WearableRename {
-                        id: w_id,
-                        alias: new_alias,
-                    })
-                }
-                KeyCode::Backspace => {
-                    if let ModalState::RenameModal { ref mut input, .. } = self.modal {
-                        input.pop();
-                    }
-                    None
-                }
-                KeyCode::Char(c) => {
-                    if let ModalState::RenameModal { ref mut input, .. } = self.modal {
-                        input.push(c);
-                    }
-                    None
-                }
-                _ => None,
-            },
-            ModalState::EnrollmentModal {
-                ref mut alias_input,
-                ref mut alias_focused,
-                ref mut pairing_prompt,
-                ..
-            } => {
-                if let Some(prompt) = pairing_prompt {
-                    match prompt {
-                        PairingPromptModalState::Passkey { input, .. }
-                        | PairingPromptModalState::PinCode { input, .. } => match key.code {
-                            KeyCode::Esc => {
-                                self.modal = ModalState::None;
-                                return Some(TuiCommand::EnrollCancel);
-                            }
-                            KeyCode::Backspace => {
-                                input.pop();
-                                return None;
-                            }
-                            KeyCode::Enter => {
-                                let ans = input.clone();
-                                let cmd = match prompt {
-                                    PairingPromptModalState::Passkey { .. } => {
-                                        let passkey_num = ans.parse::<u32>().ok();
-                                        TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                                            confirmed: Some(true),
-                                            passkey: passkey_num,
-                                            pincode: None,
-                                        })
-                                    }
-                                    PairingPromptModalState::PinCode { .. } => {
-                                        TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                                            confirmed: Some(true),
-                                            passkey: None,
-                                            pincode: Some(ans),
-                                        })
-                                    }
-                                    _ => return None,
-                                };
-                                self.modal = ModalState::None;
-                                return Some(cmd);
-                            }
-                            KeyCode::Char(c) => {
-                                input.push(c);
-                                return None;
-                            }
-                            _ => return None,
-                        },
-                        _ => return None,
-                    }
-                }
-
-                if *alias_focused {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.modal = ModalState::None;
-                            Some(TuiCommand::EnrollCancel)
-                        }
-                        KeyCode::Tab => {
-                            *alias_focused = false;
-                            None
-                        }
-                        KeyCode::Backspace => {
-                            alias_input.pop();
-                            None
-                        }
-                        KeyCode::Char(c) => {
-                            alias_input.push(c);
-                            None
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn confirm_pause_selection(&mut self, sel: usize) -> Option<TuiCommand> {
-        self.modal = ModalState::None;
-        match sel {
-            0 => Some(TuiCommand::Resume),
-            1 => Some(TuiCommand::Pause(PauseParams {
-                mode: Some(PauseMode::Indefinite),
-                duration_sec: None,
-            })),
-            2 => Some(TuiCommand::Pause(PauseParams {
-                mode: Some(PauseMode::Duration),
-                duration_sec: Some(3600),
-            })),
-            3 => Some(TuiCommand::Pause(PauseParams {
-                mode: Some(PauseMode::Duration),
-                duration_sec: Some(7200),
-            })),
-            4 => Some(TuiCommand::Pause(PauseParams {
-                mode: Some(PauseMode::UntilMorning),
-                duration_sec: None,
-            })),
-            _ => None,
-        }
-    }
-
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<TuiCommand> {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Tab click on row 0
-                if mouse.row == 0 {
-                    if mouse.column < 15 {
-                        self.active_tab = Tab::Dashboard;
-                    } else if mouse.column < 30 {
-                        self.active_tab = Tab::History;
-                    } else if mouse.column < 47 {
-                        self.active_tab = Tab::Wearables;
-                    } else if mouse.column < 62 {
-                        self.active_tab = Tab::Settings;
-                    }
-                    return None;
-                }
-
-                // Global Grace banner click (row 1)
-                if mouse.row == 1 && self.grace_state.is_some() {
-                    // Click Cancel or Snooze in banner
-                    if mouse.column >= 45 && mouse.column <= 68 {
-                        return Some(TuiCommand::CancelGrace);
-                    } else if mouse.column > 68 && mouse.column <= 82 {
-                        return Some(TuiCommand::SnoozeGrace(None));
-                    }
-                }
-
-                None
-            }
-            MouseEventKind::ScrollDown => {
-                if self.active_tab == Tab::Wearables
-                    && self.selected_wearable_idx + 1 < self.enrolled_wearables.len()
-                {
-                    self.selected_wearable_idx += 1;
-                }
-                None
-            }
-            MouseEventKind::ScrollUp => {
-                if self.active_tab == Tab::Wearables {
-                    self.selected_wearable_idx = self.selected_wearable_idx.saturating_sub(1);
-                }
-                None
-            }
-            _ => None,
-        }
     }
 
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -916,7 +471,7 @@ impl TuiApp {
         }
 
         let has_banner = self.grace_state.is_some() || !self.daemon_connected;
-        let banner_height = if has_banner { 1u16 } else { 0u16 };
+        let banner_height = u16::from(has_banner);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -954,31 +509,28 @@ impl TuiApp {
 }
 
 fn render_resize_notice(area: Rect, buf: &mut Buffer, theme: Theme) {
-    let box_w = 46u16.min(area.width);
-    let box_h = 6u16.min(area.height);
-    let box_x = area.x + (area.width.saturating_sub(box_w)) / 2;
-    let box_y = area.y + (area.height.saturating_sub(box_h)) / 2;
-    let box_area = Rect::new(box_x, box_y, box_w, box_h);
-
+    let box_area = centered_rect(area, 46, 6);
     Clear.render(box_area, buf);
 
-    let block = Block::default()
-        .title(" Terminal too small ")
-        .title_style(theme.card_title())
-        .borders(Borders::ALL)
+    let block = theme
+        .card_block(" Terminal too small ")
         .border_style(theme.warning());
 
     let inner = block.inner(box_area);
     block.render(box_area, buf);
 
+    let sep = if theme.ascii { "x" } else { "×" };
     let lines = vec![
         Line::from(vec![
             Span::styled(" Current: ", theme.muted()),
-            Span::styled(format!("{}×{}", area.width, area.height), theme.danger()),
+            Span::styled(
+                format!("{}{sep}{}", area.width, area.height),
+                theme.danger(),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" Minimum: ", theme.muted()),
-            Span::styled("60×18 (recommended: 80×24)", theme.base()),
+            Span::styled(format!("60{sep}18 (recommended: 80{sep}24)"), theme.base()),
         ]),
     ];
 

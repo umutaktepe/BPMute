@@ -1,10 +1,10 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Row, Table, Widget};
+use ratatui::widgets::{Clear, Paragraph, Row, Table, Widget};
 
-use super::super::app::{ModalState, PairingPromptModalState, TuiApp};
+use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
+use super::centered_rect;
 
 pub fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     if area.height < 5 || area.width < 10 {
@@ -19,42 +19,19 @@ pub fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let table_area = chunks[0];
     let action_area = chunks[1];
 
-    // 1. Render Table of Enrolled Wearables
     render_wearables_table(app, table_area, buf);
-
-    // 2. Render Action Bar
     render_wearables_actions(app, action_area, buf);
 
-    // 3. Render any active modal
     match app.modal {
-        ModalState::EnrollmentModal { .. } => {
-            render_enrollment_modal(app, area, buf);
-        }
-        ModalState::RenameModal { .. } => {
-            render_rename_modal(app, area, buf);
-        }
-        ModalState::UnenrollModal { .. } => {
-            render_unenroll_modal(app, area, buf);
-        }
+        ModalState::EnrollmentModal { .. } => render_enrollment_modal(app, area, buf),
+        ModalState::RenameModal { .. } => render_rename_modal(app, area, buf),
+        ModalState::UnenrollModal { .. } => render_unenroll_modal(app, area, buf),
         _ => {}
     }
 }
 
 fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Enrolled Wearables ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
-    let header_style = if app.theme.no_color {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    };
-
+    let block = app.theme.card_block(" Enrolled Wearables ");
     let header = Row::new(vec![
         "Alias / Name",
         "MAC Address",
@@ -63,7 +40,7 @@ fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         "Capabilities",
         "Last Seen",
     ])
-    .style(header_style);
+    .style(app.theme.table_header());
 
     let rows: Vec<Row> = app
         .enrolled_wearables
@@ -85,15 +62,19 @@ fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 .unwrap_or("Unknown");
 
             let mac = &w.wearable.mac_masked;
-            let status_str = format!("{:?}", w.status);
+            let status_str = w.status.display_label().to_string();
             let bat_str = w
                 .battery
                 .map(|b| format!("{b}%"))
                 .unwrap_or_else(|| "--".to_string());
-            let caps = if w.wearable.supports_rr {
+            let base_cap = if w.wearable.supports_rr {
                 "BPM+RR"
             } else {
                 "BPM-only"
+            };
+            let caps = match w.body_location.as_deref() {
+                Some(loc) if !loc.is_empty() => format!("{base_cap} ({loc})"),
+                _ => base_cap.to_string(),
             };
             let seen = if w.wearable.last_seen_at_ms > 0 {
                 "Recent"
@@ -106,7 +87,7 @@ fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 mac.to_string(),
                 status_str,
                 bat_str,
-                caps.to_string(),
+                caps,
                 seen.to_string(),
             ])
             .style(row_style)
@@ -114,77 +95,80 @@ fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(25),
-        Constraint::Percentage(20),
-        Constraint::Percentage(18),
-        Constraint::Percentage(10),
-        Constraint::Percentage(15),
-        Constraint::Percentage(12),
+        Constraint::Min(12),
+        Constraint::Length(9),
+        Constraint::Length(15),
+        Constraint::Length(7),
+        Constraint::Min(16),
+        Constraint::Length(9),
     ];
 
     let table = Table::new(rows, widths).header(header).block(block);
-
     Widget::render(table, area, buf);
 }
 
 fn render_wearables_actions(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block("");
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let lines = vec![Line::from(vec![
-        Span::styled("  [e]", app.theme.key_hint()),
-        Span::styled(" Enroll new  ", app.theme.base()),
-        Span::styled("[n]", app.theme.key_hint()),
-        Span::styled(" Rename alias  ", app.theme.base()),
-        Span::styled("[c]", app.theme.key_hint()),
-        Span::styled(" Reconnect  ", app.theme.base()),
-        Span::styled("[u]", app.theme.key_hint()),
-        Span::styled(" Unenroll", app.theme.base()),
-    ])];
+    let key_style = if app.daemon_connected {
+        app.theme.key_hint()
+    } else {
+        app.theme.muted()
+    };
+    let text_style = if app.daemon_connected {
+        app.theme.base()
+    } else {
+        app.theme.muted()
+    };
 
-    Paragraph::new(lines).render(inner, buf);
+    let mut spans = vec![
+        Span::styled("  [e]", key_style),
+        Span::styled(" Enroll new  ", text_style),
+        Span::styled("[n]", key_style),
+        Span::styled(" Rename alias  ", text_style),
+        Span::styled("[c]", key_style),
+        Span::styled(" Reconnect  ", text_style),
+        Span::styled("[u]", key_style),
+        Span::styled(" Unenroll", text_style),
+    ];
+    if !app.daemon_connected {
+        spans.push(Span::styled("  (offline: read-only)", app.theme.muted()));
+    }
+
+    Paragraph::new(vec![Line::from(spans)]).render(inner, buf);
 }
 
 fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let ModalState::EnrollmentModal {
-        scanning_timer_sec,
-        selected_device_idx,
+        scanning_remaining_ms,
+        selected_discovered_idx,
         ref alias_input,
         alias_focused,
+        enrolling,
+        ref error_message,
         ref pairing_prompt,
     } = app.modal
     else {
         return;
     };
 
-    let modal_w = 64u16.min(area.width.saturating_sub(4));
-    let modal_h = 16u16.min(area.height.saturating_sub(4));
-
-    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
-    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
-
+    let modal_area = centered_rect(area, 64, 16);
     Clear.render(modal_area, buf);
 
-    // If pairing prompt is active, render pairing prompt dialog over enrollment
     if let Some(prompt) = pairing_prompt {
         render_pairing_prompt_modal(app, prompt, modal_area, buf);
         return;
     }
 
-    let block = Block::default()
-        .title(format!(
-            " Enroll Wearable (Scanning... {}s) ",
-            scanning_timer_sec
-        ))
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let rem_sec = scanning_remaining_ms.div_ceil(1000);
+    let title = if enrolling {
+        " Enroll Wearable (Bonding / Pairing...) ".to_string()
+    } else {
+        format!(" Enroll Wearable (Scanning... {}s) ", rem_sec)
+    };
+    let block = app.theme.card_block(title);
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
 
@@ -198,23 +182,33 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ])
         .split(inner);
 
-    // Subtitle / Scanning status
-    let status_line = Line::from(vec![Span::styled(
-        " Select a discovered 0x180D Heart Rate wearable from BlueZ: ",
-        app.theme.muted(),
-    )]);
+    let status_line = if let Some(err) = error_message {
+        Line::from(vec![Span::styled(
+            format!(" Error: {err}"),
+            app.theme.danger(),
+        )])
+    } else if enrolling {
+        Line::from(vec![Span::styled(
+            " Enrolling Wearable... (awaiting Bluetooth pairing)",
+            app.theme.warning(),
+        )])
+    } else {
+        Line::from(vec![Span::styled(
+            " Select a discovered 0x180D Heart Rate Wearable from BlueZ:",
+            app.theme.muted(),
+        )])
+    };
     Paragraph::new(status_line).render(chunks[0], buf);
 
-    // Discovered devices list
     let mut dev_lines = Vec::new();
     if app.discovered_wearables.is_empty() {
         dev_lines.push(Line::from(vec![Span::styled(
-            "   (Searching for advertising BLE wearables...)",
+            "   (Searching for advertising BLE Wearables...)",
             app.theme.muted(),
         )]));
     } else {
         for (idx, d) in app.discovered_wearables.iter().enumerate() {
-            let is_selected = idx == selected_device_idx && !alias_focused;
+            let is_selected = idx == selected_discovered_idx && !alias_focused;
             let style = if is_selected {
                 app.theme.highlight()
             } else {
@@ -239,10 +233,9 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
     Paragraph::new(dev_lines).render(chunks[1], buf);
 
-    // Alias Input field
-    let alias_block = Block::default()
-        .title(" Custom Alias (Optional) [Tab to focus] ")
-        .borders(Borders::ALL)
+    let alias_block = app
+        .theme
+        .card_block(" Custom Alias (Optional) [Tab to focus] ")
         .border_style(if alias_focused {
             app.theme.primary()
         } else {
@@ -251,21 +244,26 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let alias_inner = alias_block.inner(chunks[2]);
     alias_block.render(chunks[2], buf);
 
+    let cursor = if alias_focused {
+        if app.theme.ascii { "_" } else { "█" }
+    } else {
+        ""
+    };
     let input_line = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(alias_input.as_str(), app.theme.base()),
-        if alias_focused {
-            Span::styled("█", app.theme.primary())
+        Span::styled(format!(" {}{cursor}", alias_input), app.theme.base()),
+        if alias_input.is_empty() && !alias_focused {
+            Span::styled("Press Tab to type custom alias...", app.theme.muted())
         } else {
             Span::raw("")
         },
     ]);
     Paragraph::new(input_line).render(alias_inner, buf);
 
-    // Footer actions
     let footer_line = Line::from(vec![
         Span::styled(" [Enter]", app.theme.key_hint()),
-        Span::styled(" Enroll Selected   ", app.theme.base()),
+        Span::styled(" Enroll  ", app.theme.base()),
+        Span::styled("[r]", app.theme.key_hint()),
+        Span::styled(" Rescan  ", app.theme.base()),
         Span::styled("[Esc]", app.theme.key_hint()),
         Span::styled(" Cancel", app.theme.base()),
     ]);
@@ -278,22 +276,21 @@ fn render_pairing_prompt_modal(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let block = Block::default()
-        .title(" Bluetooth LE Pairing Authorization (Agent1) ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
+    let block = app
+        .theme
+        .card_block(" Bluetooth LE Pairing Authorization (Agent1) ")
         .border_style(app.theme.primary());
 
     let inner = block.inner(area);
     block.render(area, buf);
 
     let lines = match prompt {
-        PairingPromptModalState::Confirmation { passkey, device } => {
+        PairingPromptModalState::Confirmation { passkey, wearable } => {
             vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(" Device: ", app.theme.muted()),
-                    Span::styled(device, app.theme.base()),
+                    Span::styled(" Wearable: ", app.theme.muted()),
+                    Span::styled(wearable, app.theme.base()),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
@@ -315,12 +312,12 @@ fn render_pairing_prompt_modal(
                 ]),
             ]
         }
-        PairingPromptModalState::Passkey { device, input } => {
+        PairingPromptModalState::Passkey { wearable, input } => {
             vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(" Device: ", app.theme.muted()),
-                    Span::styled(device, app.theme.base()),
+                    Span::styled(" Wearable: ", app.theme.muted()),
+                    Span::styled(wearable, app.theme.base()),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
@@ -339,12 +336,12 @@ fn render_pairing_prompt_modal(
                 )]),
             ]
         }
-        PairingPromptModalState::PinCode { device, input } => {
+        PairingPromptModalState::PinCode { wearable, input } => {
             vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(" Device: ", app.theme.muted()),
-                    Span::styled(device, app.theme.base()),
+                    Span::styled(" Wearable: ", app.theme.muted()),
+                    Span::styled(wearable, app.theme.base()),
                 ]),
                 Line::from(""),
                 Line::from(vec![Span::styled(
@@ -378,24 +375,14 @@ fn render_rename_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     };
 
-    let modal_w = 48u16.min(area.width.saturating_sub(4));
-    let modal_h = 8u16.min(area.height.saturating_sub(4));
-
-    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
-    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
-
+    let modal_area = centered_rect(area, 48, 8);
     Clear.render(modal_area, buf);
 
-    let block = Block::default()
-        .title(" Rename Wearable Alias ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Rename Wearable Alias ");
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
 
+    let cursor = if app.theme.ascii { "_" } else { "█" };
     let lines = vec![
         Line::from(vec![
             Span::styled(" Current: ", app.theme.muted()),
@@ -403,7 +390,7 @@ fn render_rename_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
-            format!(" New alias: [ {}█ ]", input),
+            format!(" New alias: [ {}{cursor} ]", input),
             app.theme.primary(),
         )]),
         Line::from(""),
@@ -429,21 +416,10 @@ fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     };
 
-    let modal_w = 58u16.min(area.width.saturating_sub(4));
-    let modal_h = 12u16.min(area.height.saturating_sub(4));
-
-    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
-    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
-
+    let modal_area = centered_rect(area, 58, 12);
     Clear.render(modal_area, buf);
 
-    let block = Block::default()
-        .title(" Unenroll Wearable ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Unenroll Wearable ");
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
 
@@ -457,13 +433,13 @@ fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let cb1 = if forget_bluez { "[X]" } else { "[ ]" };
     let cb2 = if delete_sessions { "[X]" } else { "[ ]" };
 
-    let btn0_style = if selected_button == 0 {
+    let btn0_style = if selected_button == UnenrollButton::Confirm {
         app.theme.highlight()
     } else {
         app.theme.base()
     };
 
-    let btn1_style = if selected_button == 1 {
+    let btn1_style = if selected_button == UnenrollButton::Cancel {
         app.theme.highlight()
     } else {
         app.theme.base()

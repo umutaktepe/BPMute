@@ -51,6 +51,14 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
 
     let cli_overrides = build_cli_overrides(&cli, None);
 
+    if cli.command.is_some() && (cli.no_mouse || cli.ascii) {
+        let _ = writeln!(
+            stderr,
+            "error: --no-mouse and --ascii are only valid when launching the interactive TUI without a subcommand"
+        );
+        return ExitCode::UsageOrConfigError;
+    }
+
     match cli.command {
         None => crate::tui::run_tui(paths, env, cli.no_mouse, cli.ascii, stdout, stderr).await,
         Some(Command::Daemon { dry_run }) => {
@@ -153,6 +161,7 @@ async fn run_daemon<WErr: Write>(
         action_executor: Some(Arc::new(crate::actions::SystemActionExecutor)),
         notifier: Some(Arc::new(crate::actions::DesktopNotifier)),
         idle_probe: Some(Arc::new(crate::idle::SystemIdleProbe::new(env_arc))),
+        enrollment_driver: Some(Arc::new(crate::daemon::BluezEnrollmentDriver)),
     })
     .await
     {

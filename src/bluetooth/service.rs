@@ -237,10 +237,27 @@ async fn handle_lifecycle_action(
             {
                 let _ = proxy.start_notify().await;
             }
-            // Read 0x2A38 body sensor location
-            let _ = read_body_sensor_location(system_conn, mac).await;
-            // Read Battery1 percentage
-            let _ = read_battery_percentage(system_conn, mac).await;
+            // Read 0x2A38 body sensor location and Battery1 percentage
+            let body_location = read_body_sensor_location(system_conn, mac)
+                .await
+                .ok()
+                .flatten()
+                .map(|loc| loc.display_label().to_string());
+            let battery = read_battery_percentage(system_conn, mac)
+                .await
+                .ok()
+                .flatten();
+            if (battery.is_some() || body_location.is_some())
+                && let Some(desc) = known.get(mac)
+            {
+                let _ = event_tx
+                    .send(WearableEvent::Metadata {
+                        wearable: desc.clone(),
+                        battery,
+                        body_location,
+                    })
+                    .await;
+            }
         }
         LifecycleAction::CheckNotifying { mac } => {
             // Verify GATT notification status after silence and re-subscribe if needed

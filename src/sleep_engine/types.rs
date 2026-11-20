@@ -70,6 +70,27 @@ pub enum StreamStatus {
     Acquiring,
     Streaming,
     SignalLost,
+    PassiveStandby,
+}
+
+impl StreamStatus {
+    /// Returns the human-readable Glossary/UI label for this stream state.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Disconnected => "Disconnected",
+            Self::Connecting => "Connecting",
+            Self::Acquiring => "Acquiring",
+            Self::Streaming => "Streaming",
+            Self::SignalLost => "Signal Lost",
+            Self::PassiveStandby => "Passive Standby",
+        }
+    }
+}
+
+impl fmt::Display for StreamStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display_label())
+    }
 }
 
 /// Explicit Wearable stream status transition event.
@@ -142,6 +163,23 @@ pub enum CalibrationMaturity {
     ColdStart,
     Learning,
     Calibrated,
+}
+
+impl CalibrationMaturity {
+    /// Returns the human-readable Glossary/UI label for this maturity tier.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::ColdStart => "Cold Start",
+            Self::Learning => "Learning",
+            Self::Calibrated => "Calibrated",
+        }
+    }
+}
+
+impl fmt::Display for CalibrationMaturity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display_label())
+    }
 }
 
 /// Personal physiological calibration priors shared across Wearables.

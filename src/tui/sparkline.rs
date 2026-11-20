@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use super::theme::Theme;
@@ -137,18 +136,8 @@ impl Widget for HrSparklineWidget<'_> {
             area.y + 1 + row
         });
 
-        let qw_style = if self.theme.no_color {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            Style::default().fg(Color::Cyan)
-        };
-
-        let sleep_style = if self.theme.no_color {
-            Style::default().add_modifier(Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Magenta)
-        };
-
+        let qw_style = self.theme.sparkline_qw_ref();
+        let sleep_style = self.theme.sparkline_sleep_ref();
         let ref_char = if self.theme.ascii { '-' } else { '┄' };
 
         // Render reference lines first
@@ -175,11 +164,7 @@ impl Widget for HrSparklineWidget<'_> {
         let total_samples = self.data.samples.len();
         if total_samples > 0 {
             let samples_vec: Vec<&HrSampleEvent> = self.data.samples.iter().collect();
-            let hr_style = if self.theme.no_color {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Green)
-            };
+            let hr_style = self.theme.sparkline_curve();
 
             for col in 0..chart_w {
                 let start_idx = (col as usize * total_samples) / chart_w as usize;
@@ -209,7 +194,7 @@ impl Widget for HrSparklineWidget<'_> {
                         '.'
                     }
                 } else if norm > 0.8 {
-                    '█'
+                    '⣿'
                 } else if norm > 0.6 {
                     '⣾'
                 } else if norm > 0.4 {
@@ -240,13 +225,18 @@ impl Widget for HrSparklineWidget<'_> {
             buf.set_string(now_x, time_y, "Now", self.theme.muted());
         }
 
-        // Render legend at top row
+        // Render legend at top row (pure ASCII under --ascii)
         let mut legend_x = chart_x;
-        buf.set_string(legend_x, area.y, "● HR (live)", self.theme.success());
+        let hr_legend = if self.theme.ascii {
+            "* HR (live)"
+        } else {
+            "● HR (live)"
+        };
+        buf.set_string(legend_x, area.y, hr_legend, self.theme.success());
         legend_x += 13;
 
         if let Some(qw) = self.data.quiet_wake_baseline {
-            let qw_str = format!("┄ QW ({:.0})", qw);
+            let qw_str = format!("{ref_char} QW ({:.0})", qw);
             if legend_x + (qw_str.len() as u16) < area.right() {
                 buf.set_string(legend_x, area.y, &qw_str, qw_style);
                 legend_x += (qw_str.len() as u16) + 2;
@@ -254,7 +244,7 @@ impl Widget for HrSparklineWidget<'_> {
         }
 
         if let Some(sl) = self.data.sleeping_hr {
-            let sl_str = format!("┄ Sleep ({:.0})", sl);
+            let sl_str = format!("{ref_char} Sleep ({:.0})", sl);
             if legend_x + (sl_str.len() as u16) < area.right() {
                 buf.set_string(legend_x, area.y, &sl_str, sleep_style);
             }

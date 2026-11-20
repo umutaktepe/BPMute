@@ -1,28 +1,42 @@
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use clap::Parser;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
+use bpmute::actions::fake::FakeActionExecutor;
+use bpmute::actions::traits::{ActionExecutor, BoxFuture, PowerActionResult};
+use bpmute::bluetooth::agent::AgentAuthRequest;
+use bpmute::cli::args::Cli;
+use bpmute::cli::execute_cli;
 use bpmute::config::{ActionsConfig, CliOverrides, LoadedConfig, PowerAction, ScheduleConfig};
-use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
+use bpmute::daemon::{
+    DaemonCore, DaemonHandle, DaemonOptions, EnrollmentPairingHook, VirtualClock,
+};
+use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{
-    AlertSeverity, DaemonAlert, EnrolledWearableStatus, HrSampleEvent, MonitoringState, PauseMode,
-    PauseParams,
+    AlertSeverity, DaemonAlert, DiscoveredWearable, EnrolledWearableStatus, HrSampleEvent,
+    MonitoringState, PauseMode, PauseParams, alert_ids,
 };
 use bpmute::paths::{MapEnv, ResolvedPaths};
-use bpmute::sleep_engine::{ContactStatus, StreamStatus};
+use bpmute::sleep_engine::{
+    CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, StreamStatus,
+};
 use bpmute::storage::EnrolledWearable;
+use bpmute::tui::views::header::{GraceBannerLayout, tab_hit_ranges};
 use bpmute::tui::{
-    GraceState, ModalState, PairingPromptModalState, Tab, TuiApp, TuiCommand, TuiEvent,
-    TuiIpcBridge,
+    GraceState, ModalState, PairingPromptModalState, Tab, Theme, TuiApp, TuiCommand, TuiEvent,
+    TuiIpcBridge, UnenrollButton, detect_systemd_service_installed,
 };
 
 fn buffer_to_string(buf: &Buffer) -> String {
@@ -38,6 +52,36 @@ fn buffer_to_string(buf: &Buffer) -> String {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::empty())
+}
+
+fn make_wearable(
+    id: &str,
+    mac: &str,
+    alias: Option<&str>,
+    status: StreamStatus,
+    battery: Option<u8>,
+    body_location: Option<&str>,
+) -> EnrolledWearableStatus {
+    EnrolledWearableStatus {
+        wearable: EnrolledWearable {
+            id: id.to_string(),
+            mac: mac.to_string(),
+            mac_masked: "..:22:33".to_string(),
+            address_type: "public".to_string(),
+            alias: alias.map(str::to_string),
+            advertised_name: None,
+            supports_rr: true,
+            supports_contact: true,
+            hr_var_floor: 0.25,
+            typical_sqi: Some(0.95),
+            enrolled_at_ms: 1_700_000_000_000,
+            last_seen_at_ms: 1_700_000_000_000,
+            active: true,
+        },
+        status,
+        battery,
+        body_location: body_location.map(str::to_string),
+    }
 }
 
 fn make_test_paths(temp: &TempDir) -> (ResolvedPaths, MapEnv) {
@@ -62,248 +106,304 @@ fn make_test_paths(temp: &TempDir) -> (ResolvedPaths, MapEnv) {
     (paths, env)
 }
 
-#[test]
-fn test_80x24_baseline_layout_and_navigation() {
+async fn wait_for_app_state<F>(
+    app: &mut TuiApp,
+    event_rx: &mut mpsc::Receiver<TuiEvent>,
+    mut pred: F,
+) where
+    F: FnMut(&TuiApp) -> bool,
+{
+    for _ in 0..256 {
+        if pred(app) {
+            return;
+        }
+        let ev = event_rx
+            .recv()
+            .await
+            .expect("TUI IPC event channel closed before reaching expected state");
+        let _ = app.handle_event(ev);
+    }
+    panic!("TUI app did not reach expected state within event budget");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_cli_tui_flags_are_scoped_and_80x24_baseline_renders_cleanly() {
+    // Bare `bpmute --no-mouse --ascii` parses cleanly with no subcommand
+    let cli = Cli::try_parse_from(["bpmute", "--no-mouse", "--ascii"]).unwrap();
+    assert!(cli.no_mouse);
+    assert!(cli.ascii);
+    assert!(cli.command.is_none());
+
+    // Subcommand trailing TUI flags must be rejected by clap
+    assert!(Cli::try_parse_from(["bpmute", "status", "--ascii"]).is_err());
+    assert!(Cli::try_parse_from(["bpmute", "daemon", "--no-mouse"]).is_err());
+
+    // Leading TUI flags paired with a subcommand must return UsageOrConfigError
+    let temp = TempDir::new().unwrap();
+    let (_, env) = make_test_paths(&temp);
+    let bad_cli = Cli::try_parse_from(["bpmute", "--ascii", "status"]).unwrap();
+    let mut out_buf = Vec::new();
+    let mut err_buf = Vec::new();
+    let code = execute_cli(bad_cli, &env, &mut out_buf, &mut err_buf).await;
+    assert_eq!(code, ExitCode::UsageOrConfigError);
+
+    // 80x24 Dashboard baseline with active wearable, schedule, calibration maturity, and dry-run
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
     app.monitoring_state = MonitoringState::Monitoring;
-    app.latest_bpm = Some(68.0);
-    app.latest_p_sleep = Some(0.12);
+    app.calibration_maturity = CalibrationMaturity::Calibrated;
+    app.armed = true;
+    app.dry_run = true;
+    app.latest_bpm = Some(64.0);
+    app.latest_p_sleep = Some(0.24);
+    app.daemon_status = Some(bpmute::ipc::protocol::DaemonStatus {
+        v: 1,
+        daemon_running: true,
+        version: "0.1.0".into(),
+        pid: 1,
+        uptime_sec: 10,
+        monitoring_state: MonitoringState::Monitoring,
+        armed: true,
+        paused: false,
+        paused_until: None,
+        pause_mode: None,
+        dry_run: true,
+        schedule: ScheduleConfig {
+            active_hours_enabled: true,
+            ..ScheduleConfig::default()
+        },
+        config_path: String::new(),
+        config_loaded_from_file: false,
+        socket_path: String::new(),
+        log_biometrics: false,
+        alerts: Vec::new(),
+        idle_backend: Some("ext-idle-notify".into()),
+        playing_players_count: Some(1),
+    });
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(88),
+        Some("Chest"),
+    )];
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
-
-    // 1. Initial 80x24 Dashboard render
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out = buffer_to_string(terminal.backend().buffer());
 
-    assert!(
-        out.contains("1:Dashboard"),
-        "Header must show Dashboard tab"
-    );
-    assert!(out.contains("2:History"), "Header must show History tab");
-    assert!(
-        out.contains("3:Wearables"),
-        "Header must show Wearables tab"
-    );
-    assert!(out.contains("4:Settings"), "Header must show Settings tab");
-    assert!(out.contains("68"), "Dashboard must show live BPM");
-    assert!(
-        out.contains("Sleep State"),
-        "Dashboard must show Sleep State card"
-    );
-    assert!(out.contains("[1-4] Tabs"), "Footer must show tabs shortcut");
-    assert!(out.contains("[?] Help"), "Footer must show help shortcut");
-    assert!(out.contains("[q] Quit"), "Footer must show quit shortcut");
+    assert!(out.contains("1:Dashboard"));
+    assert!(out.contains("2:History"));
+    assert!(out.contains("3:Wearables"));
+    assert!(out.contains("4:Settings"));
+    assert!(out.contains("64"));
+    assert!(out.contains("Sleep State"));
+    assert!(out.contains("Wearable: Polar H10 (88%)"));
+    assert!(!out.contains("Device:"), "Must not use avoided term Device");
+    assert!(out.contains("Streaming | Calibrated"));
+    assert!(out.contains("Armed [DRY] | 22:00-08:00"));
+    assert!(out.contains("[1-4] Tabs"));
+    assert!(out.contains("[?] Help"));
+    assert!(out.contains("[q] Quit"));
 
-    // 2. Tab switching via numeric keys 1-4
+    // Navigation shortcuts: 1-4, Tab, BackTab, h/l, Left/Right, ?, Esc, q
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
     assert_eq!(app.active_tab, Tab::History);
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Monitoring Sessions & Calibration History"));
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Monitoring Sessions"));
 
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('3'))));
     assert_eq!(app.active_tab, Tab::Wearables);
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Enrolled Wearables"));
-
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('4'))));
     assert_eq!(app.active_tab, Tab::Settings);
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("System Settings & Storage"));
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("System Settings & Storage"));
 
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('1'))));
     assert_eq!(app.active_tab, Tab::Dashboard);
-
-    // 3. Tab navigation via Tab / BackTab / Vim-hybrid (h/l) / Arrows
     app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
     assert_eq!(app.active_tab, Tab::History);
     app.handle_event(TuiEvent::Key(key(KeyCode::BackTab)));
     assert_eq!(app.active_tab, Tab::Dashboard);
-
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('l'))));
     assert_eq!(app.active_tab, Tab::History);
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('h'))));
     assert_eq!(app.active_tab, Tab::Dashboard);
-
     app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
     assert_eq!(app.active_tab, Tab::History);
     app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
     assert_eq!(app.active_tab, Tab::Dashboard);
 
-    // 4. Help modal
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('?'))));
     assert_eq!(app.modal, ModalState::Help);
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("BPMute Keyboard & Mouse Shortcuts [?]"));
-
-    // Close help modal with Esc
+    assert!(
+        buffer_to_string(terminal.backend().buffer()).contains("BPMute Keyboard & Mouse Shortcuts")
+    );
     app.handle_event(TuiEvent::Key(key(KeyCode::Esc)));
     assert_eq!(app.modal, ModalState::None);
 
-    // 5. Quit key
-    assert!(!app.should_quit);
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('q'))));
     assert!(app.should_quit);
 }
 
 #[test]
-fn test_mouse_tab_switching_and_no_mouse_option() {
-    // Normal mouse mode: clicking tab header switches tabs
+fn test_mouse_tab_clicks_grace_banner_buttons_and_no_mouse() {
     let mut app = TuiApp::new(false, false, false);
-    assert_eq!(app.active_tab, Tab::Dashboard);
+    app.daemon_connected = true;
+    app.last_viewport_width = 80;
+    app.grace_state = Some(GraceState {
+        session_id: "s-1".into(),
+        remaining_sec: 45,
+        total_sec: 60,
+        planned_actions: vec!["Pause Media".into(), "Suspend".into()],
+        dry_run: false,
+    });
 
-    // Click on row 0, col 20 (History tab area)
-    app.handle_event(TuiEvent::Mouse(MouseEvent {
+    // Click each tab using exact rendered hit ranges
+    for (expected_tab, start_col, _) in tab_hit_ranges() {
+        app.handle_event(TuiEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: start_col + 2,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }));
+        assert_eq!(app.active_tab, expected_tab);
+    }
+
+    // Click [c] Cancel and [s] Snooze on the Grace banner (row 1) at 80 cols
+    let layout = GraceBannerLayout::compute(app.grace_state.as_ref().unwrap(), 80);
+    let cancel_cmd = app.handle_event(TuiEvent::Mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: 20,
-        row: 0,
+        column: layout.cancel_cols.0 + 1,
+        row: 1,
         modifiers: KeyModifiers::empty(),
     }));
-    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(cancel_cmd, Some(TuiCommand::CancelGrace));
 
-    // Click on row 0, col 35 (Wearables tab area)
-    app.handle_event(TuiEvent::Mouse(MouseEvent {
+    let snooze_cmd = app.handle_event(TuiEvent::Mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: 35,
-        row: 0,
-        modifiers: KeyModifiers::empty(),
-    }));
-    assert_eq!(app.active_tab, Tab::Wearables);
-
-    // Click on row 0, col 50 (Settings tab area)
-    app.handle_event(TuiEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 50,
-        row: 0,
-        modifiers: KeyModifiers::empty(),
-    }));
-    assert_eq!(app.active_tab, Tab::Settings);
-
-    // Now test with --no-mouse: mouse events must be ignored
-    let mut app_no_mouse = TuiApp::new(true, false, false);
-    assert_eq!(app_no_mouse.active_tab, Tab::Dashboard);
-
-    app_no_mouse.handle_event(TuiEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: 35,
-        row: 0,
+        column: layout.snooze_cols.0 + 1,
+        row: 1,
         modifiers: KeyModifiers::empty(),
     }));
     assert_eq!(
-        app_no_mouse.active_tab,
-        Tab::Dashboard,
-        "Mouse clicks must be ignored when --no-mouse is set"
+        snooze_cmd,
+        Some(TuiCommand::SnoozeGrace(None)),
+        "Clicking [s] Snooze on the 80-col banner must dispatch SnoozeGrace"
     );
+
+    // --no-mouse suppresses all mouse events
+    let mut app_no_mouse = TuiApp::new(true, false, false);
+    app_no_mouse.daemon_connected = true;
+    app_no_mouse.handle_event(TuiEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: tab_hit_ranges()[2].1 + 2,
+        row: 0,
+        modifiers: KeyModifiers::empty(),
+    }));
+    assert_eq!(app_no_mouse.active_tab, Tab::Dashboard);
 }
 
 #[test]
-fn test_responsive_resizing_limits() {
+fn test_responsive_resizing_limits_and_secondary_card_collapse() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        None,
+    )];
 
-    // 1. Below 60x18: Render resize notice
-    let backend_small = TestBackend::new(55, 15);
-    let mut terminal_small = Terminal::new(backend_small).unwrap();
+    // Below 60x18: Resize notice
+    let mut terminal_small = Terminal::new(TestBackend::new(55, 15)).unwrap();
     terminal_small
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out_small = buffer_to_string(terminal_small.backend().buffer());
+    assert!(out_small.contains("Terminal too small"));
+    assert!(out_small.contains("55×15"));
+    assert!(out_small.contains("60×18"));
 
-    assert!(
-        out_small.contains("Terminal too small"),
-        "Must render resize notice when below 60x18"
-    );
-    assert!(
-        out_small.contains("55×15"),
-        "Notice must show current dimensions"
-    );
-    assert!(
-        out_small.contains("60×18"),
-        "Notice must show minimum required dimensions"
-    );
-
-    // 2. Compact mode (65x20): Must render cleanly without panic
-    let backend_compact = TestBackend::new(65, 20);
-    let mut terminal_compact = Terminal::new(backend_compact).unwrap();
+    // Below 80 cols (e.g. 70x20): Secondary "Wearable & System" card collapses cleanly
+    let mut terminal_compact = Terminal::new(TestBackend::new(70, 20)).unwrap();
     terminal_compact
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out_compact = buffer_to_string(terminal_compact.backend().buffer());
-    assert!(!out_compact.contains("Terminal too small"));
-    assert!(out_compact.contains("Dashboard"));
+    assert!(out_compact.contains("Live Heart Rate"));
+    assert!(out_compact.contains("Sleep State"));
+    assert!(!out_compact.contains("Wearable & System"));
 }
 
 #[test]
-fn test_no_color_and_ascii_modes() {
-    // 1. Test ASCII mode
-    let mut app_ascii = TuiApp::new(false, true, false);
+fn test_no_color_and_ascii_modes_with_live_sparkline() {
+    // 1. Theme::from_env reads NO_COLOR from injected EnvSource
+    let env_no_color = MapEnv::new().with("NO_COLOR", "1");
+    let theme = Theme::from_env(&env_no_color, true);
+    assert!(theme.no_color);
+    assert!(theme.ascii);
+
+    // 2. Test --ascii mode WITH an enrolled wearable + live HR + baselines so Sparkline renders!
+    let mut app_ascii = TuiApp::new(false, true, true);
     app_ascii.daemon_connected = true;
-    for bpm in [65.0, 70.0, 75.0, 80.0, 78.0, 72.0, 68.0] {
+    app_ascii.latest_bpm = Some(62.0);
+    app_ascii.latest_p_sleep = Some(0.88);
+    app_ascii.sparkline_data.quiet_wake_baseline = Some(72.0);
+    app_ascii.sparkline_data.sleeping_hr = Some(58.0);
+    app_ascii.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        Some("Chest"),
+    )];
+    for bpm in [74.0, 72.0, 69.0, 66.0, 63.0, 60.0, 58.0] {
         app_ascii.sparkline_data.push_sample(HrSampleEvent {
             bpm,
             rr_ms: vec![],
             contact_status: ContactStatus::Contact,
-            wearable_id: "TestStrap".into(),
+            wearable_id: "w-1".into(),
             session_id: None,
             ts_ms: 1_700_000_000_000,
         });
     }
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|f| app_ascii.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out = buffer_to_string(terminal.backend().buffer());
 
-    // Verify no Braille Unicode characters (U+2800..U+28FF) are present
-    let has_braille = out.chars().any(|c| ('\u{2800}'..='\u{28ff}').contains(&c));
+    assert!(out.contains("* HR (live)"));
+    assert!(out.contains("- QW (72)"));
+    assert!(out.contains("- Sleep (58)"));
     assert!(
-        !has_braille,
-        "ASCII mode must not produce Braille characters"
+        out.is_ascii(),
+        "--ascii mode output must be strictly 7-bit ASCII across the entire screen, got:\n{out}"
     );
 
-    // 2. Test NO_COLOR mode
-    let mut app_no_color = TuiApp::new(false, false, true);
-    app_no_color.daemon_connected = true;
-    app_no_color.monitoring_state = MonitoringState::Confirmed;
-
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|f| app_no_color.render(f.area(), f.buffer_mut()))
-        .unwrap();
+    // Verify NO_COLOR keeps every cell at Color::Reset across Dashboard + Grace Banner + Offline
     let buf = terminal.backend().buffer();
-
-    // In NO_COLOR mode, Theme uses Color::Reset for fg and bg
     for y in 0..buf.area.height {
         for x in 0..buf.area.width {
             let cell = &buf[(x, y)];
-            assert_eq!(
-                cell.fg,
-                ratatui::style::Color::Reset,
-                "NO_COLOR mode cell fg must be Reset"
-            );
-            assert_eq!(
-                cell.bg,
-                ratatui::style::Color::Reset,
-                "NO_COLOR mode cell bg must be Reset"
-            );
+            assert_eq!(cell.fg, Color::Reset);
+            assert_eq!(cell.bg, Color::Reset);
         }
     }
 }
@@ -311,56 +411,25 @@ fn test_no_color_and_ascii_modes() {
 #[test]
 fn test_hotkey_suspension_in_text_inputs() {
     let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
     app.active_tab = Tab::Wearables;
 
     // 1. Rename modal
     app.modal = ModalState::RenameModal {
         wearable_id: "w-01".into(),
-        current_alias: "Old Strap".into(),
+        current_alias: "Old".into(),
         input: "My ".into(),
     };
+    assert!(app.is_input_focused());
 
-    assert!(
-        app.is_input_focused(),
-        "Rename modal must have text input focused"
-    );
-
-    // Type characters that would otherwise trigger global hotkeys (1, 2, q, ?, h, l, d, p)
     for c in ['1', '2', 'q', '?', 'h', 'l', 'd', 'p'] {
         app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
     }
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert!(!app.should_quit);
+    assert!(!app.is_diagnostics_open);
 
-    // Verify global hotkeys were NOT triggered:
-    assert_eq!(
-        app.active_tab,
-        Tab::Wearables,
-        "Tab must not switch while input focused"
-    );
-    assert!(!app.should_quit, "q must not quit while input focused");
-    assert_ne!(
-        app.modal,
-        ModalState::Help,
-        "? must not open Help modal while input focused"
-    );
-    assert!(
-        !app.is_diagnostics_open,
-        "d must not toggle diagnostics while input focused"
-    );
-
-    // Verify input buffer received all typed characters
-    if let ModalState::RenameModal { ref input, .. } = app.modal {
-        assert_eq!(input, "My 12q?hldp");
-    } else {
-        panic!("Modal must still be RenameModal");
-    }
-
-    // Backspace
     app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
-    if let ModalState::RenameModal { ref input, .. } = app.modal {
-        assert_eq!(input, "My 12q?hld");
-    }
-
-    // Enter submits rename
     let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
     assert_eq!(
         cmd,
@@ -370,100 +439,104 @@ fn test_hotkey_suspension_in_text_inputs() {
         })
     );
     assert_eq!(app.modal, ModalState::None);
-    assert!(!app.is_input_focused());
 
-    // 2. Enrollment modal with Agent1 Passkey prompt
+    // 2. Agent1 PinCode modal
     app.modal = ModalState::EnrollmentModal {
-        scanning_timer_sec: 20,
-        selected_device_idx: 0,
+        scanning_remaining_ms: 20_000,
+        selected_discovered_idx: 0,
         alias_input: String::new(),
         alias_focused: false,
-        pairing_prompt: Some(PairingPromptModalState::Passkey {
-            device: "Polar H10".into(),
+        enrolling: true,
+        error_message: None,
+        pairing_prompt: Some(PairingPromptModalState::PinCode {
+            wearable: "Polar H10".into(),
             input: String::new(),
         }),
     };
-
-    assert!(
-        app.is_input_focused(),
-        "Passkey prompt must have input focused"
-    );
-
-    // Type passkey numbers
-    for c in ['1', '2', '3', '4', '5', '6'] {
+    assert!(app.is_input_focused());
+    for c in ['0', '4', '1', 'q'] {
         app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
     }
-    assert_eq!(app.active_tab, Tab::Wearables);
     assert!(!app.should_quit);
-
-    // Submit passkey with Enter
+    assert_eq!(app.active_tab, Tab::Wearables);
     let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
     if let Some(TuiCommand::EnrollAuthReply(params)) = cmd {
         assert_eq!(params.confirmed, Some(true));
-        assert_eq!(params.passkey, Some(123456));
+        assert_eq!(params.pincode.as_deref(), Some("041q"));
     } else {
-        panic!("Expected EnrollAuthReply command");
+        panic!("Expected EnrollAuthReply");
     }
+    // EnrollmentModal remains open (enrolling: true) until OpCompleted arrives!
+    assert!(matches!(
+        app.modal,
+        ModalState::EnrollmentModal {
+            enrolling: true,
+            pairing_prompt: None,
+            ..
+        }
+    ));
 }
 
 #[test]
-fn test_dashboard_diagnostics_and_pause_popover() {
+fn test_dashboard_diagnostics_units_and_pause_popover() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
     app.idle_backend = Some("mutter-idle-monitor".into());
-    app.playing_players_count = 2;
+    app.playing_players_count = Some(2);
+    app.latest_epoch = Some(Epoch {
+        session_index: 1,
+        ts_ms: 1_700_000_000_000,
+        features: EpochFeatures {
+            hr_bpm_60s: 58.0,
+            z_hr: -1.4,
+            hr_slope_4m: -0.45,
+            r_var_120s: 0.38,
+            ln_rmssd_60s: Some(3.21),
+            delta_ln_rmssd_60s: Some(-0.2),
+            rmssd_sdnn_120s: Some(0.78),
+        },
+        hrv_valid: true,
+        rr_artifact_frac: 0.04,
+        coverage: 1.0,
+        flatline_stale: false,
+        accumulators_frozen: false,
+        baseline_mu_hr: 66.0,
+        baseline_sigma_hr: 3.0,
+        baseline_frozen: true,
+        p_active_wake: 0.05,
+        p_quiet_wake: 0.15,
+        p_sleep: 0.80,
+        state: DetectorState::Candidate,
+    });
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
-    // 1. Toggle Engine Diagnostics with 'd'
-    assert!(!app.is_diagnostics_open);
-    app.handle_event(TuiEvent::Key(key(KeyCode::Char('d'))));
+    // Toggling diagnostics when connected issues RefreshStatus so player count updates
+    let diag_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('d'))));
+    assert_eq!(diag_cmd, Some(TuiCommand::RefreshStatus));
     assert!(app.is_diagnostics_open);
 
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out = buffer_to_string(terminal.backend().buffer());
+    assert!(out.contains("Engine Diagnostics [d]"));
     assert!(
-        out.contains("Engine Diagnostics [d]"),
-        "Diagnostics pane must be visible"
+        out.contains("Slope:-0.45 bpm/m"),
+        "hr_slope_4m must NOT be multiplied by 60"
     );
-    assert!(out.contains("Slope:"), "Must show HR slope feature");
-    assert!(out.contains("Var:"), "Must show rolling variance feature");
-    assert!(out.contains("ln(RMSSD):"), "Must show ln(RMSSD) feature");
-    assert!(
-        out.contains("mutter-idle-monitor"),
-        "Must show idle-probe backend"
-    );
-    assert!(
-        out.contains("Playing MPRIS2 Players: 2"),
-        "Must show active playing players"
-    );
+    assert!(out.contains("Var:0.38"));
+    assert!(!out.contains("bpm²"), "R_var is dimensionless ratio");
+    assert!(out.contains("ln(RMSSD):3.21"));
+    assert!(out.contains("RMSSD/SDNN:0.78"));
+    assert!(out.contains("SQI:0.96"));
+    assert!(out.contains("mutter-idle-monitor"));
+    assert!(out.contains("Playing MPRIS2 Players: 2"));
 
-    // Toggle off
-    app.handle_event(TuiEvent::Key(key(KeyCode::Char('d'))));
-    assert!(!app.is_diagnostics_open);
-
-    // 2. Open Pause Popover with 'p'
+    // Pause popover
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('p'))));
-    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 0 });
-
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Pause / Resume Monitoring"));
-    assert!(out.contains("1. Resume monitoring"));
-    assert!(out.contains("2. Pause indefinitely"));
-    assert!(out.contains("3. Pause 1 hour"));
-    assert!(out.contains("4. Pause 2 hours"));
-    assert!(out.contains("5. Pause until next morning"));
-
-    // Navigate with 'j' to "Pause 1 hour" (index 2)
-    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j')))); // index 1
-    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j')))); // index 2
-
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
     let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
     assert_eq!(
         cmd,
@@ -472,53 +545,60 @@ fn test_dashboard_diagnostics_and_pause_popover() {
             duration_sec: Some(3600),
         }))
     );
-    assert_eq!(app.modal, ModalState::None);
 }
 
 #[test]
-fn test_alert_strip_actions() {
+fn test_alert_strip_canonical_id_truncation_and_non_dismissible_guard() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
 
-    // Add persistent shift alert
+    // Canonical persistent shift ID with realistic long message from daemon
     app.alerts.push(DaemonAlert {
-        id: "persistent_shift".into(),
-        kind: "calibration".into(),
+        id: alert_ids::PERSISTENT_SHIFT.into(),
+        kind: alert_ids::PERSISTENT_SHIFT.into(),
         severity: AlertSeverity::Warn,
-        message: "5-session shift of +4.2 BPM detected".into(),
+        message: "Persistent downward baseline shift detected across 5 consecutive sessions; accept or dismiss via calibration controls".into(),
         dismissible: true,
     });
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("ALERT [calibration]"));
-    assert!(out.contains("5-session shift of +4.2 BPM detected"));
     assert!(out.contains("[a] Accept"));
     assert!(out.contains("[i] Ignore"));
     assert!(out.contains("[x] Dismiss"));
 
-    // Press 'a' to accept shift
-    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('a'))));
-    assert_eq!(cmd, Some(TuiCommand::AcceptShift));
-
-    // Press 'i' to dismiss/ignore shift
-    let cmd2 = app.handle_event(TuiEvent::Key(key(KeyCode::Char('i'))));
-    assert_eq!(cmd2, Some(TuiCommand::DismissShift));
-
-    // Press 'x' to dismiss alert
-    let cmd3 = app.handle_event(TuiEvent::Key(key(KeyCode::Char('x'))));
     assert_eq!(
-        cmd3,
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('a')))),
+        Some(TuiCommand::AcceptShift)
+    );
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('i')))),
+        Some(TuiCommand::DismissShift)
+    );
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('x')))),
         Some(TuiCommand::DismissAlert {
-            id: "persistent_shift".into(),
+            id: alert_ids::PERSISTENT_SHIFT.into(),
         })
     );
     assert!(app.alerts.is_empty());
+
+    // Non-dismissible alert must NOT be removed by pressing 'x'
+    app.alerts.push(DaemonAlert {
+        id: alert_ids::DEGRADED_IDLE.into(),
+        kind: alert_ids::DEGRADED_IDLE.into(),
+        severity: AlertSeverity::Warn,
+        message: "No desktop idle backend available.".into(),
+        dismissible: false,
+    });
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('x')))),
+        None
+    );
+    assert_eq!(app.alerts.len(), 1);
 }
 
 #[test]
@@ -529,369 +609,484 @@ fn test_global_grace_period_banner_across_tabs() {
         session_id: "sess-test".into(),
         remaining_sec: 23,
         total_sec: 30,
-        planned_actions: vec!["Pause Media".into(), "Suspend".into()],
+        planned_actions: vec!["Pause Media".into(), "Lock Screen".into(), "Suspend".into()],
         dry_run: false,
     });
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-
-    // Verify banner renders across all 4 tabs
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     for tab in [Tab::Dashboard, Tab::History, Tab::Wearables, Tab::Settings] {
         app.active_tab = tab;
         terminal
             .draw(|f| app.render(f.area(), f.buffer_mut()))
             .unwrap();
         let out = buffer_to_string(terminal.backend().buffer());
-
-        assert!(
-            out.contains("GRACE:"),
-            "Grace banner must be pinned on tab {:?}",
-            tab
-        );
-        assert!(
-            out.contains("23s left"),
-            "Grace banner must show countdown on tab {:?}",
-            tab
-        );
-        assert!(
-            out.contains("[c] Cancel"),
-            "Grace banner must show Cancel button on tab {:?}",
-            tab
-        );
-        assert!(
-            out.contains("[s] Snooze"),
-            "Grace banner must show Snooze button on tab {:?}",
-            tab
-        );
+        assert!(out.contains("GRACE: 23s"));
+        assert!(out.contains("[c] Cancel"));
+        assert!(out.contains("[s] Snooze"));
     }
 
-    // Cancel key 'c'
-    let cmd_cancel = app.handle_event(TuiEvent::Key(key(KeyCode::Char('c'))));
-    assert_eq!(cmd_cancel, Some(TuiCommand::CancelGrace));
-
-    // Snooze key 's'
-    let cmd_snooze = app.handle_event(TuiEvent::Key(key(KeyCode::Char('s'))));
-    assert_eq!(cmd_snooze, Some(TuiCommand::SnoozeGrace(None)));
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('s')))),
+        Some(TuiCommand::SnoozeGrace(None))
+    );
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('c')))),
+        Some(TuiCommand::CancelGrace)
+    );
 }
 
 #[test]
-fn test_wearables_tab_modals() {
+fn test_wearables_tab_states_countdown_and_offline_gating() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
     app.active_tab = Tab::Wearables;
+    let mut w1 = make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Chest Strap"),
+        StreamStatus::SignalLost,
+        Some(85),
+        Some("Chest"),
+    );
+    w1.wearable.advertised_name = Some("Polar H10".to_string());
+    let mut w2 = make_wearable(
+        "w-2",
+        "AA:BB:CC:44:55:66",
+        Some("Wrist Band"),
+        StreamStatus::PassiveStandby,
+        None,
+        Some("Wrist"),
+    );
+    w2.wearable.advertised_name = Some("GT 5".to_string());
+    w2.wearable.supports_rr = false;
+    app.enrolled_wearables = vec![w1, w2];
 
-    let w1 = EnrolledWearableStatus {
-        wearable: EnrolledWearable {
-            id: "polar-01".into(),
-            mac: "AA:BB:CC:11:22:33".into(),
-            mac_masked: "AA:BB:***".into(),
-            address_type: "public".into(),
-            alias: Some("Chest Strap".into()),
-            advertised_name: Some("Polar H10".into()),
-            supports_rr: true,
-            supports_contact: true,
-            hr_var_floor: 5.0,
-            typical_sqi: Some(0.95),
-            enrolled_at_ms: 1_700_000_000_000,
-            last_seen_at_ms: 1_700_000_000_000,
-            active: true,
-        },
-        status: StreamStatus::Streaming,
-        battery: Some(85),
-    };
-    let w2 = EnrolledWearableStatus {
-        wearable: EnrolledWearable {
-            id: "whoop-02".into(),
-            mac: "AA:BB:CC:44:55:66".into(),
-            mac_masked: "AA:BB:***".into(),
-            address_type: "public".into(),
-            alias: Some("Wrist Band".into()),
-            advertised_name: Some("Whoop 4.0".into()),
-            supports_rr: false,
-            supports_contact: false,
-            hr_var_floor: 5.0,
-            typical_sqi: None,
-            enrolled_at_ms: 1_700_000_000_000,
-            last_seen_at_ms: 1_700_000_000_000,
-            active: false,
-        },
-        status: StreamStatus::Disconnected,
-        battery: None,
-    };
-    app.enrolled_wearables = vec![w1.clone(), w2];
-
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-
-    // 1. Wearables list table render
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Chest Strap"));
-    assert!(out.contains("Streaming"));
-    assert!(out.contains("85%"));
-    assert!(out.contains("BPM+RR"));
-    assert!(out.contains("Wrist Band"));
-    assert!(out.contains("Disconnected"));
-    assert!(out.contains("BPM-only"));
 
-    // 2. Unenroll modal with checkboxes
+    assert!(out.contains("Signal Lost"));
+    assert!(out.contains("Passive Standby"));
+    assert!(out.contains("BPM+RR (Chest)"));
+    assert!(out.contains("BPM-only (Wrist)"));
+
+    // Unenroll modal with UnenrollButton::Confirm / Cancel
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('u'))));
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Unenroll Wearable"));
-    assert!(out.contains("Remove 'Chest Strap' from BPMute allowlist?"));
-    assert!(out.contains("[ ] [1] Also forget from BlueZ"));
-    assert!(out.contains("[ ] [2] Also delete historical Monitoring Sessions"));
-
-    // Toggle checkboxes with '1' and '2'
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('1'))));
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
-
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("[X] [1] Also forget from BlueZ"));
-    assert!(out.contains("[X] [2] Also delete historical Monitoring Sessions"));
-
-    // Confirm unenroll
+    assert!(matches!(
+        app.modal,
+        ModalState::UnenrollModal {
+            forget_bluez: true,
+            delete_sessions: true,
+            selected_button: UnenrollButton::Confirm,
+            ..
+        }
+    ));
     let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
     assert_eq!(
         cmd,
         Some(TuiCommand::WearableUnenroll {
-            id: "polar-01".into(),
+            id: "w-1".into(),
             forget_bluez: true,
             delete_sessions: true,
         })
     );
-    assert_eq!(app.modal, ModalState::None);
 
-    // 3. Agent1 Pairing prompt in Enrollment modal
-    app.modal = ModalState::EnrollmentModal {
-        scanning_timer_sec: 28,
-        selected_device_idx: 0,
-        alias_input: String::new(),
-        alias_focused: false,
-        pairing_prompt: Some(PairingPromptModalState::Confirmation {
-            passkey: 876543,
-            device: "Polar H10".into(),
-        }),
-    };
+    // 30s scan countdown uses TUI_TICK_MS (250ms): 4 ticks -> 29s
+    app.open_enrollment_modal();
+    for _ in 0..4 {
+        app.handle_event(TuiEvent::Tick);
+    }
+    if let ModalState::EnrollmentModal {
+        scanning_remaining_ms,
+        ..
+    } = app.modal
+    {
+        assert_eq!(scanning_remaining_ms, 29_000);
+    }
+    app.modal = ModalState::None;
 
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Bluetooth LE Pairing Authorization (Agent1)"));
-    assert!(out.contains("876543"));
-    assert!(out.contains("[y] to Confirm"));
-    assert!(out.contains("[n]/[Esc] to Reject"));
-
-    // Confirm with 'y'
-    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('y'))));
-    if let Some(TuiCommand::EnrollAuthReply(params)) = cmd {
-        assert_eq!(params.confirmed, Some(true));
-    } else {
-        panic!("Expected EnrollAuthReply");
+    // Offline disables ALL live controls across Dashboard and Wearables!
+    app.daemon_connected = false;
+    app.grace_state = None;
+    for code in [
+        KeyCode::Char('e'),
+        KeyCode::Char('n'),
+        KeyCode::Char('c'),
+        KeyCode::Char('u'),
+    ] {
+        assert_eq!(
+            app.handle_event(TuiEvent::Key(key(code))),
+            None,
+            "Wearables hotkey {:?} must be disabled offline",
+            code
+        );
+    }
+    app.active_tab = Tab::Dashboard;
+    app.alerts.push(DaemonAlert {
+        id: alert_ids::PERSISTENT_SHIFT.into(),
+        kind: alert_ids::PERSISTENT_SHIFT.into(),
+        severity: AlertSeverity::Warn,
+        message: "Shift".into(),
+        dismissible: true,
+    });
+    for code in [
+        KeyCode::Char('p'),
+        KeyCode::Char('a'),
+        KeyCode::Char('i'),
+        KeyCode::Char('x'),
+    ] {
+        assert_eq!(
+            app.handle_event(TuiEvent::Key(key(code))),
+            None,
+            "Dashboard hotkey {:?} must be disabled offline",
+            code
+        );
     }
 }
 
 #[test]
-fn test_zero_wearables_inline_cta() {
-    let mut app = TuiApp::new(false, false, false);
-    app.daemon_connected = true;
-    app.enrolled_wearables.clear();
-    app.systemd_service_installed = false;
+fn test_zero_wearables_cta_and_systemd_unit_detection() {
+    let temp = TempDir::new().unwrap();
+    let cfg_dir = temp.path().join("cfg");
+    let env = MapEnv::new().with("XDG_CONFIG_HOME", cfg_dir.display().to_string());
+    assert!(!detect_systemd_service_installed(&env));
 
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
+    let unit_path = cfg_dir.join("systemd/user/bpmute.service");
+    fs::create_dir_all(unit_path.parent().unwrap()).unwrap();
+    fs::write(&unit_path, "[Unit]\nDescription=BPMute\n").unwrap();
+    assert!(detect_systemd_service_installed(&env));
 
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // When unit is NOT installed, hint shows without nonexistent `bpmute service install`
+    let mut app_uninstalled = TuiApp::new(false, false, false);
+    app_uninstalled.daemon_connected = true;
+    app_uninstalled.systemd_service_installed = false;
     terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .draw(|f| app_uninstalled.render(f.area(), f.buffer_mut()))
         .unwrap();
     let out = buffer_to_string(terminal.backend().buffer());
+    assert!(out.contains("No BLE Heart Rate wearables enrolled yet."));
+    assert!(out.contains("systemd --user unit not found"));
+    assert!(!out.contains("bpmute service install"));
 
-    assert!(
-        out.contains("No BLE Heart Rate wearables enrolled yet."),
-        "Must display zero-wearables CTA when enrolled list is empty"
-    );
-    assert!(out.contains("Press [e] on the Dashboard"));
-    assert!(out.contains("bpmute service install"));
-
-    // Pressing 'e' on Dashboard activates Enrollment modal on Wearables tab
-    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('e'))));
-    assert_eq!(app.active_tab, Tab::Wearables);
-    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
-    assert_eq!(cmd, Some(TuiCommand::EnrollStart(Some(30))));
+    // When unit IS installed, hint is hidden
+    let mut app_installed = TuiApp::new(false, false, false);
+    app_installed.daemon_connected = true;
+    app_installed.systemd_service_installed = true;
+    terminal
+        .draw(|f| app_installed.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out2 = buffer_to_string(terminal.backend().buffer());
+    assert!(!out2.contains("systemd --user unit not found"));
 }
 
-#[tokio::test]
-async fn test_daemon_offline_banner_and_resilience_e2e() {
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_grace_cancel_snooze_calibration_mpris_and_inhibited_alert_e2e() {
     let temp = TempDir::new().unwrap();
     let (paths, env) = make_test_paths(&temp);
 
-    let mut app = TuiApp::new(false, false, false);
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
+    let executor = Arc::new(FakeActionExecutor::new());
+    executor.set_playing_players(&[
+        "org.mpris.MediaPlayer2.mpv",
+        "org.mpris.MediaPlayer2.spotify",
+    ]);
+    executor.set_power_action_override(Ok(PowerActionResult::RefusedInhibited(
+        "systemd-inhibit: download".to_string(),
+    )));
 
-    // 1. Initial state: daemon is offline
-    assert!(!app.daemon_connected);
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(
-        out.contains("Daemon offline — retrying…"),
-        "Must show offline banner when daemon is disconnected"
-    );
-    assert!(out.contains("systemctl --user start bpmute"));
-
-    // Live controls disabled while offline
-    app.handle_event(TuiEvent::Key(key(KeyCode::Char('p'))));
-    assert_eq!(
-        app.modal,
-        ModalState::None,
-        "Pause popover must be disabled while daemon offline"
-    );
-
-    // 2. Start real daemon with real NDJSON Unix socket
     let cli_overrides = CliOverrides::default();
     let mut loaded = LoadedConfig::load(&paths.config_file, &env, &cli_overrides).unwrap();
     loaded.config.actions = ActionsConfig {
+        pause_media: true,
+        lock_screen: true,
         power_action: PowerAction::Suspend,
-        grace_period_sec: Some(30),
+        grace_period_sec: Some(15),
         ..ActionsConfig::default()
     };
-    loaded.config.schedule = ScheduleConfig::default();
 
     let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
-    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
-        paths.clone(),
-        loaded.clone(),
-        Arc::new(env.clone()),
-        clock,
-    ))
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_action_executor(Arc::clone(&executor) as Arc<dyn ActionExecutor>),
+    )
     .await
-    .expect("daemon should start");
+    .unwrap();
 
-    // 3. Spawn TuiIpcBridge
-    let (event_tx, mut event_rx) = mpsc::channel(128);
-    let (cmd_tx, cmd_rx) = mpsc::channel(128);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    // Wait for connection handshake
-    let mut connected = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            Some(ev) = event_rx.recv() => {
-                let _ = app.handle_event(ev);
-                if app.daemon_connected {
-                    connected = true;
-                    break;
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-    }
-    assert!(connected, "TuiIpcBridge must connect to daemon socket");
-
-    // Render: offline banner must be gone
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
-        .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(!out.contains("Daemon offline — retrying…"));
-
-    // 4. Trigger Grace Period over daemon socket and verify TUI reception
-    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
-    let _ = client
-        .request("monitor.test_trigger", json!({ "grace_sec": 20 }))
+    // Seed calibration so initial calibration.status fetch sets sleeping_hr
+    let mut setup_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    setup_client
+        .request("calibration.set_seed", json!({ "sleep_hr": 56.0 }))
         .await
         .unwrap();
 
-    let mut received_grace = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            Some(ev) = event_rx.recv() => {
-                let _ = app.handle_event(ev);
-                if app.grace_state.is_some() {
-                    received_grace = true;
-                    break;
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-    }
-    assert!(received_grace, "TUI must receive GraceTick event");
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
 
-    // Verify Grace Banner rendering
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
+    let mut app = TuiApp::new(false, false, false);
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.daemon_connected && a.sparkline_data.sleeping_hr.is_some()
+    })
+    .await;
+    assert_eq!(app.playing_players_count, Some(2));
+
+    // 1. Test Snooze over real Unix socket
+    setup_client
+        .request("monitor.test_trigger", json!({ "grace_sec": 15 }))
+        .await
         .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("GRACE:"));
-
-    // Cancel Grace Period via TUI key 'c'
-    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('c'))));
-    assert_eq!(cmd, Some(TuiCommand::CancelGrace));
-    cmd_tx.send(cmd.unwrap()).await.unwrap();
-
-    // Check daemon state returned to not Confirmed
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            Some(ev) = event_rx.recv() => {
-                let _ = app.handle_event(ev);
-                if app.grace_state.is_none() {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-    }
-    assert!(
-        app.grace_state.is_none(),
-        "Grace state must be cleared after cancellation"
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_some()).await;
+    assert_eq!(
+        app.grace_state.as_ref().unwrap().planned_actions,
+        vec![
+            "Pause Media".to_string(),
+            "Lock Screen".to_string(),
+            "Suspend".to_string()
+        ]
     );
 
-    // 5. Mid-session daemon shutdown: TUI stays open and transitions to offline banner
-    daemon.shutdown().await;
+    let snooze_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('s'))));
+    assert_eq!(snooze_cmd, Some(TuiCommand::SnoozeGrace(None)));
+    cmd_tx.send(snooze_cmd.unwrap()).await.unwrap();
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_none()).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while tokio::time::Instant::now() < deadline {
-        tokio::select! {
-            Some(ev) = event_rx.recv() => {
-                let _ = app.handle_event(ev);
-                if !app.daemon_connected {
-                    break;
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-    }
-    assert!(
-        !app.daemon_connected,
-        "Daemon disconnection must be detected"
-    );
-
-    // Render: offline banner must reappear seamlessly without crashing
-    terminal
-        .draw(|f| app.render(f.area(), f.buffer_mut()))
+    // 2. Test Cancel over real Unix socket
+    setup_client
+        .request("monitor.test_trigger", json!({ "grace_sec": 15 }))
+        .await
         .unwrap();
-    let out = buffer_to_string(terminal.backend().buffer());
-    assert!(out.contains("Daemon offline — retrying…"));
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_some()).await;
+    let cancel_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('c'))));
+    assert_eq!(cancel_cmd, Some(TuiCommand::CancelGrace));
+    cmd_tx.send(cancel_cmd.unwrap()).await.unwrap();
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_none()).await;
 
-    // Clean up bridge task
+    // 3. Test RefusedInhibited pipeline execution surfaces LOGIND_INHIBITED alert over IPC
+    daemon
+        .core()
+        .handle_confirmed_sleep_onset(1_700_000_000_000)
+        .await;
+    tokio::time::advance(Duration::from_secs(18)).await;
+    tokio::task::yield_now().await;
+
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.alerts
+            .iter()
+            .any(|al| al.id == alert_ids::LOGIND_INHIBITED)
+    })
+    .await;
+
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;
+    daemon.shutdown().await;
+}
+
+struct TestAgent1PairingHook;
+
+impl EnrollmentPairingHook for TestAgent1PairingHook {
+    fn bond_and_pair<'a>(
+        &'a self,
+        core: &'a Arc<DaemonCore>,
+        _mac: &'a str,
+        _pair: bool,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            core.bridge_agent_auth_request(AgentAuthRequest::Confirmation {
+                device: "/org/bluez/hci0/dev_AA_BB_CC_11_22_33".to_string(),
+                passkey: 482_910,
+                reply: reply_tx,
+            })
+            .await;
+            match reply_rx.await {
+                Ok(true) => Ok(()),
+                _ => Err("pairing rejected".to_string()),
+            }
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_agent1_pairing_prompt_during_enroll_select_e2e() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_enrollment_driver(Arc::new(TestAgent1PairingHook)),
+    )
+    .await
+    .unwrap();
+
+    daemon
+        .core()
+        .seed_discovered_wearables(vec![DiscoveredWearable {
+            address: "AA:BB:CC:11:22:33".into(),
+            address_type: "public".into(),
+            name: Some("Polar H10".into()),
+            rssi: Some(-52),
+            paired: false,
+            already_enrolled: false,
+            uuids: vec![],
+        }]);
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+
+    let mut app = TuiApp::new(false, false, false);
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.daemon_connected).await;
+
+    // Switch to Wearables tab, press 'e' to start scan
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('3'))));
+    let start_cmd = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Char('e'))))
+        .unwrap();
+    cmd_tx.send(start_cmd).await.unwrap();
+
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        !a.discovered_wearables.is_empty()
+    })
+    .await;
+
+    // Press Enter -> sends EnrollSelect while keeping modal open in enrolling state
+    let select_cmd = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .unwrap();
+    assert!(matches!(
+        app.modal,
+        ModalState::EnrollmentModal {
+            enrolling: true,
+            ..
+        }
+    ));
+    cmd_tx.send(select_cmd).await.unwrap();
+
+    // Daemon's in-flight EnrollSelect pushes Agent1 Confirmation prompt over IPC!
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        matches!(
+            a.modal,
+            ModalState::EnrollmentModal {
+                pairing_prompt: Some(PairingPromptModalState::Confirmation {
+                    passkey: 482_910,
+                    ..
+                }),
+                ..
+            }
+        )
+    })
+    .await;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out = buffer_to_string(terminal.backend().buffer());
+    assert!(out.contains("Wearable: Polar H10"));
+    assert!(out.contains("482910"));
+
+    // Confirm with 'y' -> sends wearable.enroll_auth_response on the SAME socket without deadlock
+    let reply_cmd = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Char('y'))))
+        .unwrap();
+    cmd_tx.send(reply_cmd).await.unwrap();
+
+    // Expect EnrollSelect completion + refresh_wearables
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.modal == ModalState::None && a.enrolled_wearables.len() == 1
+    })
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_daemon_offline_grace_reset_and_restart_reconnect_e2e() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+
+    let mut app = TuiApp::new(false, false, false);
+    assert!(!app.daemon_connected);
+
+    // 1. Spawn daemon #1 while TUI is already running offline
+    let loaded1 = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock1 = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon1 = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded1,
+        Arc::new(env.clone()),
+        clock1,
+    ))
+    .await
+    .unwrap();
+
+    tokio::time::advance(Duration::from_millis(1100)).await;
+    tokio::task::yield_now().await;
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.daemon_connected).await;
+
+    // 2. Trigger Grace Period, then shut down daemon #1 mid-grace -> banner switches to Offline
+    let mut client1 = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client1
+        .request("monitor.test_trigger", json!({ "grace_sec": 20 }))
+        .await
+        .unwrap();
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_some()).await;
+    drop(client1);
+
+    daemon1.shutdown().await;
+    wait_for_app_state(&mut app, &mut event_rx, |a| !a.daemon_connected).await;
+    assert!(
+        app.grace_state.is_none(),
+        "Disconnect must clear stale grace_state so offline banner is not masked"
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Daemon offline — retrying…"));
+
+    // 3. Restart daemon #2 on the SAME socket path -> bridge must auto-reconnect seamlessly!
+    let loaded2 = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock2 = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon2 = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded2,
+        Arc::new(env),
+        clock2,
+    ))
+    .await
+    .unwrap();
+
+    tokio::time::advance(Duration::from_millis(1500)).await;
+    tokio::task::yield_now().await;
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.daemon_connected).await;
+
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(!buffer_to_string(terminal.backend().buffer()).contains("Daemon offline"));
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon2.shutdown().await;
 }

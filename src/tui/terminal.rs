@@ -1,5 +1,6 @@
-use std::io::{self, stdout};
+use std::io::{self, IsTerminal, stdout};
 use std::panic;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{
@@ -16,9 +17,30 @@ use tokio::sync::{mpsc, watch};
 
 use super::app::TuiApp;
 use super::client::TuiIpcBridge;
-use super::event::{TuiCommand, TuiEvent};
+use super::event::{TUI_TICK_MS, TuiCommand, TuiEvent};
+use super::theme::Theme;
 use crate::exit_code::ExitCode;
 use crate::paths::{EnvSource, ResolvedPaths};
+
+/// Detects whether a user `bpmute.service` systemd unit is installed in standard unit directories.
+pub fn detect_systemd_service_installed(env: &dyn EnvSource) -> bool {
+    let mut candidates = Vec::new();
+    if let Some(xdg) = env.get("XDG_CONFIG_HOME")
+        && !xdg.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(xdg).join("systemd/user/bpmute.service"));
+    } else if let Some(home) = env.get("HOME")
+        && !home.trim().is_empty()
+    {
+        candidates.push(PathBuf::from(home).join(".config/systemd/user/bpmute.service"));
+    }
+    candidates.push(PathBuf::from("/etc/systemd/user/bpmute.service"));
+    candidates.push(PathBuf::from("/usr/lib/systemd/user/bpmute.service"));
+
+    candidates
+        .iter()
+        .any(|path| path.try_exists().unwrap_or(false))
+}
 
 pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
     paths: ResolvedPaths,
@@ -29,11 +51,7 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
     stderr: &mut WErr,
 ) -> ExitCode {
     // Verify terminal interactive environment
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal()
-        || std::env::var_os("BPMUTE_NON_INTERACTIVE").is_some()
-        || std::env::var_os("CARGO_MANIFEST_DIR").is_some()
-    {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         let _ = writeln!(
             stderr,
             "error: interactive terminal required for TUI (try 'bpmute status' or 'bpmute --help')"
@@ -41,8 +59,9 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
         return ExitCode::UsageOrConfigError;
     }
 
-    let no_color = env.get("NO_COLOR").is_some_and(|v| !v.trim().is_empty());
-    let mut app = TuiApp::new(no_mouse, ascii, no_color);
+    let theme = Theme::from_env(env, ascii);
+    let systemd_installed = detect_systemd_service_installed(env);
+    let mut app = TuiApp::new_with_theme(no_mouse, theme, systemd_installed);
 
     // Terminal setup
     if let Err(err) = enable_raw_mode() {
@@ -87,6 +106,10 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
         }
     };
 
+    if let Ok(size) = terminal.size() {
+        app.last_viewport_width = size.width;
+    }
+
     // IPC client setup
     let (event_tx, mut event_rx) = mpsc::channel::<TuiEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<TuiCommand>(64);
@@ -102,7 +125,7 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
 
     // Event streams
     let mut reader = EventStream::new();
-    let mut tick_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(u64::from(TUI_TICK_MS)));
 
     // Initial render
     let _ = terminal.draw(|f| {

@@ -83,6 +83,13 @@ pub trait ActionExecutor: Send + Sync {
         ignore_players: &'a [String],
     ) -> BoxFuture<'a, Result<bool, ActionError>>;
 
+    /// Counts active non-ignored MPRIS2 players with `PlaybackStatus == "Playing"`
+    /// without sending `Pause()` or causing side effects.
+    fn count_playing_players<'a>(
+        &'a self,
+        ignore_players: &'a [String],
+    ) -> BoxFuture<'a, Result<usize, ActionError>>;
+
     /// Direct `exec` of argv command without a shell, injecting BPMute environment variables
     /// with bounded execution timeout.
     fn run_custom_command<'a>(

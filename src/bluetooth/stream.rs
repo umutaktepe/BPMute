@@ -170,7 +170,12 @@ impl StreamTracker {
                 } else if self.active_mac.as_ref() != Some(&norm)
                     && !self.standby_macs.contains(&norm)
                 {
-                    self.standby_macs.push(norm);
+                    self.standby_macs.push(norm.clone());
+                    actions.push(LifecycleAction::StatusTransition {
+                        mac: norm,
+                        status: StreamStatus::PassiveStandby,
+                        ts_ms,
+                    });
                 }
             }
 
@@ -392,6 +397,7 @@ impl StreamTracker {
             StreamStatus::SignalLost => {
                 // Keep packet timers for 30s check
             }
+            StreamStatus::PassiveStandby => {}
         }
         actions.push(LifecycleAction::StatusTransition {
             mac: norm,

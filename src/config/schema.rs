@@ -481,6 +481,33 @@ impl ActionsConfig {
         })
     }
 
+    /// Returns the ordered Sleep Action Pipeline step labels configured for execution.
+    pub fn planned_pipeline_steps(&self) -> Vec<String> {
+        let mut steps = Vec::new();
+        if self.pause_media {
+            steps.push("Pause Media".to_string());
+        }
+        if self
+            .custom_command
+            .first()
+            .is_some_and(|cmd| !cmd.trim().is_empty())
+        {
+            steps.push("Custom Hook".to_string());
+        }
+        if self.lock_screen {
+            steps.push("Lock Screen".to_string());
+        }
+        match self.power_action {
+            PowerAction::Suspend => steps.push("Suspend".to_string()),
+            PowerAction::Poweroff => steps.push("Power Off".to_string()),
+            PowerAction::None => {}
+        }
+        if steps.is_empty() {
+            steps.push("Notify Only".to_string());
+        }
+        steps
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         if self.ignore_players.iter().any(|p| p.trim().is_empty()) {
             return Err(ConfigError::Validation(

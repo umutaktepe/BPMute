@@ -38,11 +38,11 @@ pub struct Cli {
     pub log_biometrics: bool,
 
     /// Disable mouse capture in the interactive TUI.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub no_mouse: bool,
 
     /// Force ASCII rendering in the interactive TUI instead of Unicode Braille.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pub ascii: bool,
 
     #[command(subcommand)]

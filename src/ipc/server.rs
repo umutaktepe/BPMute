@@ -65,6 +65,7 @@ pub async fn handle_connection(
     });
 
     let mut active_sub_id: Option<u64> = None;
+    let mut op_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
@@ -73,6 +74,7 @@ pub async fn handle_connection(
                     break;
                 }
             }
+            Some(_) = op_tasks.join_next(), if !op_tasks.is_empty() => {}
             line_res = read_bounded_line(&mut reader, MAX_FRAME_BYTES) => {
                 match line_res {
                     Ok(None) => break,
@@ -87,6 +89,7 @@ pub async fn handle_connection(
                             &sub_watch_tx,
                             &mut active_sub_id,
                             client_id,
+                            &mut op_tasks,
                         )
                         .await;
                     }
@@ -119,6 +122,8 @@ pub async fn handle_connection(
         core.broker.unsubscribe(sub_id);
     }
     core.on_client_disconnected(client_id);
+    op_tasks.abort_all();
+    while op_tasks.join_next().await.is_some() {}
     let _ = sub_watch_tx.send(None);
     drop(resp_tx);
     let _ = writer_task.await;
@@ -131,6 +136,7 @@ async fn process_line(
     sub_watch_tx: &watch::Sender<Option<Arc<SubscriberQueue>>>,
     active_sub_id: &mut Option<u64>,
     client_id: u64,
+    op_tasks: &mut tokio::task::JoinSet<()>,
 ) {
     let raw: Value = match serde_json::from_str(line) {
         Ok(val) => val,
@@ -178,6 +184,7 @@ async fn process_line(
             if let Some(old_id) = active_sub_id.take() {
                 core.broker.unsubscribe(old_id);
             }
+            core.refresh_playing_players_count().await;
             let (sub_id, queue, status) = core.subscribe();
             *active_sub_id = Some(sub_id);
 
@@ -204,12 +211,19 @@ async fn process_line(
                 .send(ResponseEnvelope::ok(req.id, json!({ "subscribed": false })))
                 .await;
         }
-        other => {
-            let resp = match core.handle_op(other, req.params, client_id).await {
-                Ok(data) => ResponseEnvelope::ok(req.id, data),
-                Err(err) => ResponseEnvelope::err(req.id, err.code, err.message),
-            };
-            let _ = resp_tx.send(resp).await;
+        op => {
+            let core_cloned = Arc::clone(core);
+            let resp_tx_cloned = resp_tx.clone();
+            let op_owned = op.to_string();
+            let req_id = req.id;
+            let params = req.params;
+            op_tasks.spawn(async move {
+                let resp = match core_cloned.handle_op(&op_owned, params, client_id).await {
+                    Ok(data) => ResponseEnvelope::ok(req_id, data),
+                    Err(err) => ResponseEnvelope::err(req_id, err.code, err.message),
+                };
+                let _ = resp_tx_cloned.send(resp).await;
+            });
         }
     }
 }

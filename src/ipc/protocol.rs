@@ -16,6 +16,15 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum NDJSON line length in bytes (`1 MiB`).
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 
+/// Canonical daemon alert identifiers shared across daemon, IPC, and TUI.
+pub mod alert_ids {
+    pub const CONFIG_RELOAD_FAILED: &str = "config_reload_failed";
+    pub const PERSISTENT_SHIFT: &str = "calibration_persistent_shift";
+    pub const DEGRADED_IDLE: &str = "idle_backend_degraded";
+    pub const INHIBITOR_SENSITIVE: &str = "idle_backend_inhibitor_sensitive";
+    pub const LOGIND_INHIBITED: &str = "logind_inhibited";
+}
+
 /// Standardized IPC error code identifiers (ADR-0002).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -281,6 +290,8 @@ pub struct DaemonStatus {
     pub alerts: Vec<DaemonAlert>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playing_players_count: Option<usize>,
 }
 
 /// Offline `bpmute status --json` payload (ADR-0002, ADR-0009).
@@ -444,6 +455,8 @@ pub struct GraceTickEvent {
     pub total_sec: u32,
     pub power_action: crate::config::PowerAction,
     pub dry_run: bool,
+    #[serde(default)]
+    pub planned_steps: Vec<String>,
 }
 
 /// Control event payload pushed as `EpochUpdate` every 15-second `Epoch`.
@@ -479,13 +492,15 @@ pub struct DiscoveredWearable {
     pub uuids: Vec<String>,
 }
 
-/// Enrolled wearable status including live connectivity and battery percentage.
+/// Enrolled wearable status including live connectivity, battery percentage, and body location.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnrolledWearableStatus {
     #[serde(flatten)]
     pub wearable: EnrolledWearable,
     pub status: StreamStatus,
     pub battery: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_location: Option<String>,
 }
 
 /// Parameters for `wearable.rename`.
@@ -542,36 +557,18 @@ pub struct EnrollAuthResponseParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PairingPrompt {
-    Confirmation { passkey: u32, device: String },
-    Passkey { device: String },
-    PinCode { device: String },
+    Confirmation { passkey: u32, wearable: String },
+    Passkey { wearable: String },
+    PinCode { wearable: String },
 }
 
 /// Control event payload pushed as `EnrollmentUpdate` during active wearable discovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnrollmentUpdateEvent {
-    #[serde(default)]
-    pub devices: Vec<DiscoveredWearable>,
+    #[serde(default, alias = "devices")]
+    pub wearables: Vec<DiscoveredWearable>,
     #[serde(default)]
     pub pairing_prompt: Option<PairingPrompt>,
     #[serde(default)]
     pub remaining_sec: Option<u32>,
-}
-
-/// Reply to an interactive Agent1 pairing prompt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnrollAuthReply {
-    pub confirmed: Option<bool>,
-    pub passkey: Option<u32>,
-    pub pincode: Option<String>,
-}
-
-impl From<EnrollAuthResponseParams> for EnrollAuthReply {
-    fn from(p: EnrollAuthResponseParams) -> Self {
-        Self {
-            confirmed: p.confirmed,
-            passkey: p.passkey,
-            pincode: p.pincode,
-        }
-    }
 }

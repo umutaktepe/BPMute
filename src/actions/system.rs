@@ -189,6 +189,16 @@ impl ActionExecutor for SystemActionExecutor {
         ignore_players: &'a [String],
     ) -> BoxFuture<'a, Result<bool, ActionError>> {
         Box::pin(async move {
+            let count = self.count_playing_players(ignore_players).await?;
+            Ok(count > 0)
+        })
+    }
+
+    fn count_playing_players<'a>(
+        &'a self,
+        ignore_players: &'a [String],
+    ) -> BoxFuture<'a, Result<usize, ActionError>> {
+        Box::pin(async move {
             let conn = match zbus::Connection::session().await {
                 Ok(c) => c,
                 Err(err) => return Err(ActionError::Mpris(format!("session bus error: {err}"))),
@@ -214,7 +224,7 @@ impl ActionExecutor for SystemActionExecutor {
             }
 
             if targets.is_empty() {
-                return Ok(false);
+                return Ok(0);
             }
 
             let mut tasks = Vec::new();
@@ -242,13 +252,14 @@ impl ActionExecutor for SystemActionExecutor {
                 }));
             }
 
+            let mut count = 0_usize;
             for task in tasks {
                 if let Ok(Some(true)) = task.await {
-                    return Ok(true);
+                    count += 1;
                 }
             }
 
-            Ok(false)
+            Ok(count)
         })
     }
 

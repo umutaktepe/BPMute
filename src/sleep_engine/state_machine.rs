@@ -210,7 +210,7 @@ impl SleepEngine {
                     self.gap_started_ms = Some(ts_ms);
                 }
             }
-            StreamStatus::Connecting | StreamStatus::Acquiring => {}
+            StreamStatus::Connecting | StreamStatus::Acquiring | StreamStatus::PassiveStandby => {}
         }
     }
 

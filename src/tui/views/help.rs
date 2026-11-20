@@ -1,24 +1,18 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::super::app::TuiApp;
+use super::centered_rect;
 
 pub fn render_help(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let modal_w = 68u16.min(area.width.saturating_sub(2));
-    let modal_h = 22u16.min(area.height.saturating_sub(2));
-
-    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
-    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
-    let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
-
+    let modal_area = centered_rect(area, 68, 22);
     Clear.render(modal_area, buf);
 
-    let block = Block::default()
-        .title(" BPMute Keyboard & Mouse Shortcuts [?] ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
+    let block = app
+        .theme
+        .card_block(" BPMute Keyboard & Mouse Shortcuts [?] ")
         .border_style(app.theme.primary());
 
     let inner = block.inner(modal_area);
@@ -28,22 +22,34 @@ pub fn render_help(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let t = |s: &'static str| Span::styled(s, app.theme.base());
     let h = |s: &'static str| Span::styled(s, app.theme.primary());
 
+    let tab_range = if app.theme.ascii { "1-4" } else { "1–4" };
+    let nav_lr = if app.theme.ascii {
+        "h / l, <-/-> "
+    } else {
+        "h / l, ← / → "
+    };
+    let nav_ud = if app.theme.ascii {
+        "j / k, Up/Dn "
+    } else {
+        "j / k, ↑ / ↓ "
+    };
+
     let lines = vec![
         Line::from(vec![h(" Global Navigation:")]),
         Line::from(vec![
             t("   "),
-            k("1–4          "),
-            t("Switch tabs (Dashboard, History, Wearables, Settings)"),
+            k(tab_range),
+            t("          Switch tabs (Dashboard, History, Wearables, Settings)"),
         ]),
         Line::from(vec![
             t("   "),
             k("Tab/Shift+Tab"),
             t(" Next / Previous tab"),
         ]),
-        Line::from(vec![t("   "), k("h / l, ← / → "), t("Next / Previous tab")]),
+        Line::from(vec![t("   "), k(nav_lr), t("Next / Previous tab")]),
         Line::from(vec![
             t("   "),
-            k("j / k, ↑ / ↓ "),
+            k(nav_ud),
             t("Select list items / scroll tables"),
         ]),
         Line::from(vec![
@@ -76,7 +82,7 @@ pub fn render_help(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         Line::from(vec![
             t("   "),
             k("x            "),
-            t("Dismiss top alert banner"),
+            t("Dismiss top dismissible alert"),
         ]),
         Line::from(vec![
             t("   "),

@@ -35,7 +35,9 @@ use crate::storage::{
 };
 
 pub use clock::{DaemonClock, SystemClock, VirtualClock};
-pub use state::{DaemonCore, DaemonCoreInit};
+pub use state::{
+    BluezEnrollmentDriver, DaemonCore, DaemonCoreInit, EnrollmentPairingHook, NoopEnrollmentDriver,
+};
 pub use wearable::{NullWearableSource, WearableDescriptor, WearableEvent, WearableSource};
 
 /// Errors that prevent `bpmute daemon` from starting or binding its socket.
@@ -67,11 +69,12 @@ pub struct DaemonOptions {
     pub action_executor: Option<Arc<dyn ActionExecutor>>,
     pub notifier: Option<Arc<dyn Notifier>>,
     pub idle_probe: Option<Arc<dyn IdleProbe>>,
+    pub enrollment_driver: Option<Arc<dyn EnrollmentPairingHook>>,
 }
 
 impl DaemonOptions {
     /// Constructs [`DaemonOptions`] for hermetic testing with in-memory defaults
-    /// (`NullWearableSource`, `FakeActionExecutor`, `FakeNotifier`, `FakeIdleProbe`, `install_signals = false`).
+    /// (`NullWearableSource`, `FakeActionExecutor`, `FakeNotifier`, `FakeIdleProbe`, `NoopEnrollmentDriver`, `install_signals = false`).
     pub fn for_testing(
         paths: ResolvedPaths,
         loaded_config: LoadedConfig,
@@ -89,6 +92,7 @@ impl DaemonOptions {
             action_executor: None,
             notifier: None,
             idle_probe: None,
+            enrollment_driver: None,
         }
     }
 
@@ -113,6 +117,12 @@ impl DaemonOptions {
     /// Builder helper to attach a custom [`IdleProbe`].
     pub fn with_idle_probe(mut self, idle_probe: Arc<dyn IdleProbe>) -> Self {
         self.idle_probe = Some(idle_probe);
+        self
+    }
+
+    /// Builder helper to attach a custom [`EnrollmentPairingHook`].
+    pub fn with_enrollment_driver(mut self, driver: Arc<dyn EnrollmentPairingHook>) -> Self {
+        self.enrollment_driver = Some(driver);
         self
     }
 
@@ -171,6 +181,9 @@ impl DaemonHandle {
             .idle_probe
             .unwrap_or_else(|| Arc::new(crate::idle::FakeIdleProbe::default()));
         idle_probe.resolve_backend().await;
+        let enrollment_driver = opts
+            .enrollment_driver
+            .unwrap_or_else(|| Arc::new(NoopEnrollmentDriver));
 
         let core = Arc::new(DaemonCore::new(DaemonCoreInit {
             paths: opts.paths,
@@ -185,6 +198,7 @@ impl DaemonHandle {
             action_executor,
             notifier,
             idle_probe,
+            enrollment_driver,
             engine_ctrl_tx: ctrl_tx.clone(),
         }));
 
@@ -369,6 +383,10 @@ impl MonitoringContext {
     async fn handle_wearable_event(&mut self, ev: WearableEvent) {
         match ev {
             WearableEvent::StreamState { wearable, state } => {
+                self.core.set_wearable_status(&wearable.mac, state.status);
+                if state.status == StreamStatus::PassiveStandby {
+                    return;
+                }
                 self.last_event_ts_ms = Some(state.ts_ms);
                 let Some(wearable_id) = self.resolve_wearable(&wearable, state.ts_ms).await else {
                     return;
@@ -382,6 +400,14 @@ impl MonitoringContext {
                 }
                 let outputs = self.engine.handle_event(EngineEvent::StreamState(state));
                 self.process_outputs(&wearable_id, outputs).await;
+            }
+            WearableEvent::Metadata {
+                wearable,
+                battery,
+                body_location,
+            } => {
+                self.core
+                    .set_wearable_metadata(&wearable.mac, battery, body_location);
             }
             WearableEvent::HrPacket { wearable, packet } => {
                 self.last_event_ts_ms = Some(packet.ts_ms);

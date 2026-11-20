@@ -11,9 +11,18 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let mut spans = Vec::new();
     let key_style = app.theme.key_hint();
+    let live_key_style = if app.daemon_connected {
+        key_style
+    } else {
+        app.theme.muted()
+    };
     let text_style = app.theme.base();
+    let live_text_style = if app.daemon_connected {
+        text_style
+    } else {
+        app.theme.muted()
+    };
 
-    // Check if modal is active
     match app.modal {
         ModalState::Help => {
             spans.push(Span::styled("[Esc/?]", key_style));
@@ -30,12 +39,17 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             spans.push(Span::styled(" Cancel  ", text_style));
         }
         ModalState::EnrollmentModal { .. } => {
-            spans.push(Span::styled("[j/k/↑/↓]", key_style));
+            let nav_hint = if app.theme.ascii {
+                "[j/k]"
+            } else {
+                "[j/k/↑/↓]"
+            };
+            spans.push(Span::styled(nav_hint, key_style));
             spans.push(Span::styled(" Select Wearable  ", text_style));
             spans.push(Span::styled("[Enter]", key_style));
             spans.push(Span::styled(" Enroll  ", text_style));
-            spans.push(Span::styled("[Tab]", key_style));
-            spans.push(Span::styled(" Toggle Alias Input  ", text_style));
+            spans.push(Span::styled("[r]", key_style));
+            spans.push(Span::styled(" Rescan  ", text_style));
             spans.push(Span::styled("[Esc]", key_style));
             spans.push(Span::styled(" Cancel  ", text_style));
         }
@@ -46,10 +60,15 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             spans.push(Span::styled(" Cancel  ", text_style));
         }
         ModalState::UnenrollModal { .. } => {
+            let btn_hint = if app.theme.ascii {
+                "[Tab/<-/->]"
+            } else {
+                "[Tab/←/→]"
+            };
             spans.push(Span::styled("[1/2/Space]", key_style));
-            spans.push(Span::styled(" Toggle Checkbox  ", text_style));
-            spans.push(Span::styled("[Tab/←/→]", key_style));
-            spans.push(Span::styled(" Select Button  ", text_style));
+            spans.push(Span::styled(" Toggle  ", text_style));
+            spans.push(Span::styled(btn_hint, key_style));
+            spans.push(Span::styled(" Button  ", text_style));
             spans.push(Span::styled("[Enter]", key_style));
             spans.push(Span::styled(" Confirm  ", text_style));
             spans.push(Span::styled("[Esc]", key_style));
@@ -63,15 +82,15 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 Tab::Dashboard => {
                     spans.push(Span::styled("[d]", key_style));
                     spans.push(Span::styled(" Diagnostics  ", text_style));
-                    spans.push(Span::styled("[p]", key_style));
-                    spans.push(Span::styled(" Pause  ", text_style));
-                    if app.grace_state.is_some() {
+                    spans.push(Span::styled("[p]", live_key_style));
+                    spans.push(Span::styled(" Pause  ", live_text_style));
+                    if app.daemon_connected && app.grace_state.is_some() {
                         spans.push(Span::styled("[c]", key_style));
                         spans.push(Span::styled(" Cancel  ", text_style));
                         spans.push(Span::styled("[s]", key_style));
                         spans.push(Span::styled(" Snooze  ", text_style));
                     }
-                    if app.has_persistent_shift_alert() {
+                    if app.daemon_connected && app.has_persistent_shift_alert() {
                         spans.push(Span::styled("[a]", key_style));
                         spans.push(Span::styled(" Accept Shift  ", text_style));
                         spans.push(Span::styled("[i]", key_style));
@@ -79,20 +98,16 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     }
                 }
                 Tab::Wearables => {
-                    spans.push(Span::styled("[e]", key_style));
-                    spans.push(Span::styled(" Enroll  ", text_style));
-                    spans.push(Span::styled("[n]", key_style));
-                    spans.push(Span::styled(" Rename  ", text_style));
-                    spans.push(Span::styled("[c]", key_style));
-                    spans.push(Span::styled(" Reconnect  ", text_style));
-                    spans.push(Span::styled("[u]", key_style));
-                    spans.push(Span::styled(" Unenroll  ", text_style));
+                    spans.push(Span::styled("[e]", live_key_style));
+                    spans.push(Span::styled(" Enroll  ", live_text_style));
+                    spans.push(Span::styled("[n]", live_key_style));
+                    spans.push(Span::styled(" Rename  ", live_text_style));
+                    spans.push(Span::styled("[c]", live_key_style));
+                    spans.push(Span::styled(" Reconnect  ", live_text_style));
+                    spans.push(Span::styled("[u]", live_key_style));
+                    spans.push(Span::styled(" Unenroll  ", live_text_style));
                 }
-                Tab::History => {
-                    spans.push(Span::styled("[j/k]", key_style));
-                    spans.push(Span::styled(" Navigate  ", text_style));
-                }
-                Tab::Settings => {
+                Tab::History | Tab::Settings => {
                     spans.push(Span::styled("[j/k]", key_style));
                     spans.push(Span::styled(" Navigate  ", text_style));
                 }

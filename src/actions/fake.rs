@@ -118,13 +118,23 @@ impl ActionExecutor for FakeActionExecutor {
         ignore_players: &'a [String],
     ) -> BoxFuture<'a, Result<bool, ActionError>> {
         Box::pin(async move {
+            let count = self.count_playing_players(ignore_players).await?;
+            Ok(count > 0)
+        })
+    }
+
+    fn count_playing_players<'a>(
+        &'a self,
+        ignore_players: &'a [String],
+    ) -> BoxFuture<'a, Result<usize, ActionError>> {
+        Box::pin(async move {
             let guard = self.inner.lock().expect("mutex poisoned");
-            for p in &guard.playing_players {
-                if !is_player_ignored(p, ignore_players) {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+            let count = guard
+                .playing_players
+                .iter()
+                .filter(|p| !is_player_ignored(p, ignore_players))
+                .count();
+            Ok(count)
         })
     }
 

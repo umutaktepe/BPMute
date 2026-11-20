@@ -17,6 +17,11 @@ pub enum WearableEvent {
         wearable: WearableDescriptor,
         packet: HrPacket,
     },
+    Metadata {
+        wearable: WearableDescriptor,
+        battery: Option<u8>,
+        body_location: Option<String>,
+    },
 }
 
 /// Async source of timestamped Wearable heart-rate and stream-lifecycle events.

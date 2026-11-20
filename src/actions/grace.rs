@@ -218,6 +218,7 @@ impl GraceCoordinator {
             total_sec,
             power_action: params.config.power_action,
             dry_run: params.dry_run || params.config.dry_run,
+            planned_steps: params.config.planned_pipeline_steps(),
         };
         if let Ok(v) = serde_json::to_value(tick) {
             self.broker.publish_control("GraceTick", v);

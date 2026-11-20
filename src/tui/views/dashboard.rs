@@ -1,12 +1,12 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Widget};
+use ratatui::widgets::{Clear, Gauge, Paragraph, Widget};
 
 use super::super::app::{ModalState, TuiApp};
 use super::super::sparkline::HrSparklineWidget;
-use crate::ipc::protocol::AlertSeverity;
+use super::centered_rect;
+use crate::ipc::protocol::alert_ids;
 
 pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     if area.height < 5 || area.width < 10 {
@@ -31,13 +31,8 @@ pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     // 2. Decide layout based on terminal size and diagnostics toggle
     let show_diag = app.is_diagnostics_open;
-    let diag_height = if show_diag { 5u16 } else { 0u16 };
-
-    let top_card_height = if current_area.height >= 18 {
-        7u16
-    } else {
-        5u16
-    };
+    let diag_height = if show_diag { 4u16 } else { 0u16 };
+    let top_card_height = 5u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -52,14 +47,14 @@ pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let sparkline_area = chunks[1];
     let diag_area = chunks[2];
 
-    // 3. Render Top Cards (Split horizontally if >= 75 cols, stack or compress if < 75)
-    if top_cards_area.width >= 75 {
+    // 3. Render Top Cards (3-column 80x24 baseline; collapses secondary card below 80 cols)
+    if top_cards_area.width >= 80 {
         let card_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
+                Constraint::Length(23),
+                Constraint::Length(23),
+                Constraint::Min(34),
             ])
             .split(top_cards_area);
 
@@ -102,48 +97,41 @@ fn render_alert_strip(
     area: Rect,
     buf: &mut Buffer,
 ) {
-    let is_shift = alert.id == "persistent_shift";
+    let is_shift = alert.id == alert_ids::PERSISTENT_SHIFT;
     let style = app.theme.alert_strip(is_shift);
-    let border_style = if app.theme.no_color {
-        Style::default()
-    } else {
-        match alert.severity {
-            AlertSeverity::Error => Style::default().fg(Color::Red),
-            AlertSeverity::Warn => Style::default().fg(Color::Yellow),
-            AlertSeverity::Info => Style::default().fg(Color::Cyan),
-        }
-    };
+    let border_style = app.theme.alert_border(alert.severity);
 
     let title = format!(" ALERT [{}] ", alert.kind);
-    let mut spans = vec![Span::styled(&alert.message, style)];
+    let mut hint_spans: Vec<Span<'_>> = Vec::new();
+    let mut hints_len = 0usize;
 
     if is_shift {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("[a] Accept", app.theme.key_hint()));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("[i] Ignore", app.theme.key_hint()));
+        hint_spans.push(Span::raw("  "));
+        hint_spans.push(Span::styled("[a] Accept", app.theme.key_hint()));
+        hint_spans.push(Span::raw("  "));
+        hint_spans.push(Span::styled("[i] Ignore", app.theme.key_hint()));
+        hints_len += 2 + "[a] Accept".len() + 2 + "[i] Ignore".len();
     }
     if alert.dismissible {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("[x] Dismiss", app.theme.key_hint()));
+        hint_spans.push(Span::raw("  "));
+        hint_spans.push(Span::styled("[x] Dismiss", app.theme.key_hint()));
+        hints_len += 2 + "[x] Dismiss".len();
     }
 
-    let p = Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(border_style),
-    );
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let msg_budget = inner_width.saturating_sub(hints_len + 1);
+    let clipped_msg = truncate_label(&alert.message, msg_budget);
+
+    let mut spans = vec![Span::styled(clipped_msg, style)];
+    spans.extend(hint_spans);
+
+    let p = Paragraph::new(Line::from(spans))
+        .block(app.theme.card_block(title).border_style(border_style));
     p.render(area, buf);
 }
 
 fn render_live_bpm_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Live Heart Rate ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Live Heart Rate ");
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -154,14 +142,6 @@ fn render_live_bpm_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let bpm_str = match app.latest_bpm {
         Some(bpm) => format!("{:.0}", bpm),
         None => "--".to_string(),
-    };
-
-    let bpm_style = if app.theme.no_color {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
     };
 
     let contact_str = if app.contact_ok {
@@ -176,19 +156,20 @@ fn render_live_bpm_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
 
     let slope_str = if let Some(ref epoch) = app.latest_epoch {
-        format!("Slope: {:+.1} bpm/min", epoch.features.hr_slope_4m * 60.0)
+        format!("Slope: {:+.2} bpm/m", epoch.features.hr_slope_4m)
     } else {
         "Slope: --".to_string()
     };
 
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("  {} ", bpm_str), bpm_style),
+            Span::styled(format!(" {bpm_str} "), app.theme.live_bpm()),
             Span::styled("BPM", app.theme.muted()),
         ]),
+        Line::from(vec![Span::styled(format!(" {contact_str}"), contact_style)]),
         Line::from(vec![Span::styled(
-            format!("  {}  |  {}", contact_str, slope_str),
-            contact_style,
+            format!(" {slope_str}"),
+            app.theme.muted(),
         )]),
     ];
 
@@ -196,12 +177,7 @@ fn render_live_bpm_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Sleep State ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Sleep State ");
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -209,19 +185,17 @@ fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let state_str = format!("{:?}", app.monitoring_state);
-    let state_style = app.theme.primary();
-
+    let state_str = format!("{}", app.monitoring_state);
     let p_sleep = app.latest_p_sleep.unwrap_or(0.0).clamp(0.0, 1.0);
     let p_pct = (p_sleep * 100.0).round() as u16;
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("  State: ", app.theme.muted()),
-            Span::styled(state_str, state_style),
+            Span::styled(" State: ", app.theme.muted()),
+            Span::styled(state_str, app.theme.primary()),
         ]),
         Line::from(vec![Span::styled(
-            format!("  P(Sleep): {:>3}% ", p_pct),
+            format!(" P(SleepNREM): {:>3}%", p_pct),
             app.theme.base(),
         )]),
     ];
@@ -237,26 +211,24 @@ fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     Paragraph::new(lines).render(chunks[0], buf);
 
-    let gauge_style = if app.theme.no_color {
-        Style::default().add_modifier(Modifier::REVERSED)
+    if app.theme.ascii {
+        let bar_w = usize::from(chunks[1].width.saturating_sub(2));
+        let filled = ((usize::from(p_pct) * bar_w) + 50) / 100;
+        let empty = bar_w.saturating_sub(filled);
+        let ascii_bar = format!("[{}{}]", "#".repeat(filled), "-".repeat(empty));
+        Paragraph::new(Span::styled(ascii_bar, app.theme.primary())).render(chunks[1], buf);
     } else {
-        Style::default().fg(Color::Cyan)
-    };
-
-    let gauge = Gauge::default()
-        .gauge_style(gauge_style)
-        .percent(p_pct)
-        .label("");
-    gauge.render(chunks[1], buf);
+        let gauge = Gauge::default()
+            .use_unicode(true)
+            .gauge_style(app.theme.sleep_gauge())
+            .percent(p_pct)
+            .label("");
+        gauge.render(chunks[1], buf);
+    }
 }
 
 fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Wearable & System ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Wearable & System ");
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -265,7 +237,7 @@ fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 
     let active_w = app.active_wearable();
-    let w_name = active_w
+    let w_raw_name = active_w
         .as_ref()
         .and_then(|w| {
             w.wearable
@@ -275,53 +247,78 @@ fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         })
         .unwrap_or("None");
 
-    let stream_status = active_w
-        .as_ref()
-        .map(|w| format!("{:?}", w.status))
-        .unwrap_or_else(|| "No Wearable".to_string());
-
-    let stream_style = match active_w.as_ref().map(|w| w.status) {
-        Some(crate::sleep_engine::StreamStatus::Streaming) => app.theme.success(),
-        Some(crate::sleep_engine::StreamStatus::SignalLost) => app.theme.danger(),
-        _ => app.theme.muted(),
-    };
-
     let battery_str = active_w
         .as_ref()
         .and_then(|w| w.battery)
         .map(|b| format!("{b}%"))
         .unwrap_or_else(|| "--".to_string());
 
-    let maturity_str = format!("{:?}", app.calibration_maturity);
+    let bat_suffix = format!(" ({battery_str})");
+    let label_prefix = " Wearable: ";
+    let max_name_len =
+        usize::from(inner.width).saturating_sub(label_prefix.len() + bat_suffix.len());
+    let w_name = truncate_label(w_raw_name, max_name_len);
 
-    let arm_str = if app.armed { "Armed" } else { "Disarmed" };
-    let dry_str = if app.dry_run { " [DryRun]" } else { "" };
+    let (stream_status, stream_style) = match active_w {
+        Some(w) => (w.status.display_label(), app.theme.stream_status(w.status)),
+        None => ("No Wearable", app.theme.muted()),
+    };
+
+    let maturity_str = app.calibration_maturity.display_label();
+
+    let arm_str = if app.daemon_status.as_ref().is_some_and(|s| s.paused) {
+        "Paused"
+    } else if app.armed {
+        "Armed"
+    } else {
+        "Disarmed"
+    };
+    let dry_str = if app.dry_run { " [DRY]" } else { "" };
+    let sched_str = match app.daemon_status.as_ref() {
+        Some(st) if st.schedule.active_hours_enabled => {
+            format!("{}-{}", st.schedule.start, st.schedule.end)
+        }
+        _ => "Sched: Off".to_string(),
+    };
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("  Device: ", app.theme.muted()),
+            Span::styled(label_prefix, app.theme.muted()),
             Span::styled(w_name, app.theme.base()),
-            Span::styled(format!(" [{stream_status}] "), stream_style),
-            Span::styled(format!("Bat: {battery_str}"), app.theme.muted()),
+            Span::styled(bat_suffix, app.theme.muted()),
         ]),
         Line::from(vec![
-            Span::styled("  Maturity: ", app.theme.muted()),
+            Span::styled(format!(" {stream_status}"), stream_style),
+            Span::styled(" | ", app.theme.muted()),
             Span::styled(maturity_str, app.theme.accent()),
-            Span::styled("  Status: ", app.theme.muted()),
-            Span::styled(format!("{arm_str}{dry_str}"), app.theme.primary()),
+        ]),
+        Line::from(vec![
+            Span::styled(format!(" {arm_str}{dry_str}"), app.theme.primary()),
+            Span::styled(format!(" | {sched_str}"), app.theme.muted()),
         ]),
     ];
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_sparkline_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" 30-Minute Heart Rate Sparkline ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
+fn truncate_label(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return s.chars().take(max_chars).collect();
+    }
+    let mut clipped: String = s.chars().take(max_chars - 1).collect();
+    clipped.push('~');
+    clipped
+}
 
+fn render_sparkline_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let block = app.theme.card_block(" 30-Minute Heart Rate Sparkline ");
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -330,16 +327,11 @@ fn render_sparkline_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Getting Started ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Getting Started ");
     let inner = block.inner(area);
     block.render(area, buf);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
             "  No BLE Heart Rate wearables enrolled yet.",
@@ -353,23 +345,23 @@ fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             Span::styled("Wearables tab (3)", app.theme.primary()),
             Span::styled(" to enroll your wearable.", app.theme.base()),
         ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  hint: systemd --user service not installed — run 'bpmute service install' to run in background.",
-            app.theme.muted(),
-        )]),
     ];
+
+    if !app.systemd_service_installed {
+        lines.push(Line::from(""));
+        let hint = if app.theme.ascii {
+            "  Hint: systemd --user unit not found - run 'bpmute daemon' or enable bpmute.service."
+        } else {
+            "  Hint: systemd --user unit not found — run 'bpmute daemon' or enable bpmute.service."
+        };
+        lines.push(Line::from(vec![Span::styled(hint, app.theme.muted())]));
+    }
 
     Paragraph::new(lines).render(inner, buf);
 }
 
 fn render_diagnostics_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = Block::default()
-        .title(" Engine Diagnostics [d] ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Engine Diagnostics [d] ");
     let inner = block.inner(area);
     block.render(area, buf);
 
@@ -377,38 +369,47 @@ fn render_diagnostics_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let (slope_str, var_str, sqi_str, rmssd_str) = if let Some(ref epoch) = app.latest_epoch {
-        (
-            format!("{:+.2} bpm/min", epoch.features.hr_slope_4m * 60.0),
-            format!("{:.2} bpm²", epoch.features.r_var_120s),
-            format!("{:.2}", 1.0 - epoch.rr_artifact_frac),
-            epoch
-                .features
-                .ln_rmssd_60s
-                .map(|r| format!("{:.2}", r))
-                .unwrap_or_else(|| "--".to_string()),
-        )
-    } else {
-        ("--".into(), "--".into(), "--".into(), "--".into())
-    };
+    let (slope_str, var_str, sqi_str, rmssd_str, ratio_str) =
+        if let Some(ref epoch) = app.latest_epoch {
+            (
+                format!("{:+.2} bpm/m", epoch.features.hr_slope_4m),
+                format!("{:.2}", epoch.features.r_var_120s),
+                format!("{:.2}", (1.0 - epoch.rr_artifact_frac).clamp(0.0, 1.0)),
+                epoch
+                    .features
+                    .ln_rmssd_60s
+                    .map(|r| format!("{:.2}", r))
+                    .unwrap_or_else(|| "--".to_string()),
+                epoch
+                    .features
+                    .rmssd_sdnn_120s
+                    .map(|r| format!("{:.2}", r))
+                    .unwrap_or_else(|| "--".to_string()),
+            )
+        } else {
+            (
+                "--".into(),
+                "--".into(),
+                "--".into(),
+                "--".into(),
+                "--".into(),
+            )
+        };
 
     let idle_backend = app.idle_backend.as_deref().unwrap_or("None / Probing");
-    let mpris_players = app.playing_players_count;
+    let mpris_players = app
+        .playing_players_count
+        .map_or_else(|| "--".to_string(), |n| n.to_string());
 
+    let hmm_line = format!(
+        "Slope:{slope_str} | Var:{var_str} | ln(RMSSD):{rmssd_str} | RMSSD/SDNN:{ratio_str} | SQI:{sqi_str}"
+    );
     let lines = vec![
+        Line::from(vec![Span::styled(hmm_line, app.theme.base())]),
         Line::from(vec![
-            Span::styled(" HMM: ", app.theme.muted()),
+            Span::styled("Desktop: ", app.theme.muted()),
             Span::styled(
-                format!(
-                    "Slope: {slope_str} | Var: {var_str} | SQI: {sqi_str} | ln(RMSSD): {rmssd_str} "
-                ),
-                app.theme.base(),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(" Desktop: ", app.theme.muted()),
-            Span::styled(
-                format!("Idle Probe: {idle_backend} | Playing MPRIS2 Players: {mpris_players} "),
+                format!("Idle Probe: {idle_backend} | Playing MPRIS2 Players: {mpris_players}"),
                 app.theme.base(),
             ),
         ]),
@@ -418,21 +419,10 @@ fn render_diagnostics_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 }
 
 fn render_pause_popover(app: &TuiApp, selected_idx: usize, area: Rect, buf: &mut Buffer) {
-    let popover_w = 44u16.min(area.width.saturating_sub(4));
-    let popover_h = 9u16.min(area.height.saturating_sub(4));
-
-    let popover_x = area.x + (area.width.saturating_sub(popover_w)) / 2;
-    let popover_y = area.y + (area.height.saturating_sub(popover_h)) / 2;
-    let popover_area = Rect::new(popover_x, popover_y, popover_w, popover_h);
-
+    let popover_area = centered_rect(area, 44, 9);
     Clear.render(popover_area, buf);
 
-    let block = Block::default()
-        .title(" Pause / Resume Monitoring ")
-        .title_style(app.theme.card_title())
-        .borders(Borders::ALL)
-        .border_style(app.theme.card_border());
-
+    let block = app.theme.card_block(" Pause / Resume Monitoring ");
     let inner = block.inner(popover_area);
     block.render(popover_area, buf);
 

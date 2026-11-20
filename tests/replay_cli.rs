@@ -64,6 +64,7 @@ fn stream_status_label(status: bpmute::sleep_engine::StreamStatus) -> &'static s
         bpmute::sleep_engine::StreamStatus::Disconnected => "stream_disconnected",
         bpmute::sleep_engine::StreamStatus::Acquiring => "stream_acquiring",
         bpmute::sleep_engine::StreamStatus::Connecting => "stream_connecting",
+        bpmute::sleep_engine::StreamStatus::PassiveStandby => "stream_passive_standby",
     }
 }
 

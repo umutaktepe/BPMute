@@ -136,7 +136,7 @@ pub async fn bond_and_trust_device(
     if pair {
         let is_paired = device.paired().await.unwrap_or(false);
         if !is_paired {
-            let _ = device.pair().await;
+            device.pair().await?;
         }
     }
     Ok(())

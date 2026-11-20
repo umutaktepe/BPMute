@@ -55,6 +55,7 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
                                     wearable: w,
                                     status: StreamStatus::Disconnected,
                                     battery: None,
+                                    body_location: None,
                                 })
                                 .collect(),
                             Err(err) => return report_storage_error(err, stderr),
@@ -88,13 +89,13 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
                 };
                 let _ = writeln!(
                     stdout,
-                    "  {} | {} ({}) | alias: {} | name: {} | status: {:?} | battery: {}",
+                    "  {} | {} ({}) | alias: {} | name: {} | status: {} | battery: {}",
                     w.id,
                     w.mac_masked,
                     w.address_type,
                     alias_part,
                     name_part,
-                    item.status,
+                    item.status.display_label(),
                     battery_part
                 );
             }

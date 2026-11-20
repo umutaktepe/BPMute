@@ -1,5 +1,7 @@
 //! Parsing and validation of Bluetooth SIG GATT Heart Rate (`0x2A37`) and Body Location (`0x2A38`).
 
+use std::fmt;
+
 use thiserror::Error;
 
 use crate::sleep_engine::{ContactStatus, HrPacket};
@@ -22,6 +24,28 @@ pub enum BodySensorLocation {
     EarLobe,
     Foot,
     Unknown(u8),
+}
+
+impl BodySensorLocation {
+    /// Returns the human-readable body location label.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Other => "Other",
+            Self::Chest => "Chest",
+            Self::Wrist => "Wrist",
+            Self::Finger => "Finger",
+            Self::Hand => "Hand",
+            Self::EarLobe => "Ear Lobe",
+            Self::Foot => "Foot",
+            Self::Unknown(_) => "Unknown",
+        }
+    }
+}
+
+impl fmt::Display for BodySensorLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display_label())
+    }
 }
 
 /// Decodes standard Body Sensor Location (`0x2A38`).

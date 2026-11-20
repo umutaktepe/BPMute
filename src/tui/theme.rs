@@ -1,4 +1,22 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders};
+
+use crate::ipc::protocol::AlertSeverity;
+use crate::paths::EnvSource;
+use crate::sleep_engine::StreamStatus;
+
+const ASCII_BORDER_SET: symbols::border::Set<'static> = symbols::border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
 
 /// 16-color ANSI theme that strictly respects `NO_COLOR` (https://no-color.org/).
 #[derive(Debug, Clone, Copy)]
@@ -12,9 +30,26 @@ impl Theme {
         Self { no_color, ascii }
     }
 
-    pub fn from_env(ascii: bool) -> Self {
-        let no_color = std::env::var("NO_COLOR").is_ok_and(|v| !v.trim().is_empty());
+    pub fn from_env(env: &dyn EnvSource, ascii: bool) -> Self {
+        let no_color = env.get("NO_COLOR").is_some_and(|v| !v.trim().is_empty());
         Self::new(no_color, ascii)
+    }
+
+    pub fn border_set(&self) -> symbols::border::Set<'static> {
+        if self.ascii {
+            ASCII_BORDER_SET
+        } else {
+            symbols::border::PLAIN
+        }
+    }
+
+    pub fn card_block<'a>(&self, title: impl Into<Line<'a>>) -> Block<'a> {
+        Block::default()
+            .title(title)
+            .title_style(self.card_title())
+            .borders(Borders::ALL)
+            .border_set(self.border_set())
+            .border_style(self.card_border())
     }
 
     pub fn base(&self) -> Style {
@@ -163,6 +198,81 @@ impl Theme {
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    pub fn alert_border(&self, severity: AlertSeverity) -> Style {
+        if self.no_color {
+            Style::default()
+        } else {
+            match severity {
+                AlertSeverity::Error => Style::default().fg(Color::Red),
+                AlertSeverity::Warn => Style::default().fg(Color::Yellow),
+                AlertSeverity::Info => Style::default().fg(Color::Cyan),
+            }
+        }
+    }
+
+    pub fn live_bpm(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    pub fn sleep_gauge(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Cyan)
+        }
+    }
+
+    pub fn sparkline_curve(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        }
+    }
+
+    pub fn sparkline_qw_ref(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Cyan)
+        }
+    }
+
+    pub fn sparkline_sleep_ref(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Magenta)
+        }
+    }
+
+    pub fn table_header(&self) -> Style {
+        if self.no_color {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    pub fn stream_status(&self, status: StreamStatus) -> Style {
+        match status {
+            StreamStatus::Streaming => self.success(),
+            StreamStatus::SignalLost => self.danger(),
+            StreamStatus::PassiveStandby | StreamStatus::Acquiring | StreamStatus::Connecting => {
+                self.warning()
+            }
+            StreamStatus::Disconnected => self.muted(),
         }
     }
 }
