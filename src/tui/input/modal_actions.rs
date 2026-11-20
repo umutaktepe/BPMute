@@ -86,6 +86,7 @@ impl TuiApp {
             *alias_focused = false;
             *scanning_remaining_ms = 30_000;
             *error_message = None;
+            self.reset_enrollment_scan_tracking();
             Some(TuiCommand::EnrollStart(Some(30)))
         } else {
             None

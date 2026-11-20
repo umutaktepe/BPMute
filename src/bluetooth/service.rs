@@ -5,10 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tokio::sync::{mpsc, watch};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
-use zbus::{MatchRule, MessageStream};
 
 use crate::daemon::DaemonClock;
 use crate::daemon::wearable::{WearableDescriptor, WearableEvent, WearableSource};
@@ -17,9 +15,9 @@ use crate::storage::LedgerStore;
 
 use super::dbus::{GattCharacteristic1Proxy, GattManager1Proxy, HRM_CHAR_UUID};
 use super::operations::{
-    extract_bool, extract_byte_array, extract_mac_from_path, extract_string, extract_u8,
-    find_characteristic_path, inspect_bluez_state, read_battery_percentage,
-    read_body_sensor_location,
+    build_bluez_signal_stream, extract_bool, extract_byte_array, extract_mac_from_path,
+    extract_string, extract_u8, find_characteristic_path, inspect_bluez_state, next_stream_msg,
+    read_battery_percentage, read_body_sensor_location, resolve_target_adapters,
 };
 use super::packet::parse_hr_measurement;
 use super::profile::{GATT_HRS_PROFILE_PATH, GATT_PROFILE_APP_PATH, GattProfileHrs};
@@ -271,52 +269,13 @@ async fn run_bluez_source_task(
     }
 }
 
-async fn next_stream_msg(
-    stream: &mut Option<MessageStream>,
-) -> Option<zbus::Result<zbus::Message>> {
-    match stream.as_mut() {
-        Some(s) => s.next().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn build_bluez_signal_stream(
-    conn: &zbus::Connection,
-    interface: &'static str,
-    member: &'static str,
-) -> Option<MessageStream> {
-    let rule = MatchRule::builder()
-        .msg_type(zbus::message::Type::Signal)
-        .sender("org.bluez")
-        .ok()?
-        .interface(interface)
-        .ok()?
-        .member(member)
-        .ok()?
-        .build();
-    MessageStream::for_match_rule(rule, conn, None).await.ok()
-}
-
-fn normalize_adapter_path(adapter: &str) -> String {
-    if adapter.starts_with('/') {
-        adapter.to_string()
-    } else {
-        format!("/org/bluez/{adapter}")
-    }
-}
-
 async fn register_profiles_from_snapshot(
     conn: &zbus::Connection,
     pinned_adapter: Option<&str>,
 ) -> Vec<String> {
-    let targets = if let Some(pinned) = pinned_adapter {
-        vec![normalize_adapter_path(pinned)]
-    } else if let Ok(snap) = inspect_bluez_state(conn).await
-        && !snap.adapters.is_empty()
-    {
-        snap.adapters
-    } else {
-        vec![DEFAULT_ADAPTER_PATH.to_string()]
+    let targets = match resolve_target_adapters(conn, pinned_adapter).await {
+        Ok(resolved) if !resolved.targets.is_empty() => resolved.targets,
+        _ => vec![DEFAULT_ADAPTER_PATH.to_string()],
     };
 
     for adapter_path in &targets {

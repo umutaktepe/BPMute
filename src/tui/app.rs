@@ -209,6 +209,7 @@ pub struct TuiApp {
     pub(crate) wearables_scroll_offset: usize,
     pub discovered_wearables: Vec<DiscoveredWearable>,
     pub(crate) enrollment_scroll_offset: usize,
+    enrollment_update_seen: bool,
 
     // History
     pub history_sessions: Vec<SessionListEntry>,
@@ -270,6 +271,7 @@ impl TuiApp {
             wearables_scroll_offset: 0,
             discovered_wearables: Vec::new(),
             enrollment_scroll_offset: 0,
+            enrollment_update_seen: false,
             history_sessions: Vec::new(),
             history_boundaries: Vec::new(),
             selected_session_idx: 0,
@@ -429,15 +431,21 @@ impl TuiApp {
         self.help_max_scroll = 0;
     }
 
+    pub(crate) fn reset_enrollment_scan_tracking(&mut self) {
+        self.enrollment_update_seen = false;
+    }
+
     pub(crate) fn close_modal(&mut self) {
         self.modal = ModalState::None;
         self.help_scroll_offset = 0;
         self.help_max_scroll = 0;
         self.enrollment_scroll_offset = 0;
+        self.reset_enrollment_scan_tracking();
     }
 
     pub fn open_enrollment_modal(&mut self) -> TuiCommand {
         self.enrollment_scroll_offset = 0;
+        self.reset_enrollment_scan_tracking();
         self.modal = ModalState::EnrollmentModal {
             scanning_remaining_ms: 30_000,
             selected_discovered_idx: 0,
@@ -605,17 +613,21 @@ impl TuiApp {
                 }
             }
             IpcEvent::EnrollmentDiscovered(discovered) => {
-                self.discovered_wearables = discovered;
-                if let ModalState::EnrollmentModal {
-                    ref mut selected_discovered_idx,
-                    ..
-                } = self.modal
-                    && *selected_discovered_idx >= self.discovered_wearables.len()
-                {
-                    *selected_discovered_idx = self.discovered_wearables.len().saturating_sub(1);
+                if !self.enrollment_update_seen {
+                    self.discovered_wearables = discovered;
+                    if let ModalState::EnrollmentModal {
+                        ref mut selected_discovered_idx,
+                        ..
+                    } = self.modal
+                        && *selected_discovered_idx >= self.discovered_wearables.len()
+                    {
+                        *selected_discovered_idx =
+                            self.discovered_wearables.len().saturating_sub(1);
+                    }
                 }
             }
             IpcEvent::EnrollmentUpdate(update) => {
+                self.enrollment_update_seen = true;
                 self.discovered_wearables = update.wearables;
                 if let ModalState::EnrollmentModal {
                     ref mut pairing_prompt,
@@ -725,6 +737,7 @@ impl TuiApp {
                         ..
                     } = self.modal
                 {
+                    self.discovered_wearables.clear();
                     *scanning_remaining_ms = 0;
                     *error_message = message;
                 } else if !success {

@@ -2,8 +2,10 @@
 
 use std::collections::HashMap;
 
+use futures_util::StreamExt;
 use zbus::fdo::ObjectManagerProxy;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
+use zbus::{MatchRule, MessageStream};
 
 use crate::ipc::protocol::DiscoveredWearable;
 
@@ -16,6 +18,7 @@ use super::packet::{BodySensorLocation, parse_body_sensor_location};
 #[derive(Debug, Default)]
 pub(crate) struct BluezSnapshot {
     pub adapters: Vec<String>,
+    pub powered_adapters: Vec<String>,
     pub devices: HashMap<String, BluezDeviceSnapshot>,
 }
 
@@ -38,8 +41,12 @@ pub(crate) async fn inspect_bluez_state(conn: &zbus::Connection) -> zbus::Result
 
     let mut snap = BluezSnapshot::default();
     for (path, ifaces) in &managed {
-        if ifaces.contains_key("org.bluez.Adapter1") {
-            snap.adapters.push(path.as_str().to_string());
+        if let Some(adapter_props) = ifaces.get("org.bluez.Adapter1") {
+            let adapter_path = path.as_str().to_string();
+            snap.adapters.push(adapter_path.clone());
+            if extract_bool(adapter_props.get("Powered")).unwrap_or(true) {
+                snap.powered_adapters.push(adapter_path);
+            }
         }
         if let Some(dev_props) = ifaces.get("org.bluez.Device1")
             && let Some(addr) = extract_string(dev_props.get("Address"))
@@ -101,9 +108,114 @@ pub async fn find_device_object_path(
     Ok(None)
 }
 
+/// Normalizes a BlueZ adapter identifier (e.g., `"hci0"` or `"/org/bluez/hci0"`) into an object path.
+pub(crate) fn normalize_adapter_path(adapter: &str) -> String {
+    if adapter.starts_with('/') {
+        adapter.to_string()
+    } else {
+        format!("/org/bluez/{adapter}")
+    }
+}
+
+/// Target BlueZ adapter paths resolved from config or live `ObjectManager` powered adapters.
+pub(crate) struct ResolvedAdapters {
+    pub targets: Vec<String>,
+    pub any_present: bool,
+}
+
+/// Resolves target BlueZ adapter object paths from an optional pinned adapter or powered `ObjectManager` adapters.
+pub(crate) async fn resolve_target_adapters(
+    conn: &zbus::Connection,
+    pinned_adapter: Option<&str>,
+) -> zbus::Result<ResolvedAdapters> {
+    if let Some(pinned) = pinned_adapter {
+        return Ok(ResolvedAdapters {
+            targets: vec![normalize_adapter_path(pinned)],
+            any_present: true,
+        });
+    }
+    let mut snap = inspect_bluez_state(conn).await?;
+    snap.powered_adapters.sort();
+    Ok(ResolvedAdapters {
+        any_present: !snap.adapters.is_empty(),
+        targets: snap.powered_adapters,
+    })
+}
+
+/// Builds a `zbus::MessageStream` matching signals emitted by `org.bluez`.
+pub(crate) async fn build_bluez_signal_stream(
+    conn: &zbus::Connection,
+    interface: &'static str,
+    member: &'static str,
+) -> Option<MessageStream> {
+    let rule = match MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.bluez")
+        .and_then(|b| b.interface(interface))
+        .and_then(|b| b.member(member))
+        .map(|b| b.build())
+    {
+        Ok(rule) => rule,
+        Err(err) => {
+            tracing::warn!(interface, member, error = %err, "failed to build BlueZ D-Bus MatchRule");
+            return None;
+        }
+    };
+    match MessageStream::for_match_rule(rule, conn, None).await {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            tracing::warn!(interface, member, error = %err, "failed to subscribe to BlueZ D-Bus signal stream");
+            None
+        }
+    }
+}
+
+/// Awaits the next message from an optional BlueZ D-Bus `MessageStream`, pending forever if `None`.
+pub(crate) async fn next_stream_msg(
+    stream: &mut Option<MessageStream>,
+) -> Option<zbus::Result<zbus::Message>> {
+    match stream.as_mut() {
+        Some(s) => s.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Returns whether a BlueZ `ObjectManager.InterfacesAdded` message announces a `Device1` object.
+pub(crate) fn is_wearable_interfaces_added(msg: &zbus::Message) -> bool {
+    msg.body()
+        .deserialize::<(
+            OwnedObjectPath,
+            HashMap<String, HashMap<String, OwnedValue>>,
+        )>()
+        .is_ok_and(|(_path, ifaces)| ifaces.contains_key("org.bluez.Device1"))
+}
+
+/// Returns whether a BlueZ `PropertiesChanged` message updates discovery-relevant `Device1` fields.
+pub(crate) fn is_relevant_wearable_props_changed(msg: &zbus::Message) -> bool {
+    msg.body()
+        .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+        .is_ok_and(|(iface, changed, _invalidated)| {
+            iface == "org.bluez.Device1"
+                && changed.keys().any(|k| {
+                    matches!(
+                        k.as_str(),
+                        "UUIDs" | "Name" | "Alias" | "Address" | "AddressType" | "Paired"
+                    )
+                })
+        })
+}
+
 /// Discovers all known or currently discovered BlueZ devices exposing Heart Rate Service (0x180D).
 pub async fn list_heart_rate_devices(
     conn: &zbus::Connection,
+) -> zbus::Result<Vec<DiscoveredWearable>> {
+    list_heart_rate_devices_for_adapters(conn, &[]).await
+}
+
+/// Discovers BlueZ devices exposing Heart Rate Service (0x180D), optionally scoped to `adapter_paths`.
+pub(crate) async fn list_heart_rate_devices_for_adapters(
+    conn: &zbus::Connection,
+    adapter_paths: &[String],
 ) -> zbus::Result<Vec<DiscoveredWearable>> {
     let obj_mgr = ObjectManagerProxy::builder(conn)
         .destination("org.bluez")?
@@ -113,7 +225,14 @@ pub async fn list_heart_rate_devices(
     let managed = obj_mgr.get_managed_objects().await?;
     let mut devices = Vec::new();
 
-    for (_path, ifaces) in managed {
+    for (path, ifaces) in managed {
+        if !adapter_paths.is_empty()
+            && !adapter_paths
+                .iter()
+                .any(|adapter| path.as_str().starts_with(&format!("{adapter}/")))
+        {
+            continue;
+        }
         let Some(dev_props) = ifaces.get("org.bluez.Device1") else {
             continue;
         };
@@ -148,6 +267,11 @@ pub async fn list_heart_rate_devices(
         });
     }
 
+    devices.sort_by(|a, b| {
+        a.address
+            .to_ascii_uppercase()
+            .cmp(&b.address.to_ascii_uppercase())
+    });
     Ok(devices)
 }
 
@@ -167,7 +291,16 @@ pub async fn start_le_discovery(conn: &zbus::Connection, adapter_path: &str) -> 
     if let Err(err) = adapter.set_discovery_filter(filter).await {
         tracing::warn!(adapter = %adapter_path, error = %err, "BlueZ Adapter1.SetDiscoveryFilter failed");
     }
-    adapter.start_discovery().await
+    match adapter.start_discovery().await {
+        Ok(()) => Ok(()),
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.bluez.Error.InProgress" =>
+        {
+            tracing::debug!(adapter = %adapter_path, "BlueZ Adapter1 discovery already in progress");
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Stops Bluetooth discovery scan on the specified adapter.
@@ -224,7 +357,13 @@ pub async fn remove_device(
     let Some(dev_path) = find_device_object_path(conn, mac).await? else {
         return Ok(());
     };
-    let adapter_obj = ObjectPath::try_from(adapter_path)?;
+    let owning_adapter = dev_path
+        .as_str()
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty())
+        .unwrap_or(adapter_path);
+    let adapter_obj = ObjectPath::try_from(owning_adapter)?;
     let adapter = Adapter1Proxy::builder(conn)
         .path(adapter_obj)?
         .build()

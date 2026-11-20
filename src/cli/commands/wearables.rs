@@ -1,6 +1,7 @@
 //! Wearable allowlist, unenrollment, renaming, connection, and enrollment CLI commands.
 
 use std::io::Write;
+use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::json;
@@ -8,9 +9,10 @@ use serde_json::json;
 use crate::cli::args::WearablesCommand;
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::{
-    EnrollSelectParams, EnrollSelectResponse, EnrollStartParams, EnrollStartResponse,
-    EnrolledWearableStatus, WearableConnectParams, WearableConnectResponse, WearableListResponse,
-    WearableMutationResponse, WearableRenameParams, WearableUnenrollParams,
+    DiscoveredWearable, EnrollSelectParams, EnrollSelectResponse, EnrollStartParams,
+    EnrollStartResponse, EnrolledWearableStatus, EnrollmentUpdateEvent, WearableConnectParams,
+    WearableConnectResponse, WearableListResponse, WearableMutationResponse, WearableRenameParams,
+    WearableUnenrollParams,
 };
 use crate::ipc::{IpcClient, IpcClientError};
 use crate::paths::ResolvedPaths;
@@ -268,6 +270,12 @@ pub(crate) async fn run_enroll<WOut: Write, WErr: Write>(
         Err(err) => return report_ipc_error(err, stderr),
     };
 
+    if explicit_address.is_none()
+        && let Err(err) = client.request("daemon.subscribe", json!({})).await
+    {
+        return report_ipc_error(err, stderr);
+    }
+
     let start_params = EnrollStartParams {
         timeout_sec: Some(30),
     };
@@ -286,20 +294,21 @@ pub(crate) async fn run_enroll<WOut: Write, WErr: Write>(
     let target_mac = match explicit_address {
         Some(mac) => mac.to_string(),
         None => {
-            if start_res.devices.is_empty() {
+            let discovered = if start_res.devices.is_empty() {
+                await_discovered_wearables(&mut client, 30).await
+            } else {
+                start_res.devices
+            };
+            if discovered.is_empty() {
                 let _ = writeln!(
                     stderr,
-                    "error: no 0x180D Heart Rate devices discovered. Specify --address <MAC> or ensure wearable is advertising."
+                    "error: no 0x180D Heart Rate wearables discovered. Specify --address <MAC> or ensure wearable is advertising."
                 );
                 let _ = client.request("wearable.enroll_cancel", json!({})).await;
                 return ExitCode::UsageOrConfigError;
             }
-            let _ = writeln!(
-                stdout,
-                "Discovered {} Wearable(s):",
-                start_res.devices.len()
-            );
-            for (idx, d) in start_res.devices.iter().enumerate() {
+            let _ = writeln!(stdout, "Discovered {} Wearable(s):", discovered.len());
+            for (idx, d) in discovered.iter().enumerate() {
                 let name = d.name.as_deref().unwrap_or("Unknown");
                 let rssi_str = d
                     .rssi
@@ -358,4 +367,27 @@ pub(crate) async fn run_enroll<WOut: Write, WErr: Write>(
         select_res.wearable.id, select_res.wearable.mac_masked
     );
     ExitCode::Success
+}
+
+async fn await_discovered_wearables(
+    client: &mut IpcClient,
+    timeout_sec: u64,
+) -> Vec<DiscoveredWearable> {
+    tokio::time::timeout(Duration::from_secs(timeout_sec.saturating_add(1)), async {
+        while let Ok(ev) = client.next_event().await {
+            if ev.event == "EnrollmentUpdate"
+                && let Ok(update) = serde_json::from_value::<EnrollmentUpdateEvent>(ev.data)
+            {
+                if !update.wearables.is_empty() {
+                    return update.wearables;
+                }
+                if update.remaining_sec == Some(0) {
+                    return Vec::new();
+                }
+            }
+        }
+        Vec::new()
+    })
+    .await
+    .unwrap_or_default()
 }

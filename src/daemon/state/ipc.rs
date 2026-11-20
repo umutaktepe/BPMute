@@ -18,7 +18,7 @@ use crate::ipc::protocol::{
 use crate::storage::{ImportMode, SetFeedbackRequest, WearableDescriptor};
 
 use super::enrollment::try_system_conn;
-use super::{DaemonCore, EnrollmentLock, ipc_err, serialize_json, storage_to_ipc_err};
+use super::{DaemonCore, ipc_err, serialize_json, storage_to_ipc_err};
 
 impl DaemonCore {
     /// Dispatches an IPC command over the Unix domain socket.
@@ -483,12 +483,26 @@ impl DaemonCore {
                 if parsed.forget_bluez
                     && let Some(conn) = try_system_conn().await
                 {
-                    let _ = crate::bluetooth::operations::remove_device(
+                    let fallback_adapter = {
+                        let guard = self.inner.lock().expect("daemon state mutex poisoned");
+                        guard
+                            .loaded_config
+                            .config
+                            .bluetooth
+                            .adapter
+                            .as_deref()
+                            .map(crate::bluetooth::operations::normalize_adapter_path)
+                            .unwrap_or_else(|| "/org/bluez/hci0".to_string())
+                    };
+                    if let Err(err) = crate::bluetooth::operations::remove_device(
                         &conn,
-                        "/org/bluez/hci0",
+                        &fallback_adapter,
                         &unenrolled.mac,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(error = %err, "failed to remove wearable from BlueZ adapter");
+                    }
                 }
                 if let Some(cal_state) = cal_state {
                     self.apply_calibration_update(cal_state);
@@ -506,38 +520,8 @@ impl DaemonCore {
                         format!("invalid wearable.enroll_start params: {e}"),
                     )
                 })?;
-                let now_ms = self.clock.now_utc().timestamp_millis();
                 let timeout_sec = parsed.timeout_sec.unwrap_or(30).clamp(5, 120);
-                let timeout_ms = (timeout_sec as i64) * 1000;
-
-                if let Some(conn) = try_system_conn().await {
-                    let _ =
-                        crate::bluetooth::operations::start_le_discovery(&conn, "/org/bluez/hci0")
-                            .await;
-                    if let Ok(discovered) =
-                        crate::bluetooth::operations::list_heart_rate_devices(&conn).await
-                    {
-                        let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-                        guard.discovered_wearables = discovered;
-                    }
-                }
-
-                let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-                if let Some(ref lock) = guard.enrollment {
-                    let expired = now_ms >= lock.started_at_ms + lock.timeout_ms;
-                    if !expired && lock.client_id != client_id {
-                        return Err(ipc_err(
-                            error_codes::ENROLLMENT_IN_PROGRESS,
-                            "another enrollment session is currently in progress",
-                        ));
-                    }
-                }
-                guard.enrollment = Some(EnrollmentLock {
-                    client_id,
-                    started_at_ms: now_ms,
-                    timeout_ms,
-                });
-                let devices = guard.discovered_wearables.clone();
+                let devices = self.start_enrollment_scan(client_id, timeout_sec).await?;
                 serialize_json(EnrollStartResponse {
                     devices: devices.clone(),
                     wearables: devices,
@@ -594,6 +578,8 @@ impl DaemonCore {
                     let advertised_name = discovered.as_ref().and_then(|d| d.name.clone());
                     (discovered, is_rpa, address_type, advertised_name)
                 };
+
+                self.stop_active_discovery().await;
 
                 let pair_result = Arc::clone(&self.enrollment_driver)
                     .bond_and_pair(self, &norm_mac, is_rpa)
@@ -675,15 +661,11 @@ impl DaemonCore {
                 Ok(json!({ "dismissed": changed }))
             }
             "wearable.enroll_cancel" => {
-                if let Some(conn) = try_system_conn().await {
-                    let _ =
-                        crate::bluetooth::operations::stop_le_discovery(&conn, "/org/bluez/hci0")
-                            .await;
+                {
+                    let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+                    Self::cancel_enrollment_locked(&mut guard);
                 }
-                let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-                guard.enrollment = None;
-                guard.discovered_wearables.clear();
-                guard.active_auth_reply = None;
+                self.stop_active_discovery().await;
                 Ok(json!({ "ok": true }))
             }
             "wearable.enroll_auth_response" => {
