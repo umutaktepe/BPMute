@@ -8,7 +8,7 @@ use crate::calibration::{CalibrationState, FeedbackVerdict};
 use crate::config::{ClockTime, Config, LogFormat, PatchField, ScheduleConfig};
 use crate::replay::TraceFormat;
 use crate::sleep_engine::{ContactStatus, DetectorState, Epoch, StreamStatus};
-use crate::storage::{EnrolledWearable, ImportMode, SessionFullDetail};
+use crate::storage::{EnrolledWearable, ImportMode, ImportSummary, SessionFullDetail};
 
 /// Current NDJSON IPC protocol version (ADR-0002).
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -323,7 +323,7 @@ pub struct ConfigSnapshotPayload {
 }
 
 /// Parameters accepted by `session.list`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionListParams {
     pub limit: Option<u32>,
@@ -331,43 +331,43 @@ pub struct SessionListParams {
 }
 
 /// Parameters accepted by `session.get`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionGetParams {
     pub id: String,
 }
 
 /// Parameters accepted by `session.set_feedback`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetFeedbackParams {
     pub session_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "PatchField::is_unchanged")]
     pub verdict: PatchField<FeedbackVerdict>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "PatchField::is_unchanged")]
     pub onset_hhmm: PatchField<ClockTime>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "PatchField::is_unchanged")]
     pub avg_sleep_hr: PatchField<f64>,
     #[serde(default)]
     pub clear: bool,
 }
 
 /// Parameters accepted by `calibration.set_seed`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetSeedParams {
     pub sleep_hr: Option<f64>,
 }
 
 /// Parameters accepted by `session.delete`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionDeleteParams {
     pub id: String,
 }
 
 /// Parameters accepted by `session.export_trace`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionExportTraceParams {
     pub id: String,
@@ -378,8 +378,70 @@ pub struct SessionExportTraceParams {
     pub no_anonymize: bool,
 }
 
+/// Response payload returned by `session.delete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDeleteResponse {
+    pub deleted_session_id: String,
+    pub deleted_id: String,
+}
+
+/// Response payload returned by `session.export_trace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExportTraceResponse {
+    pub path: String,
+    pub events_count: usize,
+}
+
+/// Response payload returned by `data.purge_raw`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataPurgeRawResponse {
+    pub reclaimed_rows: usize,
+}
+
+/// Response payload returned by `data.export_bundle`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataExportBundleResponse {
+    pub path: String,
+}
+
+/// Response payload returned by `data.import_bundle`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DataImportBundleResponse {
+    pub summary: ImportSummary,
+    pub calibration: CalibrationState,
+}
+
+/// Response payload returned by `wearable.list`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WearableListResponse {
+    pub wearables: Vec<EnrolledWearableStatus>,
+}
+
+/// Response payload returned by `wearable.rename` and `wearable.unenroll`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WearableMutationResponse {
+    pub wearable: EnrolledWearable,
+}
+
+/// Response payload returned by `wearable.enroll_start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrollStartResponse {
+    pub devices: Vec<DiscoveredWearable>,
+    pub wearables: Vec<DiscoveredWearable>,
+}
+
+/// Response payload returned by `wearable.enroll_select`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnrollSelectResponse {
+    pub wearable: EnrolledWearable,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub hints: Vec<String>,
+}
+
 /// Parameters accepted by `calibration.set_boundary`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CalibrationSetBoundaryParams {
     pub effective_ts_ms: Option<i64>,
@@ -388,14 +450,14 @@ pub struct CalibrationSetBoundaryParams {
 }
 
 /// Parameters accepted by `data.hard_wipe`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DataHardWipeParams {
     pub all: bool,
 }
 
 /// Parameters accepted by `data.export_bundle`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataExportBundleParams {
     pub path: String,
@@ -418,7 +480,7 @@ impl DataExportBundleParams {
 }
 
 /// Parameters accepted by `data.import_bundle`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataImportBundleParams {
     pub path: String,
@@ -429,7 +491,7 @@ pub struct DataImportBundleParams {
 }
 
 /// Parameters accepted by `data.backup_sqlite`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataBackupSqliteParams {
     pub path: String,
@@ -510,7 +572,7 @@ pub struct EnrolledWearableStatus {
 }
 
 /// Parameters for `wearable.rename`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WearableRenameParams {
     pub id: String,
@@ -518,14 +580,14 @@ pub struct WearableRenameParams {
 }
 
 /// Parameters for `wearable.connect`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WearableConnectParams {
     pub id: String,
 }
 
 /// Parameters for `wearable.unenroll`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WearableUnenrollParams {
     pub id: String,
@@ -536,14 +598,14 @@ pub struct WearableUnenrollParams {
 }
 
 /// Parameters for `wearable.enroll_start`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnrollStartParams {
     pub timeout_sec: Option<u32>,
 }
 
 /// Parameters for `wearable.enroll_select`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnrollSelectParams {
     pub address: String,

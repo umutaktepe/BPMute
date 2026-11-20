@@ -62,6 +62,12 @@ pub struct GraceState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpFeedback {
+    pub is_error: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingPromptModalState {
     Confirmation { passkey: u32, wearable: String },
     Passkey { wearable: String, input: String },
@@ -192,6 +198,7 @@ pub struct TuiApp {
     // Alerts & Grace Period
     pub alerts: Vec<DaemonAlert>,
     pub grace_state: Option<GraceState>,
+    pub op_feedback: Option<OpFeedback>,
 
     // Diagnostics
     pub is_diagnostics_open: bool,
@@ -256,6 +263,7 @@ impl TuiApp {
             calibration_maturity: CalibrationMaturity::ColdStart,
             alerts: Vec::new(),
             grace_state: None,
+            op_feedback: None,
             is_diagnostics_open: false,
             enrolled_wearables: Vec::new(),
             selected_wearable_idx: 0,
@@ -500,6 +508,7 @@ impl TuiApp {
         self.contact_ok = false;
         self.playing_players_count = None;
         self.alerts.clear();
+        self.op_feedback = None;
         self.discovered_wearables.clear();
         if self.modal != ModalState::Help {
             self.close_modal();
@@ -650,6 +659,21 @@ impl TuiApp {
                 if self.selected_session_idx >= self.history_sessions.len() {
                     self.selected_session_idx = self.history_sessions.len().saturating_sub(1);
                 }
+                if let Some(selected) = self.history_sessions.get(self.selected_session_idx) {
+                    let target_id = selected.id.clone();
+                    if self
+                        .selected_session_detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.session.id != target_id)
+                    {
+                        self.selected_session_detail = None;
+                        if self.daemon_connected {
+                            return Some(TuiCommand::SessionGet { id: target_id });
+                        }
+                    }
+                } else {
+                    self.selected_session_detail = None;
+                }
             }
             IpcEvent::SessionDetailLoaded(detail) => {
                 self.selected_session_detail = Some(*detail);
@@ -700,6 +724,18 @@ impl TuiApp {
                 {
                     *scanning_remaining_ms = 0;
                     *error_message = message;
+                } else if !success {
+                    self.op_feedback = Some(OpFeedback {
+                        is_error: true,
+                        message: message.unwrap_or_else(|| format!("{op} failed")),
+                    });
+                } else if op == "session.export_trace" {
+                    self.op_feedback = Some(OpFeedback {
+                        is_error: false,
+                        message: "Trace exported".to_string(),
+                    });
+                } else {
+                    self.op_feedback = None;
                 }
             }
         }
@@ -719,7 +755,8 @@ impl TuiApp {
             return;
         }
 
-        let has_banner = self.grace_state.is_some() || !self.daemon_connected;
+        let has_banner =
+            self.grace_state.is_some() || !self.daemon_connected || self.op_feedback.is_some();
         let banner_height = u16::from(has_banner);
 
         let chunks = Layout::default()

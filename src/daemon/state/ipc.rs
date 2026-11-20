@@ -6,11 +6,13 @@ use crate::calibration::CalibrationState;
 use crate::config::ConfigPatch;
 use crate::ipc::protocol::{
     CalibrationSetBoundaryParams, DataBackupSqliteParams, DataExportBundleParams,
-    DataHardWipeParams, DataImportBundleParams, EnrollAuthResponseParams, EnrollSelectParams,
-    EnrollStartParams, ErrorPayload, PROTOCOL_VERSION, PauseParams, SessionDeleteParams,
-    SessionExportTraceParams, SessionGetParams, SessionListParams, SetDryRunParams,
-    SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableRenameParams,
-    WearableUnenrollParams, error_codes,
+    DataExportBundleResponse, DataHardWipeParams, DataImportBundleParams, DataImportBundleResponse,
+    DataPurgeRawResponse, EnrollAuthResponseParams, EnrollSelectParams, EnrollSelectResponse,
+    EnrollStartParams, EnrollStartResponse, ErrorPayload, PROTOCOL_VERSION, PauseParams,
+    SessionDeleteParams, SessionDeleteResponse, SessionExportTraceParams,
+    SessionExportTraceResponse, SessionGetParams, SessionListParams, SetDryRunParams,
+    SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableListResponse,
+    WearableMutationResponse, WearableRenameParams, WearableUnenrollParams, error_codes,
 };
 use crate::storage::{ImportMode, SetFeedbackRequest, WearableDescriptor};
 
@@ -154,7 +156,10 @@ impl DaemonCore {
                     .await
                     .map_err(storage_to_ipc_err)?;
                 self.apply_calibration_update(cal_state);
-                Ok(json!({ "deleted_session_id": deleted_id, "deleted_id": deleted_id }))
+                serialize_json(SessionDeleteResponse {
+                    deleted_session_id: deleted_id.clone(),
+                    deleted_id,
+                })
             }
             "session.export_trace" => {
                 let parsed: SessionExportTraceParams =
@@ -171,7 +176,10 @@ impl DaemonCore {
                     .export_trace(parsed.id, dest_path, format, !parsed.no_anonymize)
                     .await
                     .map_err(storage_to_ipc_err)?;
-                Ok(json!({ "path": parsed.path, "events_count": count }))
+                serialize_json(SessionExportTraceResponse {
+                    path: parsed.path,
+                    events_count: count,
+                })
             }
             "session.set_feedback" => {
                 let parsed: SetFeedbackParams = serde_json::from_value(params).map_err(|e| {
@@ -287,7 +295,9 @@ impl DaemonCore {
                     .purge_raw_samples()
                     .await
                     .map_err(storage_to_ipc_err)?;
-                Ok(json!({ "reclaimed_rows": reclaimed }))
+                serialize_json(DataPurgeRawResponse {
+                    reclaimed_rows: reclaimed,
+                })
             }
             "data.hard_wipe" => {
                 let parsed: DataHardWipeParams = serde_json::from_value(params).map_err(|e| {
@@ -342,13 +352,13 @@ impl DaemonCore {
                         )
                     })?;
                 let options = parsed.options();
-                let path = std::path::PathBuf::from(parsed.path);
+                let path = std::path::PathBuf::from(&parsed.path);
                 let now_ms = self.clock.now_utc().timestamp_millis();
                 self.persistence
-                    .export_bundle(path.clone(), options, now_ms)
+                    .export_bundle(path, options, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
-                Ok(json!({ "path": path.to_string_lossy() }))
+                serialize_json(DataExportBundleResponse { path: parsed.path })
             }
             "data.import_bundle" => {
                 let parsed: DataImportBundleParams =
@@ -369,14 +379,19 @@ impl DaemonCore {
                 self.apply_calibration_update(cal_state.clone());
                 self.wearable_source.notify_allowlist_changed();
                 self.publish_wearables_updated().await;
-                Ok(json!({ "summary": summary, "calibration": cal_state }))
+                serialize_json(DataImportBundleResponse {
+                    summary,
+                    calibration: cal_state,
+                })
             }
             "wearable.list" => {
                 let statuses = self
                     .build_wearable_statuses()
                     .await
                     .map_err(storage_to_ipc_err)?;
-                Ok(json!({ "wearables": statuses }))
+                serialize_json(WearableListResponse {
+                    wearables: statuses,
+                })
             }
             "wearable.rename" => {
                 let parsed: WearableRenameParams = serde_json::from_value(params).map_err(|e| {
@@ -392,7 +407,7 @@ impl DaemonCore {
                     .map_err(storage_to_ipc_err)?;
                 self.wearable_source.notify_allowlist_changed();
                 self.publish_wearables_updated().await;
-                Ok(json!({ "wearable": updated }))
+                serialize_json(WearableMutationResponse { wearable: updated })
             }
             "wearable.connect" => {
                 let parsed: WearableConnectParams =
@@ -429,9 +444,10 @@ impl DaemonCore {
                             format!("invalid wearable.unenroll params: {e}"),
                         )
                     })?;
-                let unenrolled = self
+                let now_ms = self.clock.now_utc().timestamp_millis();
+                let (unenrolled, cal_state) = self
                     .persistence
-                    .unenroll_wearable(parsed.id, parsed.delete_sessions)
+                    .unenroll_wearable(parsed.id, parsed.delete_sessions, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
                 {
@@ -451,9 +467,14 @@ impl DaemonCore {
                     )
                     .await;
                 }
+                if let Some(cal_state) = cal_state {
+                    self.apply_calibration_update(cal_state);
+                }
                 self.wearable_source.notify_allowlist_changed();
                 self.publish_wearables_updated().await;
-                Ok(json!({ "wearable": unenrolled }))
+                serialize_json(WearableMutationResponse {
+                    wearable: unenrolled,
+                })
             }
             "wearable.enroll_start" => {
                 let parsed: EnrollStartParams = serde_json::from_value(params).map_err(|e| {
@@ -494,7 +515,10 @@ impl DaemonCore {
                     timeout_ms,
                 });
                 let devices = guard.discovered_wearables.clone();
-                Ok(json!({ "devices": devices, "wearables": devices }))
+                serialize_json(EnrollStartResponse {
+                    devices: devices.clone(),
+                    wearables: devices,
+                })
             }
             "wearable.enroll_select" => {
                 let parsed: EnrollSelectParams = serde_json::from_value(params).map_err(|e| {
@@ -602,11 +626,11 @@ impl DaemonCore {
                     )
                 })?;
 
-                Ok(json!({
-                    "wearable": enrolled,
-                    "warnings": warnings,
-                    "hints": hints,
-                }))
+                serialize_json(EnrollSelectResponse {
+                    wearable: enrolled,
+                    warnings,
+                    hints,
+                })
             }
             "alert.dismiss" => {
                 let id = params

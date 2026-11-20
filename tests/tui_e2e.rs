@@ -163,9 +163,10 @@ fn make_test_paths(temp: &TempDir) -> (ResolvedPaths, MapEnv) {
     (paths, env)
 }
 
-async fn wait_for_app_state<F>(
+async fn wait_for_app_state_with_cmds<F>(
     app: &mut TuiApp,
     event_rx: &mut mpsc::Receiver<TuiEvent>,
+    cmd_tx: Option<&mpsc::Sender<TuiCommand>>,
     mut pred: F,
 ) where
     F: FnMut(&TuiApp) -> bool,
@@ -178,9 +179,20 @@ async fn wait_for_app_state<F>(
             .recv()
             .await
             .expect("TUI IPC event channel closed before reaching expected state");
-        let _ = app.handle_event(ev);
+        if let Some(cmd) = app.handle_event(ev)
+            && let Some(tx) = cmd_tx
+        {
+            let _ = tx.send(cmd).await;
+        }
     }
     panic!("TUI app did not reach expected state within event budget");
+}
+
+async fn wait_for_app_state<F>(app: &mut TuiApp, event_rx: &mut mpsc::Receiver<TuiEvent>, pred: F)
+where
+    F: FnMut(&TuiApp) -> bool,
+{
+    wait_for_app_state_with_cmds(app, event_rx, None, pred).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1085,7 +1097,7 @@ async fn test_real_socket_grace_cancel_snooze_calibration_mpris_and_inhibited_al
 
     // 1. Test Snooze over real Unix socket
     setup_client
-        .request("monitor.test_trigger", json!({ "grace_sec": 15 }))
+        .request("monitor.test_trigger", json!({ "grace_sec": 300 }))
         .await
         .unwrap();
     wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_some()).await;
@@ -1102,10 +1114,13 @@ async fn test_real_socket_grace_cancel_snooze_calibration_mpris_and_inhibited_al
     assert_eq!(snooze_cmd, Some(TuiCommand::SnoozeGrace(None)));
     cmd_tx.send(snooze_cmd.unwrap()).await.unwrap();
     wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_none()).await;
+    while daemon.core().is_in_grace_period() {
+        tokio::task::yield_now().await;
+    }
 
     // 2. Test Cancel over real Unix socket
     setup_client
-        .request("monitor.test_trigger", json!({ "grace_sec": 15 }))
+        .request("monitor.test_trigger", json!({ "grace_sec": 300 }))
         .await
         .unwrap();
     wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_some()).await;
@@ -1113,14 +1128,28 @@ async fn test_real_socket_grace_cancel_snooze_calibration_mpris_and_inhibited_al
     assert_eq!(cancel_cmd, Some(TuiCommand::CancelGrace));
     cmd_tx.send(cancel_cmd.unwrap()).await.unwrap();
     wait_for_app_state(&mut app, &mut event_rx, |a| a.grace_state.is_none()).await;
+    while daemon.core().is_in_grace_period() {
+        tokio::task::yield_now().await;
+    }
 
     // 3. Test RefusedInhibited pipeline execution surfaces LOGIND_INHIBITED alert over IPC
     daemon
         .core()
         .handle_confirmed_sleep_onset(1_700_000_000_000)
         .await;
-    tokio::time::advance(Duration::from_secs(18)).await;
-    tokio::task::yield_now().await;
+    for _ in 0..25 {
+        if daemon
+            .core()
+            .status()
+            .alerts
+            .iter()
+            .any(|al| al.id == alert_ids::LOGIND_INHIBITED)
+        {
+            break;
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
 
     wait_for_app_state(&mut app, &mut event_rx, |a| {
         a.alerts
@@ -5961,4 +5990,440 @@ fn test_mouse_settings_hard_wipe_modal_and_backdrop() {
         None
     );
     assert_eq!(app.modal, ModalState::None);
+}
+
+struct RealSocketTuiHarness {
+    _temp: TempDir,
+    paths: bpmute::paths::ResolvedPaths,
+    daemon: DaemonHandle,
+    event_rx: mpsc::Receiver<TuiEvent>,
+    cmd_tx: mpsc::Sender<TuiCommand>,
+    shutdown_tx: watch::Sender<bool>,
+    bridge_task: tokio::task::JoinHandle<()>,
+    app: TuiApp,
+    session_ids: Vec<String>,
+}
+
+impl RealSocketTuiHarness {
+    async fn spawn(session_count: usize, with_raw_samples: bool) -> Self {
+        let temp = TempDir::new().unwrap();
+        let (paths, env) = make_test_paths(&temp);
+        let base_ts = Utc::now().timestamp_millis() - 3_600_000;
+
+        let mut session_ids = Vec::with_capacity(session_count);
+        {
+            let db_file = bpmute::storage::db_path_in_data_dir(&paths.data_dir);
+            let db_lock = bpmute::storage::lock_path_in_data_dir(&paths.data_dir);
+            let mut store =
+                bpmute::storage::LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+            let wid = store
+                .upsert_wearable(
+                    &bpmute::storage::WearableDescriptor {
+                        mac: "AA:BB:CC:DD:EE:01".into(),
+                        address_type: "public".into(),
+                        alias: Some("Band".into()),
+                        advertised_name: None,
+                        supports_rr: true,
+                        supports_contact: true,
+                    },
+                    base_ts - 100_000,
+                )
+                .unwrap();
+
+            for i in 0..session_count {
+                let start_ts = base_ts + (i as i64) * 600_000;
+                let end_ts = start_ts + 400_000;
+                let sid = store
+                    .open_session(&bpmute::storage::OpenSessionRequest {
+                        wearable_id: wid.clone(),
+                        start_ts_ms: start_ts,
+                        detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+                    })
+                    .unwrap();
+                if with_raw_samples {
+                    store
+                        .append_epoch_and_raw(
+                            &sid,
+                            None,
+                            &[(
+                                0,
+                                &HrPacket {
+                                    ts_ms: start_ts + 1_000,
+                                    bpm: 64.0,
+                                    rr_ms: vec![930.0],
+                                    contact_status: ContactStatus::Contact,
+                                },
+                            )],
+                        )
+                        .unwrap();
+                }
+                store
+                    .close_session_and_recompute(
+                        &bpmute::storage::CloseSessionRequest {
+                            session_id: sid.clone(),
+                            summary: SessionSummary {
+                                session_index: (i + 1) as u64,
+                                start_ts_ms: start_ts,
+                                end_ts_ms: end_ts,
+                                end_reason: SessionEndReason::StreamEnded,
+                                candidate_ts_ms: None,
+                                confirmed_ts_ms: None,
+                                sleeping_ts_ms: None,
+                                anomalous: false,
+                                fp_count: 0,
+                                warmup_mu_hr: Some(64.0),
+                                warmup_sigma_hr: Some(2.5),
+                                warmup_ln_rmssd: None,
+                                onset_hr_bpm: Some(54.0),
+                                sleep_mu_hr: Some(54.0),
+                                sleep_ln_rmssd: None,
+                                observed_hr_var_ratio: None,
+                                typical_sqi: None,
+                                post_trigger_sleep_sec: 0,
+                                had_rr: with_raw_samples,
+                                grace_cancel_count: 0,
+                                rapid_wake_fp_count: 0,
+                                snooze_count: 0,
+                                epochs_count: usize::from(with_raw_samples),
+                            },
+                            trigger_power_action: PowerAction::None,
+                            rapid_resume_within_5m: false,
+                        },
+                        end_ts,
+                    )
+                    .unwrap();
+                session_ids.push(sid);
+            }
+        }
+
+        let loaded =
+            LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+        let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+        let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+            paths.clone(),
+            loaded,
+            Arc::new(env),
+            clock,
+        ))
+        .await
+        .unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+        let bridge_task = tokio::spawn(bridge.run());
+
+        let mut app = TuiApp::new(false, false, false);
+        wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+            a.daemon_connected
+                && a.active_config.is_some()
+                && a.history_sessions.len() == session_count
+                && (session_count == 0 || a.selected_session_detail.is_some())
+        })
+        .await;
+
+        // `session.list` orders newest-first, matching `app.history_sessions`.
+        session_ids.reverse();
+
+        Self {
+            _temp: temp,
+            paths,
+            daemon,
+            event_rx,
+            cmd_tx,
+            shutdown_tx,
+            bridge_task,
+            app,
+            session_ids,
+        }
+    }
+
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.bridge_task.await;
+        self.daemon.shutdown().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_delete_session_e2e() {
+    let mut h = RealSocketTuiHarness::spawn(1, false).await;
+    let s1_id = h.session_ids[0].clone();
+
+    // Switch to History tab, open Delete modal with 'D', confirm with Enter
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(h.app.active_tab, Tab::History);
+    assert_eq!(
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('D')))),
+        None
+    );
+    assert!(matches!(h.app.modal, ModalState::DeleteSessionModal { .. }));
+
+    let del_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("confirming DeleteSessionModal should emit SessionDelete");
+    assert_eq!(del_cmd, TuiCommand::SessionDelete { id: s1_id.clone() });
+    h.cmd_tx.send(del_cmd).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_sessions.is_empty()
+    })
+    .await;
+
+    let mut client = IpcClient::connect(&h.paths.socket_path).await.unwrap();
+    let list_resp = client.request("session.list", json!({})).await.unwrap();
+    let detail_cleared = h.app.selected_session_detail.is_none();
+
+    h.shutdown().await;
+
+    assert!(
+        detail_cleared,
+        "selected_session_detail should clear when last session is deleted"
+    );
+    assert_eq!(
+        list_resp["sessions"].as_array().map(|a| a.len()),
+        Some(0),
+        "session still exists in daemon DB: {list_resp:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_delete_middle_session_updates_detail_pane() {
+    let mut h = RealSocketTuiHarness::spawn(3, false).await;
+    let expected_remaining_id = h.session_ids[2].clone();
+
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    let select_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Char('j'))))
+        .expect("selecting row 1 should request SessionGet");
+    h.cmd_tx.send(select_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.selected_session_idx == 1
+            && a.selected_session_detail
+                .as_ref()
+                .is_some_and(|d| d.session.id == h.session_ids[1])
+    })
+    .await;
+
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('D'))));
+    let del_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("confirming DeleteSessionModal should emit SessionDelete");
+    h.cmd_tx.send(del_cmd).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_sessions.len() == 2
+            && a.selected_session_idx == 1
+            && a.selected_session_detail
+                .as_ref()
+                .is_some_and(|d| d.session.id == expected_remaining_id)
+    })
+    .await;
+
+    h.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_export_trace_e2e() {
+    let mut h = RealSocketTuiHarness::spawn(1, true).await;
+
+    let export_path = h._temp.path().join("exported-trace.csv");
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('x')))),
+        None
+    );
+    if let ModalState::ExportTraceModal {
+        ref mut destination_path,
+        ..
+    } = h.app.modal
+    {
+        *destination_path = export_path.to_string_lossy().into_owned();
+    } else {
+        panic!("expected ExportTraceModal");
+    }
+
+    let export_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("confirming ExportTraceModal should emit SessionExportTrace");
+    h.cmd_tx.send(export_cmd).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.op_feedback
+            .as_ref()
+            .is_some_and(|fb| !fb.is_error && fb.message == "Trace exported")
+    })
+    .await;
+
+    let csv = fs::read_to_string(&export_path).expect("exported CSV file should exist");
+    h.shutdown().await;
+
+    assert!(csv.contains("ts_ms,bpm,rr_ms,contact_status,event"));
+    assert!(csv.contains("64.0"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_op_error_surfaces_feedback_banner() {
+    let mut h = RealSocketTuiHarness::spawn(1, false).await;
+
+    let export_path = h._temp.path().join("missing-trace.csv");
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('x'))));
+    if let ModalState::ExportTraceModal {
+        ref mut destination_path,
+        ..
+    } = h.app.modal
+    {
+        *destination_path = export_path.to_string_lossy().into_owned();
+    }
+    let export_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .unwrap();
+    h.cmd_tx.send(export_cmd).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.op_feedback.as_ref().is_some_and(|fb| fb.is_error)
+    })
+    .await;
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal
+        .draw(|f| h.app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let rendered = buffer_to_string(terminal.backend().buffer());
+    assert!(rendered.contains("Error: no trace data available"));
+
+    // Next key clears the transient op_feedback banner.
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert!(h.app.op_feedback.is_none());
+
+    h.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_settings_config_rebaseline_undo_and_hard_wipe_e2e() {
+    let mut h = RealSocketTuiHarness::spawn(1, false).await;
+
+    // 1. Settings -> toggle Sensitivity via ConfigSnapshotPayload round-trip
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('4'))));
+    assert_eq!(h.app.active_tab, Tab::Settings);
+    let initial_sens = h.app.active_config.as_ref().unwrap().detection.sensitivity;
+    let cfg_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("toggling Sensitivity should emit ConfigUpdate");
+    h.cmd_tx.send(cfg_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.active_config
+            .as_ref()
+            .is_some_and(|c| c.detection.sensitivity != initial_sens)
+    })
+    .await;
+
+    // 2. Soft Rebaseline ('B') with seed 52
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('B'))));
+    for c in "52".chars() {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let rebaseline_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("SoftRebaselineModal should emit CalibrationSetBoundary");
+    h.cmd_tx.send(rebaseline_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_boundaries.len() == 1
+    })
+    .await;
+
+    // 3. Undo Boundary ('U')
+    let undo_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Char('U'))))
+        .expect("Undo should emit CalibrationUndoBoundary");
+    h.cmd_tx.send(undo_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_boundaries
+            .first()
+            .is_some_and(|b| b.reverted_at_ms.is_some())
+    })
+    .await;
+
+    // 4. Hard Wipe ('W')
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('W'))));
+    for c in "WIPE".chars() {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let wipe_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("HardWipeModal should emit DataHardWipe");
+    h.cmd_tx.send(wipe_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_sessions.is_empty()
+    })
+    .await;
+
+    assert!(h.app.selected_session_detail.is_none());
+    h.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_feedback_and_unenroll_delete_sessions_e2e() {
+    let mut h = RealSocketTuiHarness::spawn(1, false).await;
+
+    // 1. Feedback modal ('f') -> step verdict to FalsePositive -> submit
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    let fb_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("FeedbackModal should emit SessionSetFeedback");
+    h.cmd_tx.send(fb_cmd).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_sessions
+            .first()
+            .and_then(|s| s.feedback.as_ref())
+            .and_then(|f| f.verdict)
+            .is_some()
+    })
+    .await;
+
+    // 2. Wearables -> Unenroll with delete_sessions = true -> recomputes calibration and refreshes history
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('3'))));
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('u'))));
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    let unenroll_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("UnenrollModal should emit WearableUnenroll");
+    h.cmd_tx.send(unenroll_cmd).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.enrolled_wearables.is_empty() && a.history_sessions.is_empty()
+    })
+    .await;
+
+    let mut client = IpcClient::connect(&h.paths.socket_path).await.unwrap();
+    let cal_resp = client
+        .request("calibration.status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(cal_resp["valid_sessions"], 0);
+    assert_eq!(cal_resp["maturity"], "cold_start");
+    let wearables_map = cal_resp["wearables"].as_object().unwrap();
+    assert!(
+        wearables_map.values().all(|w| w["sessions_count"] == 0),
+        "all wearable session counts should reset to 0: {cal_resp:?}"
+    );
+    assert!(h.app.selected_session_detail.is_none());
+
+    h.shutdown().await;
 }

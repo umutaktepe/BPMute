@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -379,6 +380,16 @@ pub(crate) async fn ipc_request_typed<T: DeserializeOwned, WErr: Write>(
         }),
         Err(err) => Err(report_ipc_error(err, stderr)),
     }
+}
+
+pub(crate) async fn ipc_request_params<P: Serialize, T: DeserializeOwned, WErr: Write>(
+    client: &mut IpcClient,
+    op: &str,
+    params: &P,
+    stderr: &mut WErr,
+) -> Result<T, ExitCode> {
+    let val = serde_json::to_value(params).unwrap_or_else(|_| json!({}));
+    ipc_request_typed(client, op, val, stderr).await
 }
 
 pub(crate) fn open_existing_store_rw<WErr: Write>(

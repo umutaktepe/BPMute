@@ -2,12 +2,13 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::calibration::CalibrationState;
 use crate::logging::mask_mac;
 use crate::sleep_engine::WearableFloor;
 use crate::storage::schema::generate_uuid_v7_with;
 use crate::storage::{EnrolledWearable, StorageError, WearableDescriptor};
 
-use super::{LedgerStore, resolve_table_id_prefix};
+use super::{LedgerStore, recompute_and_persist_in_tx, resolve_table_id_prefix};
 
 impl LedgerStore {
     /// Inserts or updates a Wearable by normalized MAC address + address type and returns its UUIDv7 ID.
@@ -141,14 +142,17 @@ impl LedgerStore {
     ///
     /// By default (`delete_sessions = false`), only BPMute's active allowlist entry is removed
     /// (`active = 0`), preserving historical `Monitoring Sessions`.
-    /// When `delete_sessions = true`, all associated sessions and telemetry are deleted.
+    /// When `delete_sessions = true`, all associated sessions and telemetry are deleted and
+    /// `calibration_state` is recomputed.
     pub fn unenroll_wearable(
         &mut self,
         id_or_prefix: &str,
         delete_sessions: bool,
-    ) -> Result<EnrolledWearable, StorageError> {
+        now_ms: i64,
+    ) -> Result<(EnrolledWearable, Option<CalibrationState>), StorageError> {
         self.write_tx(|tx| {
             let id = resolve_wearable_id(tx, id_or_prefix)?;
+            let mut cal_state = None;
             if delete_sessions {
                 tx.execute(
                     "DELETE FROM session_feedback WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
@@ -166,12 +170,15 @@ impl LedgerStore {
                     "DELETE FROM sessions WHERE wearable_id = ?1",
                     params![id],
                 )?;
+                let _ = tx.execute("PRAGMA incremental_vacuum(500);", []);
+                cal_state = Some(recompute_and_persist_in_tx(tx, now_ms)?);
             }
             tx.execute(
                 "UPDATE wearables SET active = 0 WHERE id = ?1",
                 params![id],
             )?;
-            load_enrolled_wearable_in_conn(tx, &id)
+            let enrolled = load_enrolled_wearable_in_conn(tx, &id)?;
+            Ok((enrolled, cal_state))
         })
     }
 }

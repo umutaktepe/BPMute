@@ -1043,3 +1043,187 @@ async fn test_sqlite_online_backup_and_stats() {
     assert_eq!(stats_json["wearables_count"], 1);
     assert!(stats_json["db_size_bytes"].as_u64().unwrap() > 0);
 }
+
+#[tokio::test]
+async fn test_online_cli_sessions_and_data_ipc_roundtrip() {
+    use std::sync::Arc;
+
+    use bpmute::config::{CliOverrides, LoadedConfig};
+    use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = test_paths_and_env(&temp);
+    let base_ts = Utc::now().timestamp_millis() - 2_500_000;
+
+    let s1_id = {
+        let db_path = db_path_in_data_dir(&paths.data_dir);
+        let lock_path = lock_path_in_data_dir(&paths.data_dir);
+        let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &WearableDescriptor {
+                    mac: "77:88:99:AA:BB:CC".into(),
+                    address_type: "public".into(),
+                    alias: Some("OnlineBand".into()),
+                    advertised_name: Some("OnlineBand".into()),
+                    supports_rr: true,
+                    supports_contact: true,
+                },
+                base_ts - 100_000,
+            )
+            .unwrap();
+        let sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: base_ts,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .append_epoch_and_raw(
+                &sid,
+                None,
+                &[(
+                    0,
+                    &HrPacket {
+                        ts_ms: base_ts + 1_000,
+                        bpm: 64.0,
+                        rr_ms: vec![920.0],
+                        contact_status: ContactStatus::Contact,
+                    },
+                )],
+            )
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary: sample_summary(base_ts, base_ts + 2_000_000, 54.0),
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                base_ts + 2_000_000,
+            )
+            .unwrap();
+        sid
+    };
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env.clone()),
+        clock,
+    ))
+    .await
+    .unwrap();
+
+    // 1. sessions export (online)
+    let trace_path = temp.path().join("online-trace.csv");
+    let (code, stdout, stderr) = run_inproc_cli(
+        &[
+            "bpmute",
+            "sessions",
+            "export",
+            &s1_id,
+            &trace_path.to_string_lossy(),
+            "--format",
+            "csv",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "sessions export stderr: {stderr}");
+    assert!(
+        stdout.contains("Exported 1 samples"),
+        "unexpected sessions export stdout: {stdout}"
+    );
+    assert!(trace_path.try_exists().unwrap());
+
+    // 2. data export (online)
+    let bundle_path = temp.path().join("online-bundle.json");
+    let (code, stdout, stderr) = run_inproc_cli(
+        &[
+            "bpmute",
+            "data",
+            "export",
+            &bundle_path.to_string_lossy(),
+            "--include-raw",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "data export stderr: {stderr}");
+    assert!(
+        stdout.contains(&bundle_path.to_string_lossy().into_owned()),
+        "unexpected data export stdout: {stdout}"
+    );
+    assert!(bundle_path.try_exists().unwrap());
+
+    // 3. data backup (online)
+    let backup_path = temp.path().join("online-backup.db");
+    let (code, _, stderr) = run_inproc_cli(
+        &["bpmute", "data", "backup", &backup_path.to_string_lossy()],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "data backup stderr: {stderr}");
+    assert!(backup_path.try_exists().unwrap());
+
+    // 4. calibration rebaseline (online)
+    let (code, _, stderr) = run_inproc_cli(
+        &[
+            "bpmute",
+            "calibration",
+            "rebaseline",
+            "--seed",
+            "52",
+            "--yes",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "rebaseline stderr: {stderr}");
+
+    // 5. sessions delete (online)
+    let (code, _, stderr) =
+        run_inproc_cli(&["bpmute", "sessions", "delete", &s1_id, "--yes"], &env).await;
+    assert_eq!(code, ExitCode::Success, "sessions delete stderr: {stderr}");
+
+    // 6. data import (online)
+    let (code, stdout, stderr) = run_inproc_cli(
+        &[
+            "bpmute",
+            "data",
+            "import",
+            &bundle_path.to_string_lossy(),
+            "--mode",
+            "merge",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "data import stderr: {stderr}");
+    assert!(
+        stdout.contains("1 sessions"),
+        "unexpected data import stdout: {stdout}"
+    );
+
+    // 7. data purge-raw (online)
+    let (code, stdout, stderr) =
+        run_inproc_cli(&["bpmute", "data", "purge-raw", "--yes"], &env).await;
+    assert_eq!(code, ExitCode::Success, "data purge-raw stderr: {stderr}");
+    assert!(
+        stdout.contains("1 rows deleted"),
+        "unexpected purge-raw stdout: {stdout}"
+    );
+
+    // 8. data wipe (online)
+    let (code, _, stderr) =
+        run_inproc_cli(&["bpmute", "data", "wipe", "--confirm", "WIPE"], &env).await;
+    assert_eq!(code, ExitCode::Success, "data wipe stderr: {stderr}");
+
+    daemon.shutdown().await;
+}

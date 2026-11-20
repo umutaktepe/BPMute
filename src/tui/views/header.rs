@@ -3,7 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use crate::tui::app::{GraceState, Tab, TuiApp};
+use crate::tui::app::{GraceState, OpFeedback, Tab, TuiApp};
 use crate::tui::hit_map::{ClickTarget, HitMap};
 
 const TABS: [(Tab, &str); 4] = [
@@ -66,7 +66,18 @@ pub(crate) fn render_global_banner(
 
     if let Some(ref grace) = app.grace_state {
         render_grace_banner(grace, app, area, buf, hit_map);
+    } else if let Some(ref fb) = app.op_feedback {
+        render_op_feedback_banner(fb, app, area, buf);
     }
+}
+
+fn render_op_feedback_banner(fb: &OpFeedback, app: &TuiApp, area: Rect, buf: &mut Buffer) {
+    let prefix = if fb.is_error { " Error: " } else { " " };
+    let max_len = usize::from(area.width).saturating_sub(prefix.len() + 1);
+    let msg: String = fb.message.chars().take(max_len).collect();
+    let text = format!("{prefix}{msg} ");
+    let p = Paragraph::new(text).style(app.theme.banner_op_feedback(fb.is_error));
+    p.render(area, buf);
 }
 
 fn render_grace_banner(

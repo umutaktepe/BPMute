@@ -3,12 +3,17 @@
 use std::io::Write;
 
 use chrono::Utc;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::calibration::{CalibrationState, validate_sleep_hr_bpm};
 use crate::cli::args::{CalibrationCommand, SessionsCommand};
 use crate::config::{LoadedConfig, PatchField};
 use crate::exit_code::ExitCode;
+use crate::ipc::protocol::{
+    CalibrationSetBoundaryParams, SessionDeleteParams, SessionDeleteResponse,
+    SessionExportTraceParams, SessionExportTraceResponse, SessionGetParams, SessionListParams,
+    SetFeedbackParams, SetSeedParams,
+};
 use crate::logging::format_wearable_label;
 use crate::paths::{EnvSource, ResolvedPaths};
 use crate::replay::{
@@ -21,9 +26,9 @@ use crate::storage::{
 };
 
 use super::{
-    OnlineOrOffline, ReplayCliArgs, confirm_action, connect_online_or_offline, ipc_request_typed,
-    open_existing_store_rw, report_ipc_error, report_storage_error, resolve_cli_path,
-    write_json_line,
+    OnlineOrOffline, ReplayCliArgs, confirm_action, connect_online_or_offline, ipc_request_params,
+    ipc_request_typed, open_existing_store_rw, report_ipc_error, report_storage_error,
+    resolve_cli_path, write_json_line,
 };
 
 pub(crate) fn run_replay<WOut: Write, WErr: Write>(
@@ -144,14 +149,11 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             }
             let page: SessionListPage = match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match ipc_request_typed(
-                        &mut client,
-                        "session.list",
-                        json!({ "limit": limit, "offset": 0 }),
-                        stderr,
-                    )
-                    .await
-                    {
+                    let params = SessionListParams {
+                        limit: Some(limit),
+                        offset: Some(0),
+                    };
+                    match ipc_request_params(&mut client, "session.list", &params, stderr).await {
                         Ok(page) => page,
                         Err(code) => return code,
                     }
@@ -220,9 +222,8 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             }
             let detail: SessionFullDetail = match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match ipc_request_typed(&mut client, "session.get", json!({ "id": id }), stderr)
-                        .await
-                    {
+                    let params = SessionGetParams { id: id.clone() };
+                    match ipc_request_params(&mut client, "session.get", &params, stderr).await {
                         Ok(detail) => detail,
                         Err(code) => return code,
                     }
@@ -313,34 +314,41 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    let mut map = Map::new();
-                    map.insert("session_id".to_string(), Value::String(id.clone()));
-                    if clear {
-                        map.insert("clear".to_string(), Value::Bool(true));
+                    let params = if clear {
+                        SetFeedbackParams {
+                            session_id: id.clone(),
+                            verdict: PatchField::Unchanged,
+                            onset_hhmm: PatchField::Unchanged,
+                            avg_sleep_hr: PatchField::Unchanged,
+                            clear: true,
+                        }
                     } else {
-                        if let Some(v) = verdict {
-                            map.insert("verdict".to_string(), json!(v));
+                        SetFeedbackParams {
+                            session_id: id.clone(),
+                            verdict: verdict.map_or(PatchField::Unchanged, PatchField::Set),
+                            onset_hhmm: onset.map_or(PatchField::Unchanged, PatchField::Set),
+                            avg_sleep_hr: avg_sleep_hr
+                                .map_or(PatchField::Unchanged, PatchField::Set),
+                            clear: false,
                         }
-                        if let Some(t) = onset {
-                            map.insert("onset_hhmm".to_string(), json!(t));
-                        }
-                        if let Some(hr) = avg_sleep_hr {
-                            map.insert("avg_sleep_hr".to_string(), json!(hr));
-                        }
-                    }
-                    match client
-                        .request("session.set_feedback", Value::Object(map))
-                        .await
+                    };
+                    match ipc_request_params::<_, SessionFullDetail, _>(
+                        &mut client,
+                        "session.set_feedback",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
-                        Ok(val) => {
-                            let sid = val["session"]["id"].as_str().unwrap_or(&id);
+                        Ok(detail) => {
                             let _ = writeln!(
                                 stdout,
-                                "Updated feedback for session {sid} and recomputed calibration."
+                                "Updated feedback for session {} and recomputed calibration.",
+                                detail.session.id
                             );
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -386,19 +394,24 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request("session.delete", json!({ "session_id": id }))
-                        .await
+                    let params = SessionDeleteParams { id: id.clone() };
+                    match ipc_request_params::<_, SessionDeleteResponse, _>(
+                        &mut client,
+                        "session.delete",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
-                        Ok(val) => {
-                            let deleted_id = val["deleted_session_id"].as_str().unwrap_or(&id);
+                        Ok(resp) => {
                             let _ = writeln!(
                                 stdout,
-                                "Deleted session {deleted_id} and recomputed calibration."
+                                "Deleted session {} and recomputed calibration.",
+                                resp.deleted_session_id
                             );
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -434,10 +447,6 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             no_anonymize,
         } => {
             let abs_path = resolve_cli_path(&path);
-            let format_str = match format {
-                crate::cli::args::TraceFormatArg::Csv => "csv",
-                crate::cli::args::TraceFormatArg::Jsonl => "jsonl",
-            };
             let trace_format = match format {
                 crate::cli::args::TraceFormatArg::Csv => TraceFormat::Csv,
                 crate::cli::args::TraceFormatArg::Jsonl => TraceFormat::Jsonl,
@@ -445,29 +454,29 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request(
-                            "session.export_trace",
-                            json!({
-                                "session_id": id,
-                                "destination_path": abs_path.to_string_lossy(),
-                                "format": format_str,
-                                "no_anonymize": no_anonymize,
-                            }),
-                        )
-                        .await
+                    let params = SessionExportTraceParams {
+                        id: id.clone(),
+                        path: abs_path.to_string_lossy().into_owned(),
+                        format: Some(trace_format),
+                        no_anonymize,
+                    };
+                    match ipc_request_params::<_, SessionExportTraceResponse, _>(
+                        &mut client,
+                        "session.export_trace",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
-                        Ok(val) => {
-                            let count = val["samples_exported"].as_u64().unwrap_or(0);
-                            let sid = val["session_id"].as_str().unwrap_or(&id);
+                        Ok(resp) => {
                             let _ = writeln!(
                                 stdout,
-                                "Exported {count} samples from session {sid} to {}",
-                                abs_path.display()
+                                "Exported {} samples from session {id} to {}",
+                                resp.events_count, resp.path
                             );
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -579,9 +588,16 @@ pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request("calibration.set_seed", json!({ "sleep_hr": target_seed }))
-                        .await
+                    let params = SetSeedParams {
+                        sleep_hr: target_seed,
+                    };
+                    match ipc_request_params::<_, Value, _>(
+                        &mut client,
+                        "calibration.set_seed",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             if let Some(hr) = target_seed {
@@ -592,7 +608,7 @@ pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
                             }
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -723,22 +739,25 @@ pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
             let now_ms = Utc::now().timestamp_millis();
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    let mut map = serde_json::Map::new();
-                    map.insert("reason".to_string(), json!("rebaseline"));
-                    map.insert("reset_floors".to_string(), json!(reset_floors));
-                    if let Some(s) = seed {
-                        map.insert("seed_avg_sleep_hr".to_string(), json!(s));
-                    }
-                    match client
-                        .request("calibration.set_boundary", Value::Object(map))
-                        .await
+                    let params = CalibrationSetBoundaryParams {
+                        effective_ts_ms: None,
+                        seed_sleep_hr: seed,
+                        reset_floors,
+                    };
+                    match ipc_request_params::<_, Value, _>(
+                        &mut client,
+                        "calibration.set_boundary",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             let _ =
                                 writeln!(stdout, "Rebaselined calibration to Cold Start boundary.");
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {

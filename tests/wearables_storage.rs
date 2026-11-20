@@ -47,8 +47,9 @@ fn wearable_storage_allowlist_rename_and_unenroll_lifecycle() {
         .unwrap();
 
     // 4. Unenroll without --delete-sessions (default: removes from allowlist, keeps sessions)
-    let unenrolled = store.unenroll_wearable(prefix, false).unwrap();
+    let (unenrolled, cal_none) = store.unenroll_wearable(prefix, false, 2_500).unwrap();
     assert!(!unenrolled.active);
+    assert!(cal_none.is_none());
 
     let active_list = store.list_enrolled_wearables().unwrap();
     assert!(
@@ -66,8 +67,9 @@ fn wearable_storage_allowlist_rename_and_unenroll_lifecycle() {
     assert_eq!(store.list_enrolled_wearables().unwrap().len(), 1);
 
     // 6. Unenroll with delete_sessions = true
-    let unenrolled_purge = store.unenroll_wearable(prefix, true).unwrap();
+    let (unenrolled_purge, cal_recomputed) = store.unenroll_wearable(prefix, true, 4_000).unwrap();
     assert!(!unenrolled_purge.active);
+    assert!(cal_recomputed.is_some());
     assert!(
         store.get_session(&session_id).is_err(),
         "session must be purged with delete_sessions = true"

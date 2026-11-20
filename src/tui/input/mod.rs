@@ -24,6 +24,8 @@ pub(super) fn step_index(current: usize, len: usize, delta: isize) -> usize {
 
 impl TuiApp {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiCommand> {
+        self.op_feedback = None;
+
         // 1. If text input is focused, suspend all global hotkeys and handle typing
         if self.is_input_focused() {
             return self.handle_text_input_key(key);

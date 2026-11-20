@@ -46,6 +46,15 @@ impl DaemonCore {
         *guard_p = None;
     }
 
+    pub fn clear_active_grace_for(&self, tx: &mpsc::Sender<GraceControlCmd>) {
+        let mut guard_tx = self.active_grace_tx.lock().unwrap();
+        if guard_tx.as_ref().is_some_and(|cur| cur.same_channel(tx)) {
+            let mut guard_p = self.active_grace_params.lock().unwrap();
+            *guard_tx = None;
+            *guard_p = None;
+        }
+    }
+
     pub async fn cancel_grace(&self) -> Result<(), ErrorPayload> {
         let tx = self.active_grace_tx.lock().unwrap().clone();
         if let Some(sender) = tx {
@@ -161,12 +170,13 @@ impl DaemonCore {
         };
 
         let (tx, rx) = mpsc::channel(8);
+        let tx_owner = tx.clone();
         self.set_active_grace(tx, params.clone());
 
         let core = Arc::clone(self);
         tokio::spawn(async move {
             let outcome = core.coordinator.run(params, rx).await;
-            core.clear_active_grace();
+            core.clear_active_grace_for(&tx_owner);
             if let GraceRunOutcome::Completed(gr) = outcome
                 && gr.outcome == GraceResult::Expired
             {
@@ -335,12 +345,13 @@ impl DaemonCore {
         };
 
         let (tx, rx) = mpsc::channel(8);
+        let tx_owner = tx.clone();
         self.set_active_grace(tx, params.clone());
 
         let core = Arc::clone(self);
         tokio::spawn(async move {
             let outcome = core.coordinator.run(params, rx).await;
-            core.clear_active_grace();
+            core.clear_active_grace_for(&tx_owner);
             match outcome {
                 GraceRunOutcome::Completed(gr) => {
                     if gr.outcome == GraceResult::Expired {

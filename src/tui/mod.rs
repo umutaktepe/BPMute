@@ -11,6 +11,7 @@
 
 pub mod app;
 pub mod client;
+mod client_commands;
 pub mod event;
 pub(crate) mod hit_map;
 pub mod input;
@@ -19,7 +20,9 @@ pub mod terminal;
 pub mod theme;
 pub mod views;
 
-pub use app::{GraceState, ModalState, PairingPromptModalState, Tab, TuiApp, UnenrollButton};
+pub use app::{
+    GraceState, ModalState, OpFeedback, PairingPromptModalState, Tab, TuiApp, UnenrollButton,
+};
 pub use client::TuiIpcBridge;
 pub use event::{IpcEvent, TUI_TICK_MS, TuiCommand, TuiEvent};
 pub use terminal::{detect_systemd_service_installed, run_tui};

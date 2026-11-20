@@ -181,6 +181,19 @@ impl Theme {
         }
     }
 
+    pub fn banner_op_feedback(&self, is_error: bool) -> Style {
+        if is_error {
+            self.banner_grace()
+        } else if self.no_color {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
     pub fn alert_strip(&self, is_shift: bool) -> Style {
         if self.no_color {
             Style::default().add_modifier(Modifier::BOLD)

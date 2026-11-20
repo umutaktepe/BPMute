@@ -33,7 +33,8 @@ enum DbCommand {
     UnenrollWearable {
         id_or_prefix: String,
         delete_sessions: bool,
-        reply: oneshot::Sender<Result<EnrolledWearable, StorageError>>,
+        now_ms: i64,
+        reply: oneshot::Sender<Result<(EnrolledWearable, Option<CalibrationState>), StorageError>>,
     },
     OpenSession {
         req: OpenSessionRequest,
@@ -278,9 +279,10 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         DbCommand::UnenrollWearable {
             id_or_prefix,
             delete_sessions,
+            now_ms,
             reply,
         } => {
-            let _ = reply.send(store.unenroll_wearable(&id_or_prefix, delete_sessions));
+            let _ = reply.send(store.unenroll_wearable(&id_or_prefix, delete_sessions, now_ms));
         }
         DbCommand::OpenSession { req, reply } => {
             let _ = reply.send(store.open_session(&req));
@@ -459,10 +461,12 @@ impl PersistenceHandle {
         &self,
         id_or_prefix: String,
         delete_sessions: bool,
-    ) -> Result<EnrolledWearable, StorageError> {
+        now_ms: i64,
+    ) -> Result<(EnrolledWearable, Option<CalibrationState>), StorageError> {
         self.call(|reply| DbCommand::UnenrollWearable {
             id_or_prefix,
             delete_sessions,
+            now_ms,
             reply,
         })
         .await

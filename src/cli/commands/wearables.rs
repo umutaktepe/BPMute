@@ -2,19 +2,24 @@
 
 use std::io::Write;
 
+use chrono::Utc;
 use serde_json::json;
 
 use crate::cli::args::WearablesCommand;
 use crate::exit_code::ExitCode;
-use crate::ipc::protocol::EnrolledWearableStatus;
+use crate::ipc::protocol::{
+    EnrollSelectParams, EnrollSelectResponse, EnrollStartParams, EnrollStartResponse,
+    EnrolledWearableStatus, WearableConnectParams, WearableListResponse, WearableMutationResponse,
+    WearableRenameParams, WearableUnenrollParams,
+};
 use crate::ipc::{IpcClient, IpcClientError};
 use crate::paths::ResolvedPaths;
 use crate::sleep_engine::StreamStatus;
-use crate::storage::{EnrolledWearable, LedgerStore, db_path_in_data_dir, lock_path_in_data_dir};
+use crate::storage::{LedgerStore, db_path_in_data_dir, lock_path_in_data_dir};
 
 use super::{
-    OnlineOrOffline, connect_online_or_offline, ipc_request_typed, open_existing_store_rw,
-    report_ipc_error, report_storage_error, write_json_line,
+    OnlineOrOffline, connect_online_or_offline, ipc_request_params, ipc_request_typed,
+    open_existing_store_rw, report_ipc_error, report_storage_error, write_json_line,
 };
 
 pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
@@ -31,11 +36,7 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
             let wearables: Vec<EnrolledWearableStatus> =
                 match connect_online_or_offline(paths, stderr).await {
                     Ok(OnlineOrOffline::Online(mut client)) => {
-                        #[derive(serde::Deserialize)]
-                        struct ListResponse {
-                            wearables: Vec<EnrolledWearableStatus>,
-                        }
-                        match ipc_request_typed::<ListResponse, _>(
+                        match ipc_request_typed::<WearableListResponse, _>(
                             &mut client,
                             "wearable.list",
                             json!({}),
@@ -104,14 +105,14 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
         WearablesCommand::Rename { id, alias } => {
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    #[derive(serde::Deserialize)]
-                    struct RenameResponse {
-                        wearable: EnrolledWearable,
-                    }
-                    match ipc_request_typed::<RenameResponse, _>(
+                    let params = WearableRenameParams {
+                        id: id.clone(),
+                        alias: Some(alias.clone()),
+                    };
+                    match ipc_request_params::<_, WearableMutationResponse, _>(
                         &mut client,
                         "wearable.rename",
-                        json!({ "id": id, "alias": alias }),
+                        &params,
                         stderr,
                     )
                     .await
@@ -159,16 +160,21 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
         }
         WearablesCommand::Connect { id } => match connect_online_or_offline(paths, stderr).await {
             Ok(OnlineOrOffline::Online(mut client)) => {
-                match client
-                    .request("wearable.connect", json!({ "id": id }))
-                    .await
+                let params = WearableConnectParams { id };
+                match ipc_request_params::<_, serde_json::Value, _>(
+                    &mut client,
+                    "wearable.connect",
+                    &params,
+                    stderr,
+                )
+                .await
                 {
                     Ok(val) => {
                         let msg = val["message"].as_str().unwrap_or("connection requested");
                         let _ = writeln!(stdout, "{msg}");
                         ExitCode::Success
                     }
-                    Err(err) => report_ipc_error(err, stderr),
+                    Err(code) => code,
                 }
             }
             Ok(OnlineOrOffline::Offline) => {
@@ -186,18 +192,15 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
             delete_sessions,
         } => match connect_online_or_offline(paths, stderr).await {
             Ok(OnlineOrOffline::Online(mut client)) => {
-                #[derive(serde::Deserialize)]
-                struct UnenrollResponse {
-                    wearable: EnrolledWearable,
-                }
-                match ipc_request_typed::<UnenrollResponse, _>(
+                let params = WearableUnenrollParams {
+                    id,
+                    forget_bluez,
+                    delete_sessions,
+                };
+                match ipc_request_params::<_, WearableMutationResponse, _>(
                     &mut client,
                     "wearable.unenroll",
-                    json!({
-                        "id": id,
-                        "forget_bluez": forget_bluez,
-                        "delete_sessions": delete_sessions,
-                    }),
+                    &params,
                     stderr,
                 )
                 .await
@@ -224,8 +227,9 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
                     Ok(store) => store,
                     Err(code) => return code,
                 };
-                match store.unenroll_wearable(&id, delete_sessions) {
-                    Ok(w) => {
+                let now_ms = Utc::now().timestamp_millis();
+                match store.unenroll_wearable(&id, delete_sessions, now_ms) {
+                    Ok((w, _)) => {
                         if forget_bluez {
                             let _ = writeln!(
                                 stderr,
@@ -265,14 +269,13 @@ pub(crate) async fn run_enroll<WOut: Write, WErr: Write>(
         Err(err) => return report_ipc_error(err, stderr),
     };
 
-    #[derive(serde::Deserialize)]
-    struct EnrollStartResponse {
-        devices: Vec<crate::ipc::protocol::DiscoveredWearable>,
-    }
-    let start_res = match ipc_request_typed::<EnrollStartResponse, _>(
+    let start_params = EnrollStartParams {
+        timeout_sec: Some(30),
+    };
+    let start_res = match ipc_request_params::<_, EnrollStartResponse, _>(
         &mut client,
         "wearable.enroll_start",
-        json!({ "timeout_sec": 30 }),
+        &start_params,
         stderr,
     )
     .await
@@ -327,21 +330,14 @@ pub(crate) async fn run_enroll<WOut: Write, WErr: Write>(
         }
     };
 
-    #[derive(serde::Deserialize)]
-    struct EnrollSelectResponse {
-        wearable: EnrolledWearable,
-        #[serde(default)]
-        warnings: Vec<String>,
-        #[serde(default)]
-        hints: Vec<String>,
-    }
-    let select_res = match ipc_request_typed::<EnrollSelectResponse, _>(
+    let select_params = EnrollSelectParams {
+        address: target_mac,
+        alias: alias.map(str::to_owned),
+    };
+    let select_res = match ipc_request_params::<_, EnrollSelectResponse, _>(
         &mut client,
         "wearable.enroll_select",
-        json!({
-            "address": target_mac,
-            "alias": alias,
-        }),
+        &select_params,
         stderr,
     )
     .await

@@ -1,15 +1,19 @@
 use std::io::Write;
 
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::cli::args::{DataCommand, ImportModeArg};
 use crate::cli::commands::{
-    OnlineOrOffline, confirm_action, confirm_wipe, connect_online_or_offline,
-    open_existing_store_rw, report_ipc_error, report_storage_error, resolve_cli_path,
+    OnlineOrOffline, confirm_action, confirm_wipe, connect_online_or_offline, ipc_request_params,
+    ipc_request_typed, open_existing_store_rw, report_storage_error, resolve_cli_path,
     write_json_line,
 };
 use crate::exit_code::ExitCode;
+use crate::ipc::protocol::{
+    DataBackupSqliteParams, DataExportBundleParams, DataExportBundleResponse, DataHardWipeParams,
+    DataImportBundleParams, DataImportBundleResponse, DataPurgeRawResponse,
+};
 use crate::paths::{EnvSource, ResolvedPaths};
 use crate::sleep_engine::CalibrationMaturity;
 use crate::storage::{
@@ -31,15 +35,9 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
         DataCommand::Stats { json } => {
             let stats: StorageStats = match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client.request("data.stats", json!({})).await {
-                        Ok(val) => match serde_json::from_value(val) {
-                            Ok(s) => s,
-                            Err(err) => {
-                                let _ = writeln!(stderr, "error: invalid IPC response: {err}");
-                                return ExitCode::RuntimeError;
-                            }
-                        },
-                        Err(err) => return report_ipc_error(err, stderr),
+                    match ipc_request_typed(&mut client, "data.stats", json!({}), stderr).await {
+                        Ok(s) => s,
+                        Err(code) => return code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => match LedgerStore::open_read_only(&db_path) {
@@ -126,16 +124,23 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client.request("data.purge_raw", json!({})).await {
-                        Ok(val) => {
-                            let deleted = val["deleted_raw_samples"].as_u64().unwrap_or(0);
+                    match ipc_request_typed::<DataPurgeRawResponse, _>(
+                        &mut client,
+                        "data.purge_raw",
+                        json!({}),
+                        stderr,
+                    )
+                    .await
+                    {
+                        Ok(resp) => {
                             let _ = writeln!(
                                 stdout,
-                                "Purged raw biometric samples ({deleted} rows deleted)."
+                                "Purged raw biometric samples ({} rows deleted).",
+                                resp.reclaimed_rows
                             );
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -174,15 +179,14 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
             let now_ms = Utc::now().timestamp_millis();
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request(
-                            "data.hard_wipe",
-                            json!({
-                                "wipe_all": all,
-                                "confirm": "WIPE"
-                            }),
-                        )
-                        .await
+                    let params = DataHardWipeParams { all };
+                    match ipc_request_params::<_, Value, _>(
+                        &mut client,
+                        "data.hard_wipe",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             if all && paths.config_file.try_exists().unwrap_or(false) {
@@ -201,7 +205,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                             }
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -255,29 +259,25 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
             let now_ms = Utc::now().timestamp_millis();
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request(
-                            "data.export_bundle",
-                            json!({
-                                "path": abs_path.to_string_lossy(),
-                                "destination_path": abs_path.to_string_lossy(),
-                                "include_epochs": options.include_epochs,
-                                "include_wearables": options.include_wearables,
-                                "include_raw": options.include_raw,
-                            }),
-                        )
-                        .await
+                    let params = DataExportBundleParams {
+                        path: abs_path.to_string_lossy().into_owned(),
+                        include_epochs: options.include_epochs,
+                        include_wearables: options.include_wearables,
+                        include_raw: options.include_raw,
+                    };
+                    match ipc_request_params::<_, DataExportBundleResponse, _>(
+                        &mut client,
+                        "data.export_bundle",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
-                        Ok(val) => {
-                            let count = val["sessions_exported"].as_u64().unwrap_or(0);
-                            let dest = val["destination_path"].as_str().unwrap_or("");
-                            let _ = writeln!(
-                                stdout,
-                                "Exported ledger bundle ({count} sessions) to {dest}"
-                            );
+                        Ok(resp) => {
+                            let _ = writeln!(stdout, "Exported ledger bundle to {}", resp.path);
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -332,10 +332,6 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                 }
             }
 
-            let mode_str = match mode {
-                ImportModeArg::Merge => "merge",
-                ImportModeArg::Replace => "replace",
-            };
             let import_mode = match mode {
                 ImportModeArg::Merge => ImportMode::Merge,
                 ImportModeArg::Replace => ImportMode::Replace,
@@ -344,33 +340,36 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request(
-                            "data.import_bundle",
-                            json!({
-                                "bundle_path": abs_path.to_string_lossy(),
-                                "mode": mode_str,
-                                "force": force,
-                            }),
-                        )
-                        .await
+                    let params = DataImportBundleParams {
+                        path: abs_path.to_string_lossy().into_owned(),
+                        mode: Some(import_mode),
+                        force,
+                    };
+                    match ipc_request_params::<_, DataImportBundleResponse, _>(
+                        &mut client,
+                        "data.import_bundle",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
-                        Ok(val) => {
-                            let mode = val["mode"].as_str().unwrap_or(mode_str);
-                            let sessions = val["sessions_imported"].as_u64().unwrap_or(0);
-                            let wearables = val["wearables_imported"].as_u64().unwrap_or(0);
-                            let epochs = val["epochs_imported"].as_u64().unwrap_or(0);
-                            let feedback = val["feedback_imported"].as_u64().unwrap_or(0);
+                        Ok(resp) => {
+                            let summary = resp.summary;
                             let _ = writeln!(
                                 stdout,
-                                "Imported bundle ({mode}): {sessions} sessions, {wearables} wearables, {epochs} epochs, {feedback} feedback records imported. Calibration recomputed."
+                                "Imported bundle ({}): {} sessions, {} wearables, {} epochs, {} feedback records imported. Calibration recomputed.",
+                                summary.mode,
+                                summary.sessions_imported,
+                                summary.wearables_imported,
+                                summary.epochs_imported,
+                                summary.feedback_imported,
                             );
-                            if let Some(bkp) = val["rollback_backup_path"].as_str() {
+                            if let Some(ref bkp) = summary.rollback_backup_path {
                                 let _ = writeln!(stdout, "Rollback backup saved to: {bkp}");
                             }
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {
@@ -412,14 +411,16 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
 
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    match client
-                        .request(
-                            "data.backup_sqlite",
-                            json!({
-                                "destination_path": abs_path.to_string_lossy(),
-                            }),
-                        )
-                        .await
+                    let params = DataBackupSqliteParams {
+                        path: abs_path.to_string_lossy().into_owned(),
+                    };
+                    match ipc_request_params::<_, Value, _>(
+                        &mut client,
+                        "data.backup_sqlite",
+                        &params,
+                        stderr,
+                    )
+                    .await
                     {
                         Ok(_) => {
                             let _ = writeln!(
@@ -429,7 +430,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                             );
                             ExitCode::Success
                         }
-                        Err(err) => report_ipc_error(err, stderr),
+                        Err(code) => code,
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => {

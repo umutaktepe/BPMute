@@ -9,6 +9,7 @@ impl TuiApp {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<TuiCommand> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                self.op_feedback = None;
                 match self.hit_map.click_at(mouse.column, mouse.row)? {
                     ClickTarget::SelectTab(tab) => {
                         self.active_tab = tab;
