@@ -26,8 +26,8 @@ use bpmute::daemon::{
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{
-    AlertSeverity, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus,
-    HrSampleEvent, MonitoringState, PauseMode, PauseParams, alert_ids,
+    AlertSeverity, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
+    EnrolledWearableStatus, HrSampleEvent, MonitoringState, PauseMode, PauseParams, alert_ids,
 };
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
@@ -3942,4 +3942,840 @@ fn test_mouse_pause_popover_two_click_wheel_and_backdrop() {
     assert_eq!(app_nm.handle_event(mouse_scroll_down(0, 5)), None);
     assert_eq!(app_nm.handle_event(mouse_left_click(0, 0)), None);
     assert_eq!(app_nm.modal, ModalState::PausePopover { selected_idx: 0 });
+}
+
+#[test]
+fn test_mouse_wearables_table_row_click_and_overflow_scroll() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Wearables;
+    app.enrolled_wearables = (0..15)
+        .map(|i| {
+            make_wearable(
+                &format!("w-{i:02}"),
+                &format!("AA:BB:CC:11:22:{i:02}"),
+                Some(&format!("Strap {i:02}")),
+                if i == 0 {
+                    StreamStatus::Streaming
+                } else {
+                    StreamStatus::Disconnected
+                },
+                Some(90u8.saturating_sub(i as u8)),
+                None,
+            )
+        })
+        .collect();
+
+    // At 60x18, Enrolled Wearables table viewport holds ~10 data rows (< 15), causing overflow
+    let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let initial_out = buffer_to_string(buf);
+    assert!(initial_out.contains("Strap 00"));
+    assert!(!initial_out.contains("Strap 14"));
+
+    // Clicking table header row must not alter selection
+    let (hdr_col, hdr_row) = find_text_coords(buf, "Alias / Name").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(hdr_col + 1, hdr_row)),
+        None
+    );
+    assert_eq!(app.selected_wearable_idx, 0);
+
+    // Clicking visible row 3 ("Strap 03") selects index 3 without scrolling away
+    let (r3_col, r3_row) = find_text_coords(buf, "Strap 03").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(r3_col + 1, r3_row)), None);
+    assert_eq!(app.selected_wearable_idx, 3);
+
+    // Wheel scrolling down advances selection and scrolls overflowed rows into view
+    for _ in 0..11 {
+        app.handle_event(mouse_scroll_down(r3_col + 1, r3_row));
+    }
+    assert_eq!(app.selected_wearable_idx, 14);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let scrolled_out = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        scrolled_out.contains("Strap 14"),
+        "Bottom wearable must scroll into viewport when selected"
+    );
+    assert!(
+        !scrolled_out.contains("Strap 00"),
+        "Top wearable must scroll out of viewport when scrolled to bottom"
+    );
+
+    // Extra ScrollDown at bottom clamps cleanly without overshoot
+    app.handle_event(mouse_scroll_down(r3_col + 1, r3_row));
+    assert_eq!(app.selected_wearable_idx, 14);
+
+    // Clicking a scrolled-into-view row ("Strap 12") selects its true index (12)
+    let (r12_col, r12_row) = find_text_coords(terminal.backend().buffer(), "Strap 12").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(r12_col + 1, r12_row)),
+        None
+    );
+    assert_eq!(app.selected_wearable_idx, 12);
+
+    // Single ScrollUp immediately steps from 12 -> 11, and keyboard 'k' back to 0 brings Strap 00 back
+    app.handle_event(mouse_scroll_up(r12_col + 1, r12_row));
+    assert_eq!(app.selected_wearable_idx, 11);
+    for _ in 0..11 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('k'))));
+    }
+    assert_eq!(app.selected_wearable_idx, 0);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Strap 00"));
+}
+
+#[test]
+fn test_mouse_wearables_action_bar_buttons_and_offline_guards() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Wearables;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Disconnected,
+        Some(80),
+        None,
+    )];
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    let (e_col, bar_row) = find_text_coords(buf, "[e] Enroll new").unwrap();
+    assert!(bar_row < 23, "Action bar should sit above the footer");
+    let (n_col, _) = find_text_coords_in_row(buf, bar_row, "[n] Rename alias").unwrap();
+    let (c_col, _) = find_text_coords_in_row(buf, bar_row, "[c] Reconnect").unwrap();
+    let (u_col, _) = find_text_coords_in_row(buf, bar_row, "[u] Unenroll").unwrap();
+
+    // [c] Reconnect dispatches WearableConnect for selected wearable
+    assert_eq!(
+        app.handle_event(mouse_left_click(c_col + 5, bar_row)),
+        Some(TuiCommand::WearableConnect { id: "w-1".into() })
+    );
+
+    // [n] Rename alias opens RenameModal
+    assert_eq!(app.handle_event(mouse_left_click(n_col + 5, bar_row)), None);
+    assert!(matches!(
+        app.modal,
+        ModalState::RenameModal {
+            ref wearable_id,
+            ..
+        } if wearable_id == "w-1"
+    ));
+    app.modal = ModalState::None;
+
+    // [u] Unenroll opens UnenrollModal
+    assert_eq!(app.handle_event(mouse_left_click(u_col + 4, bar_row)), None);
+    assert!(matches!(app.modal, ModalState::UnenrollModal { .. }));
+    app.modal = ModalState::None;
+
+    // [e] Enroll new opens EnrollmentModal and dispatches EnrollStart
+    assert_eq!(
+        app.handle_event(mouse_left_click(e_col + 4, bar_row)),
+        Some(TuiCommand::EnrollStart(Some(30)))
+    );
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+    app.modal = ModalState::None;
+
+    // Online with empty enrolled_wearables: [e] works, [n]/[c]/[u] are ignored
+    app.enrolled_wearables.clear();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(n_col + 1, bar_row)), None);
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(app.handle_event(mouse_left_click(c_col + 1, bar_row)), None);
+    assert_eq!(app.handle_event(mouse_left_click(u_col + 1, bar_row)), None);
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(mouse_left_click(e_col + 1, bar_row)),
+        Some(TuiCommand::EnrollStart(Some(30)))
+    );
+    app.modal = ModalState::None;
+
+    // Offline guard: all action bar buttons and offline notice ignore clicks
+    app.daemon_connected = false;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Disconnected,
+        Some(80),
+        None,
+    )];
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let off_buf = terminal.backend().buffer();
+    let (off_col, off_row) = find_text_coords(off_buf, "(offline: read-only)").unwrap();
+    for col in [e_col + 1, n_col + 1, c_col + 1, u_col + 1, off_col + 1] {
+        assert_eq!(app.handle_event(mouse_left_click(col, off_row)), None);
+        assert_eq!(app.modal, ModalState::None);
+    }
+}
+
+#[test]
+fn test_mouse_enrollment_modal_scroll_two_click_alias_focus_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Wearables;
+    app.open_enrollment_modal();
+    app.discovered_wearables = (0..12)
+        .map(|i| DiscoveredWearable {
+            address: format!("AA:BB:CC:DD:EE:{i:02}"),
+            address_type: "public".into(),
+            name: Some(format!("HRM-{i:02}")),
+            rssi: Some(-50 - i as i16),
+            paired: i % 2 == 0,
+            already_enrolled: false,
+            uuids: vec![],
+        })
+        .collect();
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let initial_out = buffer_to_string(terminal.backend().buffer());
+    assert!(initial_out.contains("HRM-00"));
+    assert!(!initial_out.contains("HRM-11"));
+
+    // 1. Clicking backdrop outside Enrollment modal box must NOT dismiss it
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 10)), None);
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+
+    // 2. Wheel scroll outside discovered list does not scroll; inside discovered list scrolls overflow
+    let (hdr_col, hdr_row) =
+        find_text_coords(terminal.backend().buffer(), "Select a discovered").unwrap();
+    app.handle_event(mouse_scroll_down(hdr_col + 1, hdr_row));
+    let (d0_col, d0_row) = find_text_coords(terminal.backend().buffer(), "HRM-00").unwrap();
+    for _ in 0..11 {
+        app.handle_event(mouse_scroll_down(d0_col + 1, d0_row));
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let scrolled_out = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        scrolled_out.contains("HRM-11"),
+        "Long scan list must scroll bottom wearable into view"
+    );
+    assert!(!scrolled_out.contains("HRM-00"));
+
+    // Wheel overshoot clamps cleanly and single ScrollUp reverses immediately
+    app.handle_event(mouse_scroll_down(d0_col + 1, d0_row));
+    app.handle_event(mouse_scroll_up(d0_col + 1, d0_row));
+    if let ModalState::EnrollmentModal {
+        selected_discovered_idx,
+        ..
+    } = app.modal
+    {
+        assert_eq!(selected_discovered_idx, 10);
+    } else {
+        panic!("Expected EnrollmentModal");
+    }
+
+    // Scroll back up to top
+    for _ in 0..10 {
+        app.handle_event(mouse_scroll_up(d0_col + 1, d0_row));
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("HRM-00"));
+
+    // 3. Clicking Custom Alias focuses text input and suspends global hotkeys
+    let (alias_col, alias_row) =
+        find_text_coords(terminal.backend().buffer(), "Custom Alias").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(alias_col + 2, alias_row + 1)),
+        None
+    );
+    assert!(app.is_input_focused());
+    for c in ['q', 'r', '1'] {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    assert!(!app.should_quit);
+    assert_eq!(app.active_tab, Tab::Wearables);
+
+    // Clicking a discovered row (even row 0!) while Custom Alias is focused unfocuses alias and selects row without enrolling
+    let (d0_col, d0_row) = find_text_coords(terminal.backend().buffer(), "HRM-00").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(d0_col + 1, d0_row)), None);
+    assert!(!app.is_input_focused());
+    assert!(matches!(
+        app.modal,
+        ModalState::EnrollmentModal {
+            selected_discovered_idx: 0,
+            alias_focused: false,
+            enrolling: false,
+            ..
+        }
+    ));
+
+    // Clicking another row (row 2) selects row 2 without enrolling; clicking row 2 again initiates EnrollSelect
+    let (d2_col, d2_row) = find_text_coords(terminal.backend().buffer(), "HRM-02").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(d2_col + 1, d2_row)), None);
+    assert!(matches!(
+        app.modal,
+        ModalState::EnrollmentModal {
+            selected_discovered_idx: 2,
+            enrolling: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        app.handle_event(mouse_left_click(d2_col + 1, d2_row)),
+        Some(TuiCommand::EnrollSelect {
+            address: "AA:BB:CC:DD:EE:02".into(),
+            alias: Some("qr1".into()),
+        })
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::EnrollmentModal {
+            enrolling: true,
+            ..
+        }
+    ));
+
+    // While enrolling: true, clicking discovered rows, Custom Alias, [Enter] Enroll, or [r] Rescan is ignored; [Esc] Cancel cancels
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (m_enter_col, m_enter_row) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] Enroll").unwrap();
+    assert!(m_enter_row < 23);
+    let (m_rescan_col, m_rescan_row) =
+        find_text_coords(terminal.backend().buffer(), "[r] Rescan").unwrap();
+    assert!(m_rescan_row < 23);
+    let (m_esc_col, m_esc_row) =
+        find_text_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert!(m_esc_row < 23);
+
+    assert_eq!(
+        app.handle_event(mouse_left_click(m_enter_col + 1, m_enter_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(m_rescan_col + 1, m_rescan_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(m_esc_col + 1, m_esc_row)),
+        Some(TuiCommand::EnrollCancel)
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 4. Reopen EnrollmentModal: clicking [r] Rescan / [Enter] Enroll clears alias_focused and triggers action
+    app.open_enrollment_modal();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (alias_col, alias_row) =
+        find_text_coords(terminal.backend().buffer(), "Custom Alias").unwrap();
+    app.handle_event(mouse_left_click(alias_col + 1, alias_row + 1));
+    assert!(app.is_input_focused());
+
+    // Clicking empty wearable list also clears alias_focused
+    let saved_discovered = std::mem::take(&mut app.discovered_wearables);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (empty_col, empty_row) =
+        find_text_coords(terminal.backend().buffer(), "Searching for advertising").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(empty_col + 2, empty_row)),
+        None
+    );
+    assert!(!app.is_input_focused());
+
+    // Refocus alias, click [r] Rescan -> clears alias_focused and sends EnrollStart
+    app.handle_event(mouse_left_click(alias_col + 1, alias_row + 1));
+    assert!(app.is_input_focused());
+    let (m_rescan_col, m_rescan_row) =
+        find_text_coords(terminal.backend().buffer(), "[r] Rescan").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(m_rescan_col + 1, m_rescan_row)),
+        Some(TuiCommand::EnrollStart(Some(30)))
+    );
+    assert!(!app.is_input_focused());
+
+    // Restore discovered list, refocus alias, click in-modal [Enter] Enroll -> clears alias_focused and initiates EnrollSelect
+    app.discovered_wearables = saved_discovered;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    app.handle_event(mouse_left_click(alias_col + 1, alias_row + 1));
+    assert!(app.is_input_focused());
+    let (m_enter_col, m_enter_row) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] Enroll").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(m_enter_col + 1, m_enter_row)),
+        Some(TuiCommand::EnrollSelect {
+            address: "AA:BB:CC:DD:EE:00".into(),
+            alias: None,
+        })
+    );
+    assert!(!app.is_input_focused());
+}
+
+#[test]
+fn test_mouse_agent1_pairing_prompts_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Wearables;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // 1. Confirmation prompt: [y], [n], [Esc], and backdrop no-dismiss
+    app.modal = ModalState::EnrollmentModal {
+        scanning_remaining_ms: 20_000,
+        selected_discovered_idx: 0,
+        alias_input: String::new(),
+        alias_focused: false,
+        enrolling: true,
+        error_message: None,
+        pairing_prompt: Some(PairingPromptModalState::Confirmation {
+            passkey: 482_910,
+            wearable: "Polar H10".into(),
+        }),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    // Backdrop click does not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+
+    // Clicking [y] dispatches EnrollAuthReply(confirmed: Some(true))
+    let (y_col, y_row) = find_text_coords(buf, "[y]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(y_col + 1, y_row)),
+        Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+            confirmed: Some(true),
+            passkey: None,
+            pincode: None,
+        }))
+    );
+
+    // Re-set Confirmation, click [n] -> confirmed: Some(false)
+    if let ModalState::EnrollmentModal {
+        ref mut pairing_prompt,
+        ..
+    } = app.modal
+    {
+        *pairing_prompt = Some(PairingPromptModalState::Confirmation {
+            passkey: 482_910,
+            wearable: "Polar H10".into(),
+        });
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (n_col, n_row) = find_text_coords(terminal.backend().buffer(), "[n]/[Esc]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(n_col + 1, n_row)),
+        Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+            confirmed: Some(false),
+            passkey: None,
+            pincode: None,
+        }))
+    );
+
+    // Re-set Confirmation, click [Esc] inside modal -> closes modal and dispatches EnrollCancel
+    if let ModalState::EnrollmentModal {
+        ref mut pairing_prompt,
+        ..
+    } = app.modal
+    {
+        *pairing_prompt = Some(PairingPromptModalState::Confirmation {
+            passkey: 482_910,
+            wearable: "Polar H10".into(),
+        });
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (ne_col, ne_row) = find_text_coords(terminal.backend().buffer(), "[n]/[Esc]").unwrap();
+    assert!(ne_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(ne_col + 5, ne_row)),
+        Some(TuiCommand::EnrollCancel)
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 2. Passkey prompt: typing + [Enter] / [Esc] + backdrop no-dismiss
+    app.modal = ModalState::EnrollmentModal {
+        scanning_remaining_ms: 20_000,
+        selected_discovered_idx: 0,
+        alias_input: String::new(),
+        alias_focused: false,
+        enrolling: true,
+        error_message: None,
+        pairing_prompt: Some(PairingPromptModalState::Passkey {
+            wearable: "Polar H10".into(),
+            input: String::new(),
+        }),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    for c in "123456".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let (p_enter_col, p_enter_row) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] to submit").unwrap();
+    assert!(p_enter_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(p_enter_col + 1, p_enter_row)),
+        Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+            confirmed: Some(true),
+            passkey: Some(123_456),
+            pincode: None,
+        }))
+    );
+
+    // 3. PinCode prompt: typing + [Esc]
+    app.modal = ModalState::EnrollmentModal {
+        scanning_remaining_ms: 20_000,
+        selected_discovered_idx: 0,
+        alias_input: String::new(),
+        alias_focused: false,
+        enrolling: true,
+        error_message: None,
+        pairing_prompt: Some(PairingPromptModalState::PinCode {
+            wearable: "Polar H10".into(),
+            input: String::new(),
+        }),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for c in "0042".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let (pin_enter_col, pin_enter_row) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] to submit").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(pin_enter_col + 1, pin_enter_row)),
+        Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+            confirmed: Some(true),
+            passkey: None,
+            pincode: Some("0042".into()),
+        }))
+    );
+
+    if let ModalState::EnrollmentModal {
+        ref mut pairing_prompt,
+        ..
+    } = app.modal
+    {
+        *pairing_prompt = Some(PairingPromptModalState::PinCode {
+            wearable: "Polar H10".into(),
+            input: String::new(),
+        });
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (pin_esc_col, pin_esc_row) =
+        find_text_coords(terminal.backend().buffer(), "[Esc] to cancel").unwrap();
+    assert!(pin_esc_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(pin_esc_col + 1, pin_esc_row)),
+        Some(TuiCommand::EnrollCancel)
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_mouse_enrollment_and_agent1_pairing_e2e() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_enrollment_driver(Arc::new(TestAgent1PairingHook)),
+    )
+    .await
+    .unwrap();
+
+    daemon
+        .core()
+        .seed_discovered_wearables(vec![DiscoveredWearable {
+            address: "AA:BB:CC:11:22:33".into(),
+            address_type: "public".into(),
+            name: Some("Polar H10".into()),
+            rssi: Some(-52),
+            paired: false,
+            already_enrolled: false,
+            uuids: vec![],
+        }]);
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+
+    let mut app = TuiApp::new(false, false, false);
+    wait_for_app_state(&mut app, &mut event_rx, |a| a.daemon_connected).await;
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+
+    // 1. Click [3:Wearables] tab
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (tab_col, tab_row) =
+        find_text_coords(terminal.backend().buffer(), "[3:Wearables]").unwrap();
+    app.handle_event(mouse_left_click(tab_col + 1, tab_row));
+    assert_eq!(app.active_tab, Tab::Wearables);
+
+    // 2. Click [e] Enroll new in the Wearables action bar
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (enroll_btn_col, enroll_btn_row) =
+        find_text_coords(terminal.backend().buffer(), "[e] Enroll new").unwrap();
+    let start_cmd = app
+        .handle_event(mouse_left_click(enroll_btn_col + 1, enroll_btn_row))
+        .unwrap();
+    cmd_tx.send(start_cmd).await.unwrap();
+
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        !a.discovered_wearables.is_empty()
+    })
+    .await;
+
+    // 3. Render EnrollmentModal, focus Custom Alias, type alias, unfocus via row click, and two-click EnrollSelect
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (alias_col, alias_row) =
+        find_text_coords(terminal.backend().buffer(), "Custom Alias").unwrap();
+    app.handle_event(mouse_left_click(alias_col + 1, alias_row + 1));
+    for c in "Night Strap".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let (dev_col, dev_row) = find_text_coords(terminal.backend().buffer(), "Polar H10").unwrap();
+    // First click unfocuses Custom Alias and selects row 0
+    assert_eq!(
+        app.handle_event(mouse_left_click(dev_col + 1, dev_row)),
+        None
+    );
+    assert!(!app.is_input_focused());
+    // Second click on already-selected row initiates EnrollSelect
+    let select_cmd = app
+        .handle_event(mouse_left_click(dev_col + 1, dev_row))
+        .unwrap();
+    cmd_tx.send(select_cmd).await.unwrap();
+
+    // 4. Wait for Agent1 Confirmation prompt pushed over real Unix socket
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        matches!(
+            a.modal,
+            ModalState::EnrollmentModal {
+                pairing_prompt: Some(PairingPromptModalState::Confirmation {
+                    passkey: 482_910,
+                    ..
+                }),
+                ..
+            }
+        )
+    })
+    .await;
+
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (y_col, y_row) = find_text_coords(terminal.backend().buffer(), "[y]").unwrap();
+    let reply_cmd = app
+        .handle_event(mouse_left_click(y_col + 1, y_row))
+        .unwrap();
+    cmd_tx.send(reply_cmd).await.unwrap();
+
+    // 5. Enrollment finishes and newly enrolled Wearable with custom alias appears in Wearables table
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.modal == ModalState::None && a.enrolled_wearables.len() == 1
+    })
+    .await;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Night Strap"));
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
+}
+
+#[test]
+fn test_mouse_rename_and_unenroll_modals_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Wearables;
+    let w = make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Old Alias"),
+        StreamStatus::Disconnected,
+        Some(85),
+        None,
+    );
+    app.enrolled_wearables = vec![w];
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // 1. RenameModal: backdrop no-dismiss, alias input focus, [Enter] Save, [Esc] Cancel
+    app.modal = ModalState::RenameModal {
+        wearable_id: "w-1".into(),
+        current_alias: "Old Alias".into(),
+        input: "Old".into(),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let r_buf = terminal.backend().buffer();
+
+    // Backdrop click does not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::RenameModal { .. }));
+
+    // Clicking alias input focuses it and typing appends
+    let (in_col, in_row) = find_text_coords(r_buf, "New alias:").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(in_col + 12, in_row)),
+        None
+    );
+    assert!(app.is_input_focused());
+    for c in " Strap".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // Clicking in-modal [Enter] Save executes immediately
+    let (save_col, save_row) = find_text_coords(r_buf, "[Enter] Save").unwrap();
+    assert!(save_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(save_col + 1, save_row)),
+        Some(TuiCommand::WearableRename {
+            id: "w-1".into(),
+            alias: Some("Old Strap".into()),
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // Reopen RenameModal and click in-modal [Esc] Cancel -> closes immediately without command
+    app.modal = ModalState::RenameModal {
+        wearable_id: "w-1".into(),
+        current_alias: "Old Alias".into(),
+        input: "Draft".into(),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (esc_col, esc_row) = find_text_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert!(esc_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(esc_col + 1, esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 2. UnenrollModal: backdrop no-dismiss, [1]/[2] checkboxes, [ Confirm ] / [ Cancel ] buttons
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('u'))));
+    assert!(matches!(app.modal, ModalState::UnenrollModal { .. }));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let u_buf = terminal.backend().buffer();
+
+    // Backdrop click does not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::UnenrollModal { .. }));
+
+    // Clicking [1] and [2] checkboxes toggles forget_bluez and delete_sessions
+    let (cb1_col, cb1_row) = find_text_coords(u_buf, "[1] Also forget from BlueZ").unwrap();
+    let (cb2_col, cb2_row) = find_text_coords(u_buf, "[2] Also delete historical").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(cb1_col + 1, cb1_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(cb2_col + 1, cb2_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::UnenrollModal {
+            forget_bluez: true,
+            delete_sessions: true,
+            ..
+        }
+    ));
+
+    // Toggle [2] back off
+    assert_eq!(
+        app.handle_event(mouse_left_click(cb2_col + 1, cb2_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::UnenrollModal {
+            forget_bluez: true,
+            delete_sessions: false,
+            ..
+        }
+    ));
+
+    // Even when selected_button is Cancel, clicking [ Confirm ] executes unenroll immediately
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert!(matches!(
+        app.modal,
+        ModalState::UnenrollModal {
+            selected_button: UnenrollButton::Cancel,
+            ..
+        }
+    ));
+    let (conf_col, conf_row) = find_text_coords(u_buf, "[ Confirm ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(conf_col + 2, conf_row)),
+        Some(TuiCommand::WearableUnenroll {
+            id: "w-1".into(),
+            forget_bluez: true,
+            delete_sessions: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // Reopen UnenrollModal and click [ Cancel ] -> cancels immediately even when Confirm is highlighted
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('u'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (canc_col, canc_row) = find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
 }

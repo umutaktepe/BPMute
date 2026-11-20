@@ -199,7 +199,9 @@ pub struct TuiApp {
     // Wearables
     pub enrolled_wearables: Vec<EnrolledWearableStatus>,
     pub selected_wearable_idx: usize,
+    pub(crate) wearables_scroll_offset: usize,
     pub discovered_wearables: Vec<DiscoveredWearable>,
+    pub(crate) enrollment_scroll_offset: usize,
 
     // History
     pub history_sessions: Vec<SessionListEntry>,
@@ -257,7 +259,9 @@ impl TuiApp {
             is_diagnostics_open: false,
             enrolled_wearables: Vec::new(),
             selected_wearable_idx: 0,
+            wearables_scroll_offset: 0,
             discovered_wearables: Vec::new(),
+            enrollment_scroll_offset: 0,
             history_sessions: Vec::new(),
             history_boundaries: Vec::new(),
             selected_session_idx: 0,
@@ -421,9 +425,11 @@ impl TuiApp {
         self.modal = ModalState::None;
         self.help_scroll_offset = 0;
         self.help_max_scroll = 0;
+        self.enrollment_scroll_offset = 0;
     }
 
     pub fn open_enrollment_modal(&mut self) -> TuiCommand {
+        self.enrollment_scroll_offset = 0;
         self.modal = ModalState::EnrollmentModal {
             scanning_remaining_ms: 30_000,
             selected_discovered_idx: 0,
@@ -496,7 +502,7 @@ impl TuiApp {
         self.alerts.clear();
         self.discovered_wearables.clear();
         if self.modal != ModalState::Help {
-            self.modal = ModalState::None;
+            self.close_modal();
         }
     }
 
@@ -670,7 +676,7 @@ impl TuiApp {
                 if op == "wearable.enroll_select" {
                     if success {
                         if matches!(self.modal, ModalState::EnrollmentModal { .. }) {
-                            self.modal = ModalState::None;
+                            self.close_modal();
                         }
                     } else if let ModalState::EnrollmentModal {
                         ref mut enrolling,
@@ -742,7 +748,11 @@ impl TuiApp {
         match self.active_tab {
             Tab::Dashboard => render_dashboard(self, content_area, buf, &mut hit_map),
             Tab::History => render_history(self, content_area, buf),
-            Tab::Wearables => render_wearables(self, content_area, buf, &mut hit_map),
+            Tab::Wearables => {
+                let scroll = render_wearables(self, content_area, buf, &mut hit_map);
+                self.wearables_scroll_offset = scroll.table;
+                self.enrollment_scroll_offset = scroll.enrollment;
+            }
             Tab::Settings => render_settings(self, content_area, buf),
         }
 

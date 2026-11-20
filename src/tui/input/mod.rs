@@ -12,6 +12,14 @@ mod modal;
 mod modal_actions;
 mod mouse;
 
+pub(super) fn step_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max_idx = len.saturating_sub(1) as isize;
+    (current as isize + delta).clamp(0, max_idx) as usize
+}
+
 impl TuiApp {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<TuiCommand> {
         // 1. If text input is focused, suspend all global hotkeys and handle typing

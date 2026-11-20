@@ -2,6 +2,13 @@ use ratatui::layout::{Position, Rect};
 
 use super::app::Tab;
 
+/// Checkbox targeted inside `UnenrollModal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnenrollCheckbox {
+    ForgetBluez,
+    DeleteSessions,
+}
+
 /// Interactive action triggered by a left mouse click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClickTarget {
@@ -18,6 +25,7 @@ pub(crate) enum ClickTarget {
     WearablesRename,
     WearablesReconnect,
     WearablesUnenroll,
+    SelectWearable(usize),
     HistoryFeedback,
     HistoryExport,
     HistoryDelete,
@@ -32,6 +40,12 @@ pub(crate) enum ClickTarget {
     CloseModal,
     ModalConfirm,
     ModalRescan,
+    EnrollmentFocusList,
+    EnrollmentSelectRow(usize),
+    FocusModalInput,
+    PairingConfirm(bool),
+    UnenrollToggle(UnenrollCheckbox),
+    UnenrollConfirm,
     PauseOption(usize),
     Consume,
 }
@@ -40,6 +54,7 @@ pub(crate) enum ClickTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScrollTarget {
     WearablesTable,
+    EnrollmentList,
     HelpModal,
     PausePopover,
 }
@@ -80,7 +95,7 @@ impl HitMap {
         push_region(&mut self.clicks, rect, target);
     }
 
-    /// Records a single-row clickable target clipped to `bounds`.
+    /// Records a single-row clickable background target clipped to `bounds`.
     pub(crate) fn push_clipped_row_click(
         &mut self,
         bounds: Rect,
@@ -89,10 +104,19 @@ impl HitMap {
         width: u16,
         target: ClickTarget,
     ) {
-        if x < bounds.right() && y >= bounds.y && y < bounds.bottom() {
-            let visible_w = width.min(bounds.right().saturating_sub(x));
-            self.push_click(Rect::new(x, y, visible_w, 1), target);
-        }
+        push_clipped_region(&mut self.clicks, bounds, x, y, width, target);
+    }
+
+    /// Records a single-row clickable modal-layer target clipped to `bounds`.
+    pub(crate) fn push_clipped_modal_row_click(
+        &mut self,
+        bounds: Rect,
+        x: u16,
+        y: u16,
+        width: u16,
+        target: ClickTarget,
+    ) {
+        push_clipped_region(&mut self.modal_clicks, bounds, x, y, width, target);
     }
 
     /// Records a clickable modal-layer target rectangle if non-empty.
@@ -137,6 +161,20 @@ fn push_region<T>(regions: &mut Vec<HitRegion<T>>, rect: Rect, target: T) {
         return;
     }
     regions.push(HitRegion { rect, target });
+}
+
+fn push_clipped_region<T>(
+    regions: &mut Vec<HitRegion<T>>,
+    bounds: Rect,
+    x: u16,
+    y: u16,
+    width: u16,
+    target: T,
+) {
+    if x < bounds.right() && y >= bounds.y && y < bounds.bottom() {
+        let visible_w = width.min(bounds.right().saturating_sub(x));
+        push_region(regions, Rect::new(x, y, visible_w, 1), target);
+    }
 }
 
 fn region_at<T: Copy>(regions: &[HitRegion<T>], col: u16, row: u16) -> Option<T> {

@@ -4,12 +4,27 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Row, Table, Widget};
 
 use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
-use super::super::hit_map::{HitMap, ScrollTarget};
-use super::centered_rect;
+use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget, UnenrollCheckbox};
+use super::{
+    build_clickable_row_line, build_modal_clickable_row_line, centered_rect, fit_scroll_offset,
+};
 
-pub(crate) fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+pub(crate) struct WearablesScrollOffsets {
+    pub(crate) table: usize,
+    pub(crate) enrollment: usize,
+}
+
+pub(crate) fn render_wearables(
+    app: &TuiApp,
+    area: Rect,
+    buf: &mut Buffer,
+    hit_map: &mut HitMap,
+) -> WearablesScrollOffsets {
     if area.height < 5 || area.width < 10 {
-        return;
+        return WearablesScrollOffsets {
+            table: app.wearables_scroll_offset,
+            enrollment: app.enrollment_scroll_offset,
+        };
     }
 
     let chunks = Layout::default()
@@ -20,20 +35,41 @@ pub(crate) fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_m
     let table_area = chunks[0];
     let action_area = chunks[1];
 
-    render_wearables_table(app, table_area, buf, hit_map);
-    render_wearables_actions(app, action_area, buf);
+    let table = render_wearables_table(app, table_area, buf, hit_map);
+    render_wearables_actions(app, action_area, buf, hit_map);
 
-    match app.modal {
-        ModalState::EnrollmentModal { .. } => render_enrollment_modal(app, area, buf),
-        ModalState::RenameModal { .. } => render_rename_modal(app, area, buf),
-        ModalState::UnenrollModal { .. } => render_unenroll_modal(app, area, buf),
-        _ => {}
-    }
+    let enrollment = match app.modal {
+        ModalState::EnrollmentModal { .. } => render_enrollment_modal(app, area, buf, hit_map),
+        ModalState::RenameModal { .. } => {
+            render_rename_modal(app, area, buf, hit_map);
+            app.enrollment_scroll_offset
+        }
+        ModalState::UnenrollModal { .. } => {
+            render_unenroll_modal(app, area, buf, hit_map);
+            app.enrollment_scroll_offset
+        }
+        _ => app.enrollment_scroll_offset,
+    };
+
+    WearablesScrollOffsets { table, enrollment }
 }
 
-fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+fn render_wearables_table(
+    app: &TuiApp,
+    area: Rect,
+    buf: &mut Buffer,
+    hit_map: &mut HitMap,
+) -> usize {
     hit_map.push_scroll(area, ScrollTarget::WearablesTable);
     let block = app.theme.card_block(" Enrolled Wearables ");
+    let inner = block.inner(area);
+    let visible_rows = usize::from(inner.height.saturating_sub(1));
+    let scroll_offset = fit_scroll_offset(
+        app.wearables_scroll_offset,
+        app.selected_wearable_idx,
+        app.enrolled_wearables.len(),
+        visible_rows,
+    );
     let header = Row::new(vec![
         "Alias / Name",
         "MAC Address",
@@ -48,7 +84,19 @@ fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &
         .enrolled_wearables
         .iter()
         .enumerate()
-        .map(|(idx, w)| {
+        .skip(scroll_offset)
+        .take(visible_rows)
+        .enumerate()
+        .map(|(visual_idx, (idx, w))| {
+            hit_map.push_click(
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1 + visual_idx as u16),
+                    inner.width,
+                    1,
+                ),
+                ClickTarget::SelectWearable(idx),
+            );
             let is_selected = idx == app.selected_wearable_idx;
             let row_style = if is_selected {
                 app.theme.highlight()
@@ -107,9 +155,10 @@ fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &
 
     let table = Table::new(rows, widths).header(header).block(block);
     Widget::render(table, area, buf);
+    scroll_offset
 }
 
-fn render_wearables_actions(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_wearables_actions(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let block = app.theme.card_block("");
     let inner = block.inner(area);
     block.render(area, buf);
@@ -125,24 +174,43 @@ fn render_wearables_actions(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         app.theme.muted()
     };
 
-    let mut spans = vec![
-        Span::styled("  [e]", key_style),
-        Span::styled(" Enroll new  ", text_style),
-        Span::styled("[n]", key_style),
-        Span::styled(" Rename alias  ", text_style),
-        Span::styled("[c]", key_style),
-        Span::styled(" Reconnect  ", text_style),
-        Span::styled("[u]", key_style),
-        Span::styled(" Unenroll", text_style),
+    let enroll_target = app.daemon_connected.then_some(ClickTarget::WearablesEnroll);
+    let can_act = app.can_act_on_selected_wearable();
+    let rename_target = can_act.then_some(ClickTarget::WearablesRename);
+    let reconnect_target = can_act.then_some(ClickTarget::WearablesReconnect);
+    let unenroll_target = can_act.then_some(ClickTarget::WearablesUnenroll);
+
+    let mut items = vec![
+        (Span::styled("  ", text_style), None),
+        (Span::styled("[e]", key_style), enroll_target),
+        (Span::styled(" Enroll new", text_style), enroll_target),
+        (Span::styled("  ", text_style), None),
+        (Span::styled("[n]", key_style), rename_target),
+        (Span::styled(" Rename alias", text_style), rename_target),
+        (Span::styled("  ", text_style), None),
+        (Span::styled("[c]", key_style), reconnect_target),
+        (Span::styled(" Reconnect", text_style), reconnect_target),
+        (Span::styled("  ", text_style), None),
+        (Span::styled("[u]", key_style), unenroll_target),
+        (Span::styled(" Unenroll", text_style), unenroll_target),
     ];
     if !app.daemon_connected {
-        spans.push(Span::styled("  (offline: read-only)", app.theme.muted()));
+        items.push((
+            Span::styled("  (offline: read-only)", app.theme.muted()),
+            None,
+        ));
     }
 
-    Paragraph::new(vec![Line::from(spans)]).render(inner, buf);
+    let line = build_clickable_row_line(inner, inner.y, items, hit_map);
+    Paragraph::new(vec![line]).render(inner, buf);
 }
 
-fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_enrollment_modal(
+    app: &TuiApp,
+    area: Rect,
+    buf: &mut Buffer,
+    hit_map: &mut HitMap,
+) -> usize {
     let ModalState::EnrollmentModal {
         scanning_remaining_ms,
         selected_discovered_idx,
@@ -153,15 +221,16 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         ref pairing_prompt,
     } = app.modal
     else {
-        return;
+        return app.enrollment_scroll_offset;
     };
 
     let modal_area = centered_rect(area, 64, 16);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
     Clear.render(modal_area, buf);
 
     if let Some(prompt) = pairing_prompt {
-        render_pairing_prompt_modal(app, prompt, modal_area, buf);
-        return;
+        render_pairing_prompt_modal(app, prompt, modal_area, buf, hit_map);
+        return app.enrollment_scroll_offset;
     }
 
     let rem_sec = scanning_remaining_ms.div_ceil(1000);
@@ -202,6 +271,19 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
     Paragraph::new(status_line).render(chunks[0], buf);
 
+    let visible_rows = usize::from(chunks[1].height);
+    let scroll_offset = fit_scroll_offset(
+        app.enrollment_scroll_offset,
+        selected_discovered_idx,
+        app.discovered_wearables.len(),
+        visible_rows,
+    );
+    if !enrolling {
+        hit_map.push_modal_scroll(chunks[1], ScrollTarget::EnrollmentList);
+        hit_map.push_modal_click(chunks[1], ClickTarget::EnrollmentFocusList);
+        hit_map.push_modal_click(chunks[2], ClickTarget::FocusModalInput);
+    }
+
     let mut dev_lines = Vec::new();
     if app.discovered_wearables.is_empty() {
         dev_lines.push(Line::from(vec![Span::styled(
@@ -209,7 +291,25 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             app.theme.muted(),
         )]));
     } else {
-        for (idx, d) in app.discovered_wearables.iter().enumerate() {
+        for (visual_row, (idx, d)) in app
+            .discovered_wearables
+            .iter()
+            .enumerate()
+            .skip(scroll_offset)
+            .take(visible_rows)
+            .enumerate()
+        {
+            if !enrolling {
+                hit_map.push_modal_click(
+                    Rect::new(
+                        chunks[1].x,
+                        chunks[1].y.saturating_add(visual_row as u16),
+                        chunks[1].width,
+                        1,
+                    ),
+                    ClickTarget::EnrollmentSelectRow(idx),
+                );
+            }
             let is_selected = idx == selected_discovered_idx && !alias_focused;
             let style = if is_selected {
                 app.theme.highlight()
@@ -261,15 +361,32 @@ fn render_enrollment_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     ]);
     Paragraph::new(input_line).render(alias_inner, buf);
 
-    let footer_line = Line::from(vec![
-        Span::styled(" [Enter]", app.theme.key_hint()),
-        Span::styled(" Enroll  ", app.theme.base()),
-        Span::styled("[r]", app.theme.key_hint()),
-        Span::styled(" Rescan  ", app.theme.base()),
-        Span::styled("[Esc]", app.theme.key_hint()),
-        Span::styled(" Cancel", app.theme.base()),
-    ]);
+    let enroll_target = (!enrolling).then_some(ClickTarget::ModalConfirm);
+    let rescan_target = (!enrolling).then_some(ClickTarget::ModalRescan);
+    let footer_line = build_modal_clickable_row_line(
+        chunks[3],
+        chunks[3].y,
+        vec![
+            (Span::raw(" "), None),
+            (Span::styled("[Enter]", app.theme.key_hint()), enroll_target),
+            (Span::styled(" Enroll", app.theme.base()), enroll_target),
+            (Span::raw("  "), None),
+            (Span::styled("[r]", app.theme.key_hint()), rescan_target),
+            (Span::styled(" Rescan", app.theme.base()), rescan_target),
+            (Span::raw("  "), None),
+            (
+                Span::styled("[Esc]", app.theme.key_hint()),
+                Some(ClickTarget::CloseModal),
+            ),
+            (
+                Span::styled(" Cancel", app.theme.base()),
+                Some(ClickTarget::CloseModal),
+            ),
+        ],
+        hit_map,
+    );
     Paragraph::new(footer_line).render(chunks[3], buf);
+    scroll_offset
 }
 
 fn render_pairing_prompt_modal(
@@ -277,6 +394,7 @@ fn render_pairing_prompt_modal(
     prompt: &PairingPromptModalState,
     area: Rect,
     buf: &mut Buffer,
+    hit_map: &mut HitMap,
 ) {
     let block = app
         .theme
@@ -286,8 +404,32 @@ fn render_pairing_prompt_modal(
     let inner = block.inner(area);
     block.render(area, buf);
 
+    let action_y = inner.y.saturating_add(7);
     let lines = match prompt {
         PairingPromptModalState::Confirmation { passkey, wearable } => {
+            let action_line = build_modal_clickable_row_line(
+                inner,
+                action_y,
+                vec![
+                    (Span::styled(" Press ", app.theme.base()), None),
+                    (
+                        Span::styled("[y]", app.theme.key_hint()),
+                        Some(ClickTarget::PairingConfirm(true)),
+                    ),
+                    (Span::styled(" to Confirm, or ", app.theme.base()), None),
+                    (
+                        Span::styled("[n]", app.theme.key_hint()),
+                        Some(ClickTarget::PairingConfirm(false)),
+                    ),
+                    (Span::styled("/", app.theme.key_hint()), None),
+                    (
+                        Span::styled("[Esc]", app.theme.key_hint()),
+                        Some(ClickTarget::CloseModal),
+                    ),
+                    (Span::styled(" to Reject.", app.theme.base()), None),
+                ],
+                hit_map,
+            );
             vec![
                 Line::from(""),
                 Line::from(vec![
@@ -305,69 +447,78 @@ fn render_pairing_prompt_modal(
                     app.theme.highlight(),
                 )]),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled(" Press ", app.theme.base()),
-                    Span::styled("[y]", app.theme.key_hint()),
-                    Span::styled(" to Confirm, or ", app.theme.base()),
-                    Span::styled("[n]/[Esc]", app.theme.key_hint()),
-                    Span::styled(" to Reject.", app.theme.base()),
-                ]),
+                action_line,
             ]
         }
-        PairingPromptModalState::Passkey { wearable, input } => {
-            vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(" Wearable: ", app.theme.muted()),
-                    Span::styled(wearable, app.theme.base()),
-                ]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    " Enter 6-digit Bluetooth passkey: ",
-                    app.theme.warning(),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    format!(" [ {} ]", input),
-                    app.theme.highlight(),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    " Press [Enter] to submit, [Esc] to cancel.",
-                    app.theme.base(),
-                )]),
-            ]
-        }
-        PairingPromptModalState::PinCode { wearable, input } => {
-            vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(" Wearable: ", app.theme.muted()),
-                    Span::styled(wearable, app.theme.base()),
-                ]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    " Enter Bluetooth PIN code: ",
-                    app.theme.warning(),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    format!(" [ {} ]", input),
-                    app.theme.highlight(),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    " Press [Enter] to submit, [Esc] to cancel.",
-                    app.theme.base(),
-                )]),
-            ]
-        }
+        PairingPromptModalState::Passkey { wearable, input } => pairing_input_lines(
+            app,
+            wearable,
+            " Enter 6-digit Bluetooth passkey: ",
+            input,
+            inner,
+            action_y,
+            hit_map,
+        ),
+        PairingPromptModalState::PinCode { wearable, input } => pairing_input_lines(
+            app,
+            wearable,
+            " Enter Bluetooth PIN code: ",
+            input,
+            inner,
+            action_y,
+            hit_map,
+        ),
     };
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_rename_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn pairing_input_lines<'a>(
+    app: &TuiApp,
+    wearable: &'a str,
+    prompt_label: &'static str,
+    input: &str,
+    inner: Rect,
+    action_y: u16,
+    hit_map: &mut HitMap,
+) -> Vec<Line<'a>> {
+    let action_line = build_modal_clickable_row_line(
+        inner,
+        action_y,
+        vec![
+            (Span::styled(" Press ", app.theme.base()), None),
+            (
+                Span::styled("[Enter]", app.theme.key_hint()),
+                Some(ClickTarget::ModalConfirm),
+            ),
+            (Span::styled(" to submit, ", app.theme.base()), None),
+            (
+                Span::styled("[Esc]", app.theme.key_hint()),
+                Some(ClickTarget::CloseModal),
+            ),
+            (Span::styled(" to cancel.", app.theme.base()), None),
+        ],
+        hit_map,
+    );
+    vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Wearable: ", app.theme.muted()),
+            Span::styled(wearable, app.theme.base()),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(prompt_label, app.theme.warning())]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!(" [ {} ]", input),
+            app.theme.highlight(),
+        )]),
+        Line::from(""),
+        action_line,
+    ]
+}
+
+fn render_rename_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let ModalState::RenameModal {
         ref current_alias,
         ref input,
@@ -378,13 +529,46 @@ fn render_rename_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
 
     let modal_area = centered_rect(area, 48, 8);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
     Clear.render(modal_area, buf);
 
     let block = app.theme.card_block(" Rename Wearable Alias ");
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
 
+    if inner.width > 0 && inner.height > 2 {
+        hit_map.push_modal_click(
+            Rect::new(inner.x, inner.y.saturating_add(2), inner.width, 1),
+            ClickTarget::FocusModalInput,
+        );
+    }
+
     let cursor = if app.theme.ascii { "_" } else { "█" };
+    let action_line = build_modal_clickable_row_line(
+        inner,
+        inner.y.saturating_add(4),
+        vec![
+            (Span::raw(" "), None),
+            (
+                Span::styled("[Enter]", app.theme.key_hint()),
+                Some(ClickTarget::ModalConfirm),
+            ),
+            (
+                Span::styled(" Save", app.theme.base()),
+                Some(ClickTarget::ModalConfirm),
+            ),
+            (Span::raw("   "), None),
+            (
+                Span::styled("[Esc]", app.theme.key_hint()),
+                Some(ClickTarget::CloseModal),
+            ),
+            (
+                Span::styled(" Cancel", app.theme.base()),
+                Some(ClickTarget::CloseModal),
+            ),
+        ],
+        hit_map,
+    );
     let lines = vec![
         Line::from(vec![
             Span::styled(" Current: ", app.theme.muted()),
@@ -396,18 +580,13 @@ fn render_rename_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             app.theme.primary(),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(" [Enter]", app.theme.key_hint()),
-            Span::styled(" Save   ", app.theme.base()),
-            Span::styled("[Esc]", app.theme.key_hint()),
-            Span::styled(" Cancel", app.theme.base()),
-        ]),
+        action_line,
     ];
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let ModalState::UnenrollModal {
         ref wearable,
         forget_bluez,
@@ -419,11 +598,25 @@ fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
 
     let modal_area = centered_rect(area, 58, 12);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
     Clear.render(modal_area, buf);
 
     let block = app.theme.card_block(" Unenroll Wearable ");
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
+
+    if inner.width > 0 && inner.height > 3 {
+        hit_map.push_modal_click(
+            Rect::new(inner.x, inner.y.saturating_add(3), inner.width, 1),
+            ClickTarget::UnenrollToggle(UnenrollCheckbox::ForgetBluez),
+        );
+    }
+    if inner.width > 0 && inner.height > 4 {
+        hit_map.push_modal_click(
+            Rect::new(inner.x, inner.y.saturating_add(4), inner.width, 1),
+            ClickTarget::UnenrollToggle(UnenrollCheckbox::DeleteSessions),
+        );
+    }
 
     let name = wearable
         .wearable
@@ -447,6 +640,24 @@ fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         app.theme.base()
     };
 
+    let action_line = build_modal_clickable_row_line(
+        inner,
+        inner.y.saturating_add(6),
+        vec![
+            (Span::styled("   ", app.theme.base()), None),
+            (
+                Span::styled(" [ Confirm ] ", btn0_style),
+                Some(ClickTarget::UnenrollConfirm),
+            ),
+            (Span::styled("   ", app.theme.base()), None),
+            (
+                Span::styled(" [ Cancel ] ", btn1_style),
+                Some(ClickTarget::CloseModal),
+            ),
+        ],
+        hit_map,
+    );
+
     let lines = vec![
         Line::from(vec![Span::styled(
             format!(" Remove '{}' from BPMute allowlist?", name),
@@ -466,12 +677,7 @@ fn render_unenroll_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             app.theme.base(),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("   ", app.theme.base()),
-            Span::styled(" [ Confirm ] ", btn0_style),
-            Span::styled("   ", app.theme.base()),
-            Span::styled(" [ Cancel ] ", btn1_style),
-        ]),
+        action_line,
     ];
 
     Paragraph::new(lines).render(inner, buf);

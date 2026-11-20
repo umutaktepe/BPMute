@@ -6,7 +6,7 @@ use ratatui::widgets::{Clear, Gauge, Paragraph, Widget};
 use super::super::app::{Tab, TuiApp};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::super::sparkline::HrSparklineWidget;
-use super::centered_rect;
+use super::{build_clickable_row_line, centered_rect};
 use crate::ipc::protocol::alert_ids;
 
 pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
@@ -85,27 +85,6 @@ pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_m
     if show_diag && diag_height > 0 {
         render_diagnostics_pane(app, diag_area, buf, hit_map);
     }
-}
-
-fn build_clickable_row_line<'a>(
-    inner: Rect,
-    y: u16,
-    items: Vec<(Span<'a>, Option<ClickTarget>)>,
-    hit_map: &mut HitMap,
-) -> Line<'a> {
-    let mut x = inner.x;
-    let mut spans = Vec::with_capacity(items.len());
-    for (span, target) in items {
-        let w = span.width() as u16;
-        if let Some(click_target) = target
-            && inner.height > 0
-        {
-            hit_map.push_clipped_row_click(inner, x, y, w, click_target);
-        }
-        x = x.saturating_add(w);
-        spans.push(span);
-    }
-    Line::from(spans)
 }
 
 fn render_alert_strip(

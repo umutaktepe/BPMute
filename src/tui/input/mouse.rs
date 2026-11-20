@@ -3,6 +3,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use super::super::app::TuiApp;
 use super::super::event::TuiCommand;
 use super::super::hit_map::{ClickTarget, ScrollTarget};
+use super::step_index;
 
 impl TuiApp {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<TuiCommand> {
@@ -36,6 +37,12 @@ impl TuiApp {
                     ClickTarget::WearablesRename => self.open_rename_selected_wearable_modal(),
                     ClickTarget::WearablesReconnect => self.reconnect_selected_wearable(),
                     ClickTarget::WearablesUnenroll => self.open_unenroll_selected_wearable_modal(),
+                    ClickTarget::SelectWearable(idx) => {
+                        if idx < self.enrolled_wearables.len() {
+                            self.selected_wearable_idx = idx;
+                        }
+                        None
+                    }
                     ClickTarget::HistoryFeedback => self.open_history_feedback_modal(),
                     ClickTarget::HistoryExport => self.open_history_export_modal(),
                     ClickTarget::HistoryDelete => self.open_history_delete_modal(),
@@ -64,6 +71,23 @@ impl TuiApp {
                     ClickTarget::CloseModal => self.cancel_active_modal(),
                     ClickTarget::ModalConfirm => self.confirm_active_modal(),
                     ClickTarget::ModalRescan => self.rescan_enrollment_modal(),
+                    ClickTarget::EnrollmentFocusList => {
+                        self.set_enrollment_alias_focus(false);
+                        None
+                    }
+                    ClickTarget::EnrollmentSelectRow(idx) => self.click_enrollment_row(idx),
+                    ClickTarget::FocusModalInput => {
+                        self.set_enrollment_alias_focus(true);
+                        None
+                    }
+                    ClickTarget::PairingConfirm(confirmed) => {
+                        self.reply_pairing_confirmation(confirmed)
+                    }
+                    ClickTarget::UnenrollToggle(checkbox) => {
+                        self.toggle_unenroll_option(checkbox);
+                        None
+                    }
+                    ClickTarget::UnenrollConfirm => self.confirm_unenroll_modal(),
                     ClickTarget::PauseOption(idx) => self.click_pause_option(idx),
                     ClickTarget::Consume => None,
                 }
@@ -78,6 +102,9 @@ impl TuiApp {
                 match target {
                     ScrollTarget::WearablesTable => {
                         self.scroll_wearables_selection(delta);
+                    }
+                    ScrollTarget::EnrollmentList => {
+                        self.scroll_enrollment_list(delta);
                     }
                     ScrollTarget::HelpModal => {
                         self.scroll_help(delta);
@@ -99,12 +126,10 @@ impl TuiApp {
     }
 
     fn scroll_wearables_selection(&mut self, delta: isize) {
-        let len = self.enrolled_wearables.len();
-        if len == 0 {
-            return;
-        }
-        let max_idx = len.saturating_sub(1) as isize;
-        let next = (self.selected_wearable_idx as isize + delta).clamp(0, max_idx);
-        self.selected_wearable_idx = next as usize;
+        self.selected_wearable_idx = step_index(
+            self.selected_wearable_idx,
+            self.enrolled_wearables.len(),
+            delta,
+        );
     }
 }

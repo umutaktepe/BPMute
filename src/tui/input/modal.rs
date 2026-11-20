@@ -5,7 +5,6 @@ use super::super::app::{
     TuiApp, UnenrollButton,
 };
 use super::super::event::TuiCommand;
-use crate::ipc::protocol::EnrollAuthResponseParams;
 
 impl TuiApp {
     pub(super) fn handle_modal_key(&mut self, key: KeyEvent) -> Option<TuiCommand> {
@@ -357,24 +356,10 @@ impl TuiApp {
 
         if let Some(PairingPromptModalState::Confirmation { .. }) = pairing_prompt {
             return match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    *pairing_prompt = None;
-                    Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                        confirmed: Some(true),
-                        passkey: None,
-                        pincode: None,
-                    }))
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') => {
-                    *pairing_prompt = None;
-                    Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                        confirmed: Some(false),
-                        passkey: None,
-                        pincode: None,
-                    }))
-                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.reply_pairing_confirmation(true),
+                KeyCode::Char('n') | KeyCode::Char('N') => self.reply_pairing_confirmation(false),
                 KeyCode::Esc => {
-                    self.modal = ModalState::None;
+                    self.close_modal();
                     Some(TuiCommand::EnrollCancel)
                 }
                 _ => None,
@@ -383,7 +368,7 @@ impl TuiApp {
 
         if *enrolling {
             if key.code == KeyCode::Esc {
-                self.modal = ModalState::None;
+                self.close_modal();
                 return Some(TuiCommand::EnrollCancel);
             }
             return None;
@@ -391,7 +376,7 @@ impl TuiApp {
 
         match key.code {
             KeyCode::Esc => {
-                self.modal = ModalState::None;
+                self.close_modal();
                 Some(TuiCommand::EnrollCancel)
             }
             KeyCode::Tab => {
@@ -444,35 +429,14 @@ impl TuiApp {
                         | PairingPromptModalState::PinCode { input, .. } => {
                             return match key.code {
                                 KeyCode::Esc => {
-                                    self.modal = ModalState::None;
+                                    self.close_modal();
                                     Some(TuiCommand::EnrollCancel)
                                 }
                                 KeyCode::Backspace => {
                                     input.pop();
                                     None
                                 }
-                                KeyCode::Enter => {
-                                    let ans = input.clone();
-                                    let cmd = match prompt {
-                                        PairingPromptModalState::Passkey { .. } => {
-                                            TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                                                confirmed: Some(true),
-                                                passkey: ans.parse::<u32>().ok(),
-                                                pincode: None,
-                                            })
-                                        }
-                                        PairingPromptModalState::PinCode { .. } => {
-                                            TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
-                                                confirmed: Some(true),
-                                                passkey: None,
-                                                pincode: Some(ans),
-                                            })
-                                        }
-                                        _ => return None,
-                                    };
-                                    *pairing_prompt = None;
-                                    Some(cmd)
-                                }
+                                KeyCode::Enter => self.submit_pairing_prompt_input(),
                                 KeyCode::Char(c) => {
                                     input.push(c);
                                     None
@@ -487,7 +451,7 @@ impl TuiApp {
                 if *alias_focused {
                     match key.code {
                         KeyCode::Esc => {
-                            self.modal = ModalState::None;
+                            self.close_modal();
                             Some(TuiCommand::EnrollCancel)
                         }
                         KeyCode::Tab | KeyCode::Enter => {

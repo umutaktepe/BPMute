@@ -1,9 +1,11 @@
 use chrono::TimeZone;
 
-use super::super::app::{ModalState, TuiApp, UnenrollButton};
+use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
 use super::super::event::TuiCommand;
+use super::super::hit_map::UnenrollCheckbox;
+use super::step_index;
 use crate::calibration::FeedbackVerdict;
-use crate::ipc::protocol::{PauseMode, PauseParams};
+use crate::ipc::protocol::{EnrollAuthResponseParams, PauseMode, PauseParams};
 use crate::replay::TraceFormat;
 
 const PAUSE_OPTION_COUNT: usize = 5;
@@ -71,12 +73,14 @@ impl TuiApp {
     pub(super) fn rescan_enrollment_modal(&mut self) -> Option<TuiCommand> {
         if let ModalState::EnrollmentModal {
             ref mut scanning_remaining_ms,
+            ref mut alias_focused,
             ref mut error_message,
             enrolling: false,
             pairing_prompt: None,
             ..
         } = self.modal
         {
+            *alias_focused = false;
             *scanning_remaining_ms = 30_000;
             *error_message = None;
             Some(TuiCommand::EnrollStart(Some(30)))
@@ -85,9 +89,122 @@ impl TuiApp {
         }
     }
 
+    pub(super) fn set_enrollment_alias_focus(&mut self, focused: bool) {
+        if let ModalState::EnrollmentModal {
+            ref mut alias_focused,
+            enrolling: false,
+            pairing_prompt: None,
+            ..
+        } = self.modal
+        {
+            *alias_focused = focused;
+        }
+    }
+
+    pub(super) fn click_enrollment_row(&mut self, idx: usize) -> Option<TuiCommand> {
+        let ModalState::EnrollmentModal {
+            ref mut selected_discovered_idx,
+            ref mut alias_focused,
+            enrolling: false,
+            pairing_prompt: None,
+            ..
+        } = self.modal
+        else {
+            return None;
+        };
+        if idx >= self.discovered_wearables.len() {
+            return None;
+        }
+        let was_focused = *alias_focused;
+        *alias_focused = false;
+        if !was_focused && *selected_discovered_idx == idx {
+            self.confirm_enrollment_selection()
+        } else {
+            *selected_discovered_idx = idx;
+            None
+        }
+    }
+
+    pub(super) fn scroll_enrollment_list(&mut self, delta: isize) {
+        let ModalState::EnrollmentModal {
+            ref mut selected_discovered_idx,
+            enrolling: false,
+            pairing_prompt: None,
+            ..
+        } = self.modal
+        else {
+            return;
+        };
+        *selected_discovered_idx = step_index(
+            *selected_discovered_idx,
+            self.discovered_wearables.len(),
+            delta,
+        );
+    }
+
+    pub(super) fn reply_pairing_confirmation(&mut self, confirmed: bool) -> Option<TuiCommand> {
+        let ModalState::EnrollmentModal {
+            ref mut pairing_prompt,
+            ..
+        } = self.modal
+        else {
+            return None;
+        };
+        if matches!(
+            pairing_prompt,
+            Some(PairingPromptModalState::Confirmation { .. })
+        ) {
+            *pairing_prompt = None;
+            Some(TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+                confirmed: Some(confirmed),
+                passkey: None,
+                pincode: None,
+            }))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn submit_pairing_prompt_input(&mut self) -> Option<TuiCommand> {
+        let ModalState::EnrollmentModal {
+            ref mut pairing_prompt,
+            ..
+        } = self.modal
+        else {
+            return None;
+        };
+        let cmd = match pairing_prompt {
+            Some(PairingPromptModalState::Passkey { input, .. }) => {
+                TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+                    confirmed: Some(true),
+                    passkey: input.parse::<u32>().ok(),
+                    pincode: None,
+                })
+            }
+            Some(PairingPromptModalState::PinCode { input, .. }) => {
+                TuiCommand::EnrollAuthReply(EnrollAuthResponseParams {
+                    confirmed: Some(true),
+                    passkey: None,
+                    pincode: Some(input.clone()),
+                })
+            }
+            _ => return None,
+        };
+        *pairing_prompt = None;
+        Some(cmd)
+    }
+
     pub(super) fn confirm_active_modal(&mut self) -> Option<TuiCommand> {
         match self.modal {
             ModalState::PausePopover { selected_idx } => self.confirm_pause_selection(selected_idx),
+            ModalState::EnrollmentModal {
+                pairing_prompt:
+                    Some(
+                        PairingPromptModalState::Passkey { .. }
+                        | PairingPromptModalState::PinCode { .. },
+                    ),
+                ..
+            } => self.submit_pairing_prompt_input(),
             ModalState::EnrollmentModal {
                 enrolling: false,
                 pairing_prompt: None,
@@ -119,6 +236,7 @@ impl TuiApp {
         let ModalState::EnrollmentModal {
             selected_discovered_idx,
             ref alias_input,
+            ref mut alias_focused,
             ref mut enrolling,
             ref mut error_message,
             ..
@@ -126,6 +244,7 @@ impl TuiApp {
         else {
             return None;
         };
+        *alias_focused = false;
         let dev = self.discovered_wearables.get(selected_discovered_idx)?;
         let addr = dev.address.clone();
         let alias = if alias_input.trim().is_empty() {
@@ -161,6 +280,20 @@ impl TuiApp {
             id: w_id,
             alias: new_alias,
         })
+    }
+
+    pub(super) fn toggle_unenroll_option(&mut self, checkbox: UnenrollCheckbox) {
+        if let ModalState::UnenrollModal {
+            ref mut forget_bluez,
+            ref mut delete_sessions,
+            ..
+        } = self.modal
+        {
+            match checkbox {
+                UnenrollCheckbox::ForgetBluez => *forget_bluez = !*forget_bluez,
+                UnenrollCheckbox::DeleteSessions => *delete_sessions = !*delete_sessions,
+            }
+        }
     }
 
     pub(super) fn confirm_unenroll_modal(&mut self) -> Option<TuiCommand> {
