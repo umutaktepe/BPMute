@@ -32,7 +32,7 @@ while IFS= read -r -d '' file; do
   lines=$(wc -l < "$file")
   limit=1000
   case "$file" in
-    ./src/storage/store/mod.rs) limit=1294 ;;
+    ./src/storage/store/mod.rs) limit=1065 ;;
     ./src/sleep_engine/state_machine.rs) limit=1041 ;;
   esac
   if [ "$lines" -gt "$limit" ]; then
