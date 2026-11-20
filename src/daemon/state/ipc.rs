@@ -5,13 +5,14 @@ use serde_json::{Value, json};
 use crate::calibration::CalibrationState;
 use crate::config::ConfigPatch;
 use crate::ipc::protocol::{
-    CalibrationSetBoundaryParams, DataBackupSqliteParams, DataExportBundleParams,
-    DataExportBundleResponse, DataHardWipeParams, DataImportBundleParams, DataImportBundleResponse,
-    DataPurgeRawResponse, EnrollAuthResponseParams, EnrollSelectParams, EnrollSelectResponse,
-    EnrollStartParams, EnrollStartResponse, ErrorPayload, PROTOCOL_VERSION, PauseParams,
-    SessionDeleteParams, SessionDeleteResponse, SessionExportTraceParams,
+    AlertDismissParams, CalibrationSetBoundaryParams, DataBackupSqliteParams,
+    DataExportBundleParams, DataExportBundleResponse, DataHardWipeParams, DataImportBundleParams,
+    DataImportBundleResponse, DataPurgeRawResponse, EnrollAuthResponseParams, EnrollSelectParams,
+    EnrollSelectResponse, EnrollStartParams, EnrollStartResponse, ErrorPayload, PROTOCOL_VERSION,
+    PauseParams, SessionDeleteParams, SessionDeleteResponse, SessionExportTraceParams,
     SessionExportTraceResponse, SessionGetParams, SessionListParams, SetDryRunParams,
-    SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableListResponse,
+    SetFeedbackParams, SetSeedParams, SnoozeGraceParams, SnoozeGraceResponse, TestTriggerParams,
+    TestTriggerResponse, WearableConnectParams, WearableConnectResponse, WearableListResponse,
     WearableMutationResponse, WearableRenameParams, WearableUnenrollParams, error_codes,
 };
 use crate::storage::{ImportMode, SetFeedbackRequest, WearableDescriptor};
@@ -57,32 +58,34 @@ impl DaemonCore {
                 Ok(json!({ "cancelled": true }))
             }
             "monitor.snooze_grace" => {
-                let dur_sec = params
-                    .get("duration_sec")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .or_else(|| {
-                        params
-                            .get("duration_min")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| (v * 60) as u32)
-                    });
+                let parsed: SnoozeGraceParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid monitor.snooze_grace params: {e}"),
+                    )
+                })?;
+                let dur_sec = parsed
+                    .duration_sec
+                    .or_else(|| parsed.duration_min.map(|m| m.saturating_mul(60)));
                 let dur = self.snooze_grace(dur_sec).await?;
-                Ok(json!({ "snoozed": true, "duration_sec": dur }))
+                serialize_json(SnoozeGraceResponse {
+                    snoozed: true,
+                    duration_sec: dur,
+                })
             }
             "monitor.test_trigger" => {
-                let grace_sec = params
-                    .get("grace_sec")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .or_else(|| {
-                        params
-                            .get("grace_period_sec")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as u32)
-                    });
+                let parsed: TestTriggerParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid monitor.test_trigger params: {e}"),
+                    )
+                })?;
+                let grace_sec = parsed.grace_sec.or(parsed.grace_period_sec);
                 let eff_sec = self.start_test_trigger(grace_sec).await?;
-                Ok(json!({ "test_trigger_started": true, "grace_period_sec": eff_sec }))
+                serialize_json(TestTriggerResponse {
+                    test_trigger_started: true,
+                    grace_period_sec: eff_sec,
+                })
             }
             "config.get" => {
                 let guard = self.inner.lock().expect("daemon state mutex poisoned");
@@ -434,7 +437,10 @@ impl DaemonCore {
                 if let Some(conn) = try_system_conn().await {
                     let _ = crate::bluetooth::operations::connect_device(&conn, &w.mac).await;
                 }
-                Ok(json!({ "ok": true, "message": format!("connection requested for {}", w.id) }))
+                serialize_json(WearableConnectResponse {
+                    ok: true,
+                    message: format!("connection requested for {}", w.id),
+                })
             }
             "wearable.unenroll" => {
                 let parsed: WearableUnenrollParams =
@@ -633,14 +639,16 @@ impl DaemonCore {
                 })
             }
             "alert.dismiss" => {
-                let id = params
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ipc_err(error_codes::INVALID_PARAMS, "missing 'id' param"))?;
+                let parsed: AlertDismissParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid alert.dismiss params: {e}"),
+                    )
+                })?;
                 let (changed, alerts) = {
                     let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                     let before = guard.alerts.len();
-                    guard.alerts.retain(|a| a.id != id || !a.dismissible);
+                    guard.alerts.retain(|a| a.id != parsed.id || !a.dismissible);
                     (guard.alerts.len() != before, guard.alerts.clone())
                 };
                 if changed {

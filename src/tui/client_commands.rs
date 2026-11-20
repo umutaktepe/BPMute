@@ -10,11 +10,11 @@ use super::event::{IpcEvent, TuiCommand, TuiEvent};
 use crate::calibration::CalibrationState;
 use crate::config::{ClockTime, PatchField};
 use crate::ipc::protocol::{
-    CalibrationSetBoundaryParams, ConfigSnapshotPayload, DaemonStatus, DataHardWipeParams,
-    DiscoveredWearable, EnrollSelectParams, EnrollStartParams, RequestEnvelope,
+    AlertDismissParams, CalibrationSetBoundaryParams, ConfigSnapshotPayload, DaemonStatus,
+    DataHardWipeParams, DiscoveredWearable, EnrollSelectParams, EnrollStartParams, RequestEnvelope,
     SessionDeleteParams, SessionExportTraceParams, SessionGetParams, SessionListParams,
-    SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableListResponse,
-    WearableRenameParams, WearableUnenrollParams,
+    SetFeedbackParams, SetSeedParams, SnoozeGraceParams, WearableConnectParams,
+    WearableListResponse, WearableRenameParams, WearableUnenrollParams,
 };
 use crate::storage::{SessionFullDetail, SessionListPage, StorageStats};
 
@@ -27,8 +27,8 @@ pub(super) async fn execute_command(
 ) -> Result<(), std::io::Error> {
     match cmd {
         TuiCommand::Pause(params) => {
-            let val = serde_json::to_value(params).unwrap_or_else(|_| json!({}));
-            send_op_request(req_tx, pending, next_id, "monitor.pause", val, event_tx).await?;
+            send_typed_op_request(req_tx, pending, next_id, "monitor.pause", &params, event_tx)
+                .await?;
         }
         TuiCommand::Resume => {
             send_op_request(
@@ -52,17 +52,17 @@ pub(super) async fn execute_command(
             )
             .await?;
         }
-        TuiCommand::SnoozeGrace(duration) => {
-            let params = match duration {
-                Some(d) => json!({ "duration_sec": d }),
-                None => json!({}),
+        TuiCommand::SnoozeGrace(duration_sec) => {
+            let params = SnoozeGraceParams {
+                duration_sec,
+                duration_min: None,
             };
-            send_op_request(
+            send_typed_op_request(
                 req_tx,
                 pending,
                 next_id,
                 "monitor.snooze_grace",
-                params,
+                &params,
                 event_tx,
             )
             .await?;
@@ -208,14 +208,8 @@ pub(super) async fn execute_command(
             .await?;
         }
         TuiCommand::DismissAlert { id } => {
-            send_request(
-                req_tx,
-                pending,
-                next_id,
-                "alert.dismiss",
-                json!({ "id": id }),
-            )
-            .await?;
+            let params = AlertDismissParams { id };
+            send_typed_request(req_tx, pending, next_id, "alert.dismiss", &params).await?;
         }
         TuiCommand::RefreshStatus => {
             refresh_status_event(req_tx, pending, next_id, event_tx, false).await?;

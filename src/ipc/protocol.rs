@@ -203,10 +203,47 @@ pub struct PauseParams {
 }
 
 /// Parameters accepted by `monitor.set_dry_run`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetDryRunParams {
     pub dry_run: bool,
+}
+
+/// Parameters accepted by `monitor.snooze_grace`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SnoozeGraceParams {
+    pub duration_sec: Option<u32>,
+    pub duration_min: Option<u32>,
+}
+
+/// Typed response payload for `monitor.snooze_grace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnoozeGraceResponse {
+    pub snoozed: bool,
+    pub duration_sec: u32,
+}
+
+/// Parameters accepted by `monitor.test_trigger`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestTriggerParams {
+    pub grace_sec: Option<u32>,
+    pub grace_period_sec: Option<u32>,
+}
+
+/// Typed response payload for `monitor.test_trigger`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestTriggerResponse {
+    pub test_trigger_started: bool,
+    pub grace_period_sec: u32,
+}
+
+/// Parameters accepted by `alert.dismiss`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertDismissParams {
+    pub id: String,
 }
 
 /// Severity level for daemon alerts surfaced in status and TUI.
@@ -584,6 +621,13 @@ pub struct WearableRenameParams {
 #[serde(deny_unknown_fields)]
 pub struct WearableConnectParams {
     pub id: String,
+}
+
+/// Typed response payload for `wearable.connect`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WearableConnectResponse {
+    pub ok: bool,
+    pub message: String,
 }
 
 /// Parameters for `wearable.unenroll`.

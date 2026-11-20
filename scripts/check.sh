@@ -39,15 +39,42 @@ if grep -En 'let[[:space:]]+_[[:space:]]*=[[:space:]]*(adapter|device|mgr|proxy)
   exit 1
 fi
 
-if ! grep -Eq 'parse_hr_measurement\(' src/bluetooth/service.rs; then
-  echo "error: parse_hr_measurement must be wired into production src/bluetooth/service.rs" >&2
+if ! grep -REq 'parse_hr_measurement\(' src/bluetooth; then
+  echo "error: parse_hr_measurement must be wired into production src/bluetooth/" >&2
   exit 1
 fi
 
-if ! grep -Eq '"WearablesUpdated"' src/daemon/state/mod.rs || ! grep -Eq '"WearablesUpdated"' src/tui/client.rs; then
+if ! grep -REq '"WearablesUpdated"' src/daemon/state || ! grep -REq '"WearablesUpdated"' src/tui; then
   echo "error: WearablesUpdated IPC control event must stay wired between daemon and TUI" >&2
   exit 1
 fi
+
+python3 - <<'PY'
+import glob, re, sys
+
+proto_lines = open("src/ipc/protocol.rs", encoding="utf-8").read().splitlines()
+for idx, line in enumerate(proto_lines):
+    if "deny_unknown_fields" in line:
+        window = "\n".join(proto_lines[max(0, idx - 3) : idx + 2])
+        if "derive(" not in window or "Serialize" not in window:
+            sys.exit(
+                f"error: #[serde(deny_unknown_fields)] type at src/ipc/protocol.rs:{idx + 1} must also derive Serialize"
+            )
+
+files = sorted(set(glob.glob("src/tui/**/*.rs", recursive=True) + glob.glob("src/cli/commands/*.rs")))
+for path in files:
+    stripped = "\n".join(
+        l.split("//", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()
+    )
+    if re.search(r'json!\(\s*\{[^}]*"', stripped):
+        sys.exit(
+            f"error: keyed serde_json::json!({{ ... }}) literal forbidden in {path}; use typed structs from src/ipc/protocol.rs"
+        )
+    if re.search(r'\["[a-z0-9_]+"\]', stripped):
+        sys.exit(
+            f"error: raw JSON string-key indexing forbidden in {path}; deserialize typed response structs from src/ipc/protocol.rs"
+        )
+PY
 
 for script in scripts/*.sh .githooks/*; do
   [ -f "$script" ] || continue
@@ -115,14 +142,14 @@ if awk '
   {
     line = $0
     sub(/\/\/.*/, "", line)
-    if (in_test && !paused && line ~ /tokio::time::sleep/) {
+    if (in_test && !paused && line ~ /tokio::time::(sleep|timeout|interval)/) {
       print FILENAME ":" FNR ":" $0
       found = 1
     }
   }
   END { exit !found }
 ' tests/*.rs; then
-  echo "error: tokio::time::sleep inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
+  echo "error: tokio::time::{sleep,timeout,interval} inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
   exit 1
 fi
 

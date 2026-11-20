@@ -5,6 +5,9 @@ use serde_json::json;
 
 use crate::cli::duration::parse_pause_target;
 use crate::exit_code::ExitCode;
+use crate::ipc::protocol::{
+    SnoozeGraceParams, SnoozeGraceResponse, TestTriggerParams, TestTriggerResponse,
+};
 use crate::ipc::{IpcClient, IpcClientError};
 
 /// Cancels an active Grace Period countdown via `monitor.cancel_grace`.
@@ -66,17 +69,23 @@ pub async fn run_snooze<WOut: Write, WErr: Write>(
         Err(err) => return handle_ipc_error(err, stderr),
     };
 
-    let params = match duration_sec {
-        Some(sec) => json!({ "duration_sec": sec }),
-        None => json!({}),
+    let params = SnoozeGraceParams {
+        duration_sec,
+        duration_min: None,
     };
 
-    match client.request("monitor.snooze_grace", params).await {
+    let param_val = match serde_json::to_value(&params) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = writeln!(stderr, "error: failed to serialize snooze params: {err}");
+            return ExitCode::RuntimeError;
+        }
+    };
+
+    match client.request("monitor.snooze_grace", param_val).await {
         Ok(resp) => {
-            let dur_sec = resp
-                .get("duration_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1800);
+            let parsed = serde_json::from_value::<SnoozeGraceResponse>(resp).ok();
+            let dur_sec = parsed.map_or(1800, |r| r.duration_sec);
             let mins = dur_sec / 60;
             let _ = writeln!(
                 stdout,
@@ -107,17 +116,26 @@ pub async fn run_test_trigger<WOut: Write, WErr: Write>(
         Err(err) => return handle_ipc_error(err, stderr),
     };
 
-    let params = match grace_sec {
-        Some(sec) => json!({ "grace_sec": sec }),
-        None => json!({}),
+    let params = TestTriggerParams {
+        grace_sec,
+        grace_period_sec: None,
     };
 
-    match client.request("monitor.test_trigger", params).await {
+    let param_val = match serde_json::to_value(&params) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = writeln!(
+                stderr,
+                "error: failed to serialize test_trigger params: {err}"
+            );
+            return ExitCode::RuntimeError;
+        }
+    };
+
+    match client.request("monitor.test_trigger", param_val).await {
         Ok(resp) => {
-            let eff_sec = resp
-                .get("grace_period_sec")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30);
+            let parsed = serde_json::from_value::<TestTriggerResponse>(resp).ok();
+            let eff_sec = parsed.map_or(30, |r| r.grace_period_sec);
             let _ = writeln!(
                 stdout,
                 "Initiated dry-run test trigger ({eff_sec}s grace period)."

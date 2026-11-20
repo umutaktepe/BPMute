@@ -9,8 +9,8 @@ use crate::cli::args::WearablesCommand;
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::{
     EnrollSelectParams, EnrollSelectResponse, EnrollStartParams, EnrollStartResponse,
-    EnrolledWearableStatus, WearableConnectParams, WearableListResponse, WearableMutationResponse,
-    WearableRenameParams, WearableUnenrollParams,
+    EnrolledWearableStatus, WearableConnectParams, WearableConnectResponse, WearableListResponse,
+    WearableMutationResponse, WearableRenameParams, WearableUnenrollParams,
 };
 use crate::ipc::{IpcClient, IpcClientError};
 use crate::paths::ResolvedPaths;
@@ -68,7 +68,7 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
                 };
 
             if json {
-                return write_json_line(&json!({ "wearables": wearables }), stdout, stderr);
+                return write_json_line(&WearableListResponse { wearables }, stdout, stderr);
             }
 
             if wearables.is_empty() {
@@ -161,7 +161,7 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
         WearablesCommand::Connect { id } => match connect_online_or_offline(paths, stderr).await {
             Ok(OnlineOrOffline::Online(mut client)) => {
                 let params = WearableConnectParams { id };
-                match ipc_request_params::<_, serde_json::Value, _>(
+                match ipc_request_params::<_, WearableConnectResponse, _>(
                     &mut client,
                     "wearable.connect",
                     &params,
@@ -169,9 +169,8 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
                 )
                 .await
                 {
-                    Ok(val) => {
-                        let msg = val["message"].as_str().unwrap_or("connection requested");
-                        let _ = writeln!(stdout, "{msg}");
+                    Ok(resp) => {
+                        let _ = writeln!(stdout, "{}", resp.message);
                         ExitCode::Success
                     }
                     Err(code) => code,

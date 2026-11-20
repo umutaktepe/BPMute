@@ -11,7 +11,7 @@ use crate::bluetooth::BluezWearableSource;
 use crate::config::{CliOverrides, LoadedConfig, Sensitivity, init_config_file};
 use crate::daemon::{DaemonError, DaemonHandle, DaemonOptions, SystemClock};
 use crate::exit_code::ExitCode;
-use crate::ipc::protocol::ConfigSnapshotPayload;
+use crate::ipc::protocol::{ConfigSnapshotPayload, PauseMode, PauseParams};
 use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus};
 use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, resolve_config_file, split_shell_words};
@@ -285,23 +285,32 @@ async fn run_pause<WOut: Write, WErr: Write>(
     };
 
     let params = match parsed {
-        PauseTarget::Indefinite => json!({ "mode": "indefinite" }),
-        PauseTarget::UntilMorning => json!({ "mode": "until_morning" }),
-        PauseTarget::DurationSecs(secs) => {
-            json!({ "mode": "duration", "duration_sec": secs })
-        }
+        PauseTarget::Indefinite => PauseParams {
+            mode: Some(PauseMode::Indefinite),
+            duration_sec: None,
+        },
+        PauseTarget::UntilMorning => PauseParams {
+            mode: Some(PauseMode::UntilMorning),
+            duration_sec: None,
+        },
+        PauseTarget::DurationSecs(secs) => PauseParams {
+            mode: Some(PauseMode::Duration),
+            duration_sec: Some(secs),
+        },
     };
 
-    match client.request("monitor.pause", params).await {
-        Ok(data) => {
-            if let Some(until) = data.get("paused_until").and_then(|v| v.as_str()) {
+    match ipc_request_params::<_, DaemonStatus, _>(&mut client, "monitor.pause", &params, stderr)
+        .await
+    {
+        Ok(status) => {
+            if let Some(until) = status.paused_until {
                 let _ = writeln!(stdout, "Monitoring paused until {until}.");
             } else {
                 let _ = writeln!(stdout, "Monitoring paused indefinitely.");
             }
             ExitCode::Success
         }
-        Err(err) => report_ipc_error(err, stderr),
+        Err(code) => code,
     }
 }
 

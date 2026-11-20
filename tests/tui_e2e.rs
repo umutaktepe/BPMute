@@ -2244,7 +2244,7 @@ impl WearableSource for LiveStreamTestSource {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_real_socket_wearable_stream_status_and_disconnect_updates_live_tui() {
     let temp = TempDir::new().unwrap();
     let (paths, env) = make_test_paths(&temp);
@@ -2317,24 +2317,11 @@ async fn test_real_socket_wearable_stream_status_and_disconnect_updates_live_tui
     .await
     .unwrap();
 
-    let reached_streaming = tokio::time::timeout(Duration::from_secs(1), async {
-        while !app
-            .active_wearable()
-            .is_some_and(|w| w.status == StreamStatus::Streaming && app.latest_bpm == Some(65.0))
-        {
-            let Some(ev) = event_rx.recv().await else {
-                return false;
-            };
-            let _ = app.handle_event(ev);
-        }
-        true
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.active_wearable()
+            .is_some_and(|w| w.status == StreamStatus::Streaming && a.latest_bpm == Some(65.0))
     })
-    .await
-    .unwrap_or(false);
-    assert!(
-        reached_streaming,
-        "TUI must update active wearable status to Streaming and latest_bpm to 65.0"
-    );
+    .await;
 
     // Watch stops HR broadcast -> daemon emits Disconnected
     w_tx.send(WearableEvent::StreamState {
@@ -2347,24 +2334,11 @@ async fn test_real_socket_wearable_stream_status_and_disconnect_updates_live_tui
     .await
     .unwrap();
 
-    let reached_disconnected = tokio::time::timeout(Duration::from_secs(1), async {
-        while !app
-            .active_wearable()
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.active_wearable()
             .is_some_and(|w| w.status == StreamStatus::Disconnected)
-        {
-            let Some(ev) = event_rx.recv().await else {
-                return false;
-            };
-            let _ = app.handle_event(ev);
-        }
-        true
     })
-    .await
-    .unwrap_or(false);
-    assert!(
-        reached_disconnected,
-        "TUI must update active wearable status back to Disconnected when watch stops HR broadcast"
-    );
+    .await;
     assert_eq!(app.latest_bpm, None);
 
     let _ = shutdown_tx.send(true);

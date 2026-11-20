@@ -1,6 +1,6 @@
 # Coding Standards
 
-Review-stage standards for BPMute. Mechanical checks (`rustfmt`, `clippy`, `unsafe_code`, `await_holding_*`, `allow_attributes_without_reason`, `disallowed_methods` (`Path::exists`, `std::env::var*`), ADR-0001 & ADR-0007 dependency isolation, `src/sleep_engine/` and `src/calibration/` pure-sync isolation, `DaemonOptions::for_testing` in tests, `#!/usr/bin/env` ban in test scripts, executable/bash/YAML/`cargo-dist` checks, 1,000-line `src/**/*.rs` ceiling, unpaused test `tokio::time::sleep` check, 60 s suite timeout, and 5 s budgets for `sleep_engine` and `calibration_ledger`) live in `./scripts/check.sh`, `clippy.toml`, and `Cargo.toml`.
+Review-stage standards for BPMute. Mechanical checks live in `./scripts/check.sh`, `clippy.toml`, and `Cargo.toml`; run `./scripts/check.sh` rather than auditing them manually.
 
 ## Judgement Rules
 
@@ -21,4 +21,4 @@ Review-stage standards for BPMute. Mechanical checks (`rustfmt`, `clippy`, `unsa
 - **External edit isolation**: External file mutations (`$EDITOR` on `config.toml`, external SQLite file imports) must never clobber active runtime or in-memory state until validation passes. On validation failure, render the error prominently while keeping the active valid state intact.
 - **Modal state encapsulation**: Avoid bundling unbounded modal text-input logic into monolithic dispatchers; group text input state and validation logic within the modal struct to avoid primitive obsession and unbounded switch growth in input routers.
 - **D-Bus & external wire contract verification**: When authoring or mocking `zbus` proxies/interfaces, verify exact method names, parameter types, and `#[zbus(property, name = "...")]` casing (`UUIDs`, `UUID`) against `docs/research/` or `busctl introspect` primary sources, and log or propagate BlueZ registration, discovery, and subscription errors rather than discarding them.
-- **Daemon-to-TUI push completeness**: Any daemon runtime state rendered in the TUI (such as `wearable_statuses`, `wearable_batteries`, or `alerts`) must emit a control push event on state changes and have a real-socket `TuiIpcBridge` test covering both activation and teardown transitions.
+- **Daemon-to-TUI push and mutation completeness**: Any daemon runtime state rendered in the TUI (such as `wearable_statuses`, `wearable_batteries`, or `alerts`) must emit a control push event on state changes, and every TUI mutating command (`TuiCommand` modal/action) plus `OpCompleted` error/success feedback handling must have a real-socket `TuiIpcBridge` roundtrip test in `tests/tui_e2e.rs`.
