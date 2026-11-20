@@ -62,6 +62,8 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
     let theme = Theme::from_env(env, ascii);
     let systemd_installed = detect_systemd_service_installed(env);
     let mut app = TuiApp::new_with_theme(no_mouse, theme, systemd_installed);
+    app.set_offline_paths(paths.clone());
+    app.load_offline_data(env);
 
     // Terminal setup
     if let Err(err) = enable_raw_mode() {
@@ -133,41 +135,36 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
     });
 
     while !app.should_quit {
+        let mut dispatch_cmd = None;
         tokio::select! {
             _ = tick_interval.tick() => {
-                let cmd = app.handle_event(TuiEvent::Tick);
-                if let Some(c) = cmd {
-                    let _ = cmd_tx.send(c).await;
-                }
+                dispatch_cmd = app.handle_event(TuiEvent::Tick);
             }
             crossterm_event = reader.next() => {
                 match crossterm_event {
                     Some(Ok(CrosstermEvent::Key(key))) => {
-                        let cmd = app.handle_event(TuiEvent::Key(key));
-                        if let Some(c) = cmd {
-                            let _ = cmd_tx.send(c).await;
-                        }
+                        dispatch_cmd = app.handle_event(TuiEvent::Key(key));
                     }
                     Some(Ok(CrosstermEvent::Mouse(mouse))) => {
-                        let cmd = app.handle_event(TuiEvent::Mouse(mouse));
-                        if let Some(c) = cmd {
-                            let _ = cmd_tx.send(c).await;
-                        }
+                        dispatch_cmd = app.handle_event(TuiEvent::Mouse(mouse));
                     }
                     Some(Ok(CrosstermEvent::Resize(w, h))) => {
-                        let cmd = app.handle_event(TuiEvent::Resize(w, h));
-                        if let Some(c) = cmd {
-                            let _ = cmd_tx.send(c).await;
-                        }
+                        dispatch_cmd = app.handle_event(TuiEvent::Resize(w, h));
                     }
                     _ => {}
                 }
             }
             Some(tui_event) = event_rx.recv() => {
-                let cmd = app.handle_event(tui_event);
-                if let Some(c) = cmd {
-                    let _ = cmd_tx.send(c).await;
-                }
+                dispatch_cmd = app.handle_event(tui_event);
+            }
+        }
+
+        if let Some(cmd) = dispatch_cmd {
+            if cmd == TuiCommand::EditorHandoff {
+                handle_editor_handoff(env, no_mouse, &paths.config_file, &mut terminal, &cmd_tx)
+                    .await;
+            } else {
+                let _ = cmd_tx.send(cmd).await;
             }
         }
 
@@ -191,4 +188,32 @@ fn restore_terminal(no_mouse: bool) {
     }
     let _ = execute!(out, LeaveAlternateScreen);
     let _ = disable_raw_mode();
+}
+
+async fn handle_editor_handoff(
+    env: &dyn EnvSource,
+    no_mouse: bool,
+    config_file: &std::path::Path,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    cmd_tx: &mpsc::Sender<TuiCommand>,
+) {
+    restore_terminal(no_mouse);
+
+    let editor = env
+        .get("VISUAL")
+        .or_else(|| env.get("EDITOR"))
+        .unwrap_or_else(|| "nano".to_string());
+    let _ = std::process::Command::new(&editor)
+        .arg(config_file)
+        .status();
+
+    let _ = enable_raw_mode();
+    let mut out = stdout();
+    let _ = execute!(out, EnterAlternateScreen);
+    if !no_mouse {
+        let _ = execute!(out, EnableMouseCapture);
+    }
+    let _ = terminal.clear();
+
+    let _ = cmd_tx.send(TuiCommand::ConfigReload).await;
 }

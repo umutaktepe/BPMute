@@ -115,6 +115,9 @@ enum DbCommand {
     GetStorageStats {
         reply: oneshot::Sender<Result<StorageStats, StorageError>>,
     },
+    ListCalibrationBoundaries {
+        reply: oneshot::Sender<Result<Vec<CalibrationBoundaryRecord>, StorageError>>,
+    },
     ExportBundle {
         dest_path: PathBuf,
         options: ExportBundleOptions,
@@ -374,6 +377,9 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         DbCommand::GetStorageStats { reply } => {
             let _ = reply.send(store.get_storage_stats());
         }
+        DbCommand::ListCalibrationBoundaries { reply } => {
+            let _ = reply.send(store.list_calibration_boundaries());
+        }
         DbCommand::ExportBundle {
             dest_path,
             options,
@@ -629,6 +635,13 @@ impl PersistenceHandle {
 
     pub async fn get_storage_stats(&self) -> Result<StorageStats, StorageError> {
         self.call(|reply| DbCommand::GetStorageStats { reply })
+            .await
+    }
+
+    pub async fn list_calibration_boundaries(
+        &self,
+    ) -> Result<Vec<CalibrationBoundaryRecord>, StorageError> {
+        self.call(|reply| DbCommand::ListCalibrationBoundaries { reply })
             .await
     }
 

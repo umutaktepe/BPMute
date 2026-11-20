@@ -2,7 +2,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{TimeZone, Utc};
 use clap::Parser;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
@@ -25,18 +25,19 @@ use bpmute::daemon::{
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{
-    AlertSeverity, DaemonAlert, DiscoveredWearable, EnrolledWearableStatus, HrSampleEvent,
-    MonitoringState, PauseMode, PauseParams, alert_ids,
+    AlertSeverity, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus,
+    HrSampleEvent, MonitoringState, PauseMode, PauseParams, alert_ids,
 };
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
-    CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, StreamStatus,
+    CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, SessionEndReason,
+    SessionSummary, StreamStatus,
 };
 use bpmute::storage::EnrolledWearable;
 use bpmute::tui::views::header::{GraceBannerLayout, tab_hit_ranges};
 use bpmute::tui::{
-    GraceState, ModalState, PairingPromptModalState, Tab, Theme, TuiApp, TuiCommand, TuiEvent,
-    TuiIpcBridge, UnenrollButton, detect_systemd_service_installed,
+    GraceState, IpcEvent, ModalState, PairingPromptModalState, Tab, Theme, TuiApp, TuiCommand,
+    TuiEvent, TuiIpcBridge, UnenrollButton, detect_systemd_service_installed,
 };
 
 fn buffer_to_string(buf: &Buffer) -> String {
@@ -1089,4 +1090,848 @@ async fn test_real_socket_daemon_offline_grace_reset_and_restart_reconnect_e2e()
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;
     daemon2.shutdown().await;
+}
+
+use bpmute::calibration::{
+    BoundaryReason, CalibrationBoundaryRecord, FeedbackVerdict, SessionFeedbackRecord,
+    SessionLedgerRecord,
+};
+use bpmute::config::Sensitivity;
+use bpmute::storage::{SessionFullDetail, SessionListEntry, SessionStatus, WearableInfo};
+
+#[test]
+fn test_history_tab_master_detail_chart_and_boundary_dividers() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let s1 = SessionListEntry {
+        id: "sess-001".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:33".into(),
+        status: SessionStatus::Closed,
+        start_ts_ms: 1_700_100_000_000,
+        end_ts_ms: 1_700_102_700_000, // 45 min
+        end_reason: Some(SessionEndReason::HostSuspend),
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(72.0),
+        sleep_mu_hr: Some(58.0),
+        onset_confirmed_ts_ms: Some(1_700_100_900_000), // 15m in
+        sleeping_ts_ms: Some(1_700_101_800_000),        // 30m in
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 30,
+        raw_samples_count: 2700,
+        feedback: None,
+    };
+
+    let boundary = CalibrationBoundaryRecord {
+        id: "bnd-001".into(),
+        effective_ts_ms: 1_700_050_000_000,
+        reason: BoundaryReason::ManualRebaseline,
+        seed_sleep_hr: Some(55.0),
+        reset_floors: false,
+        created_at_ms: 1_700_050_000_000,
+        reverted_at_ms: None,
+    };
+
+    let s2 = SessionListEntry {
+        id: "sess-002".into(),
+        wearable_id: "w-2".into(),
+        wearable_alias: Some("GT 5".into()),
+        wearable_mac_masked: "..:44:55".into(),
+        status: SessionStatus::Closed,
+        start_ts_ms: 1_700_000_000_000,
+        end_ts_ms: 1_700_003_600_000, // 60 min
+        end_reason: Some(SessionEndReason::StreamEnded),
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: false,
+        warmup_mu_hr: Some(68.0),
+        sleep_mu_hr: Some(56.0),
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: true,
+        fp_count: 1,
+        epochs_count: 40,
+        raw_samples_count: 0,
+        feedback: Some(SessionFeedbackRecord {
+            id: "fb-002".into(),
+            session_id: "sess-002".into(),
+            verdict: Some(FeedbackVerdict::FalsePositive),
+            manual_onset_ts_ms: None,
+            manual_avg_sleep_hr: None,
+            notes: None,
+            updated_at_ms: 1_700_004_000_000,
+        }),
+    };
+
+    app.history_sessions = vec![s1.clone(), s2.clone()];
+    app.history_boundaries = vec![boundary.clone()];
+    app.selected_session_idx = 0;
+
+    // Populate detail for selected session (s1)
+    let epochs = (0..30)
+        .map(|i| {
+            let ts = s1.start_ts_ms + (i as i64) * 15_000;
+            let (hr, p_sleep) = if i < 10 {
+                (72.0 - (i as f64) * 0.5, 0.1)
+            } else if i < 20 {
+                (67.0 - ((i - 10) as f64) * 0.8, 0.6)
+            } else {
+                (58.0, 0.95)
+            };
+            Epoch {
+                session_index: 1,
+                ts_ms: ts,
+                features: EpochFeatures {
+                    hr_bpm_60s: hr,
+                    z_hr: -1.0,
+                    hr_slope_4m: -0.2,
+                    r_var_120s: 0.3,
+                    ln_rmssd_60s: Some(3.0),
+                    delta_ln_rmssd_60s: Some(-0.1),
+                    rmssd_sdnn_120s: Some(0.8),
+                },
+                hrv_valid: true,
+                rr_artifact_frac: 0.0,
+                coverage: 1.0,
+                flatline_stale: false,
+                accumulators_frozen: false,
+                baseline_mu_hr: 72.0,
+                baseline_sigma_hr: 3.0,
+                baseline_frozen: true,
+                p_active_wake: 0.05,
+                p_quiet_wake: 0.1,
+                p_sleep,
+                state: if i < 10 {
+                    DetectorState::Warmup
+                } else if i < 20 {
+                    DetectorState::Candidate
+                } else {
+                    DetectorState::Confirmed
+                },
+            }
+        })
+        .collect();
+
+    app.selected_session_detail = Some(SessionFullDetail {
+        session: SessionLedgerRecord {
+            id: s1.id.clone(),
+            wearable_id: s1.wearable_id.clone(),
+            start_ts_ms: s1.start_ts_ms,
+            end_ts_ms: s1.end_ts_ms,
+            end_reason: SessionEndReason::HostSuspend,
+            detection_sensitivity: Sensitivity::Balanced,
+            had_rr: true,
+            warmup_mu_hr: Some(72.0),
+            warmup_sigma_hr: Some(3.0),
+            warmup_ln_rmssd: Some(3.5),
+            onset_candidate_ts_ms: Some(s1.start_ts_ms + 10 * 15_000),
+            onset_confirmed_ts_ms: Some(s1.start_ts_ms + 12 * 15_000),
+            sleeping_ts_ms: Some(s1.start_ts_ms + 20 * 15_000),
+            sleep_mu_hr: Some(58.0),
+            onset_hr_bpm: Some(64.0),
+            delta_hr_onset: Some(8.0),
+            sleep_ln_rmssd: Some(3.8),
+            sleep_hr_var_ratio: Some(0.25),
+            typical_sqi: Some(0.95),
+            post_trigger_sleep_sec: 900,
+            trigger_power_action: PowerAction::Suspend,
+            rapid_resume_within_5m: false,
+            grace_cancel_count: 0,
+            rapid_wake_fp_count: 0,
+            snooze_count: 0,
+            auto_anomalous: false,
+            epochs_count: 30,
+            raw_samples_count: 2700,
+        },
+        status: SessionStatus::Closed,
+        wearable: WearableInfo {
+            id: "w-1".into(),
+            mac_masked: "..:22:33".into(),
+            alias: Some("Polar H10".into()),
+            advertised_name: None,
+            supports_rr: true,
+            supports_contact: true,
+            hr_var_floor: 0.25,
+            typical_sqi: Some(0.95),
+        },
+        feedback: Some(SessionFeedbackRecord {
+            id: "fb-001".into(),
+            session_id: s1.id.clone(),
+            verdict: None,
+            manual_onset_ts_ms: Some(s1.start_ts_ms + 14 * 15_000),
+            manual_avg_sleep_hr: Some(57.5),
+            notes: None,
+            updated_at_ms: s1.end_ts_ms + 60_000,
+        }),
+        epochs,
+        has_raw_samples: true,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out = buffer_to_string(terminal.backend().buffer());
+
+    // Master list verifications
+    assert!(out.contains("Polar H10"));
+    assert!(out.contains("45m") || out.contains("45 min"));
+    assert!(out.contains("Calibration Boundary") || out.contains("Boundary"));
+    assert!(out.contains("Rebaseline"));
+    assert!(out.contains("GT 5"));
+    assert!(out.contains("[FP]") || out.contains("False Positive"));
+    assert!(out.contains("[ANOMALOUS]") || out.contains("Anomalous"));
+
+    // Detail pane & chart verifications
+    assert!(out.contains("sess-001") || out.contains("sess-001"));
+    assert!(out.contains("Epoch Detail") || out.contains("HR + P(Sleep)"));
+    assert!(out.contains("QW:72") || out.contains("72"));
+    assert!(out.contains("Onset") || out.contains("[O]"));
+    assert!(out.contains("Trigger") || out.contains("[T]"));
+    assert!(out.contains("Manual") || out.contains("[M]"));
+
+    // Navigation down to second session
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    assert_eq!(app.selected_session_idx, 1);
+}
+
+#[test]
+fn test_history_session_modals_and_mutating_guards() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let active_session = SessionListEntry {
+        id: "sess-active".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:33".into(),
+        status: SessionStatus::Active,
+        start_ts_ms: 1_700_200_000_000,
+        end_ts_ms: 1_700_201_000_000,
+        end_reason: None,
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(70.0),
+        sleep_mu_hr: None,
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 10,
+        raw_samples_count: 1000,
+        feedback: None,
+    };
+
+    let closed_session = SessionListEntry {
+        id: "sess-closed".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:33".into(),
+        status: SessionStatus::Closed,
+        start_ts_ms: 1_700_100_000_000,
+        end_ts_ms: 1_700_103_600_000, // 1 hour
+        end_reason: Some(SessionEndReason::HostSuspend),
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(72.0),
+        sleep_mu_hr: Some(58.0),
+        onset_confirmed_ts_ms: Some(1_700_101_800_000),
+        sleeping_ts_ms: Some(1_700_102_400_000),
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 30,
+        raw_samples_count: 2700,
+        feedback: None,
+    };
+
+    app.history_sessions = vec![active_session, closed_session.clone()];
+    app.selected_session_idx = 0; // On active session!
+
+    // 1. Guardrail: All mutating actions (f, x, D) MUST be disabled on actively recording sessions
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('f')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('x')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('D')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 2. Select closed session (idx 1)
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    assert_eq!(app.selected_session_idx, 1);
+
+    // 3. Feedback modal (f)
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('f')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::FeedbackModal { .. }));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out = buffer_to_string(terminal.backend().buffer());
+    assert!(out.contains("Manual Feedback") || out.contains("Wearable-Report"));
+    assert!(out.contains("+2.5 bpm") || out.contains("nadir offset"));
+
+    // Cycle verdict: None -> False Positive
+    app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    // Move to HH:MM input
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert!(app.is_input_focused());
+
+    // Enter invalid HH:MM format
+    for c in "25:99".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    // Validation error prevents submit
+    if let ModalState::FeedbackModal {
+        ref error_message, ..
+    } = app.modal
+    {
+        assert!(error_message.is_some());
+    } else {
+        panic!("Expected FeedbackModal to stay open on validation failure");
+    }
+
+    // Clear and enter valid HH:MM
+    for _ in 0..5 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    // Calculate local HH:MM 30 mins after start
+    let local_valid = chrono::Local
+        .timestamp_millis_opt(closed_session.start_ts_ms + 1800 * 1000)
+        .single()
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    for c in local_valid.chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // Move to Avg Sleep HR field
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    for c in "58.5".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // Move to Submit button and press Enter
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    let submit_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        submit_cmd,
+        Some(TuiCommand::SessionSetFeedback {
+            ref session_id,
+            verdict: Some(FeedbackVerdict::FalsePositive),
+            ref onset_hhmm,
+            avg_sleep_hr: Some(58.5),
+            clear: false,
+        }) if session_id == "sess-closed" && onset_hhmm.as_deref() == Some(&local_valid)
+    ));
+    assert_eq!(app.modal, ModalState::None);
+
+    // 4. Export Trace modal (x)
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('x')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::ExportTraceModal { .. }));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_export = buffer_to_string(terminal.backend().buffer());
+    assert!(out_export.contains("Export Trace"));
+    assert!(out_export.contains("CSV") || out_export.contains("Format"));
+    assert!(out_export.contains("[x] Anonymize") || out_export.contains("Anonymize: ON"));
+
+    let export_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert!(matches!(
+        export_cmd,
+        Some(TuiCommand::SessionExportTrace {
+            ref id,
+            format: bpmute::replay::TraceFormat::Csv,
+            no_anonymize: false,
+            ..
+        }) if id == "sess-closed"
+    ));
+    assert_eq!(app.modal, ModalState::None);
+
+    // 5. Delete Session modal (D)
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('D')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::DeleteSessionModal { .. }));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_del = buffer_to_string(terminal.backend().buffer());
+    assert!(out_del.contains("Delete session") || out_del.contains("Delete Session"));
+
+    let del_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        del_cmd,
+        Some(TuiCommand::SessionDelete {
+            id: "sess-closed".into(),
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_settings_live_reconfig_editor_and_calibration_storage() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+
+    let mut cfg = bpmute::config::Config::default();
+    cfg.detection.sensitivity = Sensitivity::Balanced;
+    cfg.actions.pause_media = true;
+    cfg.actions.lock_screen = true;
+    cfg.actions.power_action = PowerAction::Suspend;
+    cfg.actions.grace_period_sec = Some(30);
+    cfg.actions.dry_run = false;
+    cfg.actions.custom_command = vec!["pkill".into(), "-STOP".into(), "game".into()];
+    cfg.actions.ignore_players = vec!["firefox".into(), "spotify".into()];
+    cfg.bluetooth.adapter = Some("hci0".into());
+    app.active_config = Some(cfg);
+
+    app.storage_stats = Some(bpmute::storage::StorageStats {
+        db_size_bytes: 145_408,
+        db_size_formatted: "142 KB".into(),
+        sessions_count: 12,
+        session_epochs_count: 1420,
+        raw_samples_count: 8500,
+        session_feedback_count: 4,
+        calibration_boundaries_count: 1,
+        wearables_count: 2,
+        raw_samples_retention: "14 days".into(),
+        session_epochs_retention: "indefinite".into(),
+        calibration_maturity: CalibrationMaturity::Calibrated,
+        active_calibration_boundary: Some(CalibrationBoundaryRecord {
+            id: "bnd-001".into(),
+            effective_ts_ms: 1_700_000_000_000,
+            reason: BoundaryReason::ManualRebaseline,
+            seed_sleep_hr: Some(56.0),
+            reset_floors: false,
+            created_at_ms: 1_700_000_000_000,
+            reverted_at_ms: None,
+        }),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out = buffer_to_string(terminal.backend().buffer());
+
+    // 1. Verify Core Preferences display
+    assert!(out.contains("Sensitivity: Balanced") || out.contains("Balanced"));
+    assert!(out.contains("Pause Media") || out.contains("Media: ON"));
+    assert!(out.contains("Lock Screen") || out.contains("Lock: ON"));
+    assert!(out.contains("Suspend") || out.contains("Action: Suspend"));
+    assert!(out.contains("30s") || out.contains("Grace: 30s"));
+    assert!(out.contains("Dry Run: OFF") || out.contains("Dry Run"));
+
+    // 2. Verify Advanced Settings read-only display + $EDITOR handoff hint
+    assert!(out.contains("pkill") || out.contains("custom_command"));
+    assert!(out.contains("firefox") || out.contains("ignore_players"));
+    assert!(out.contains("hci0") || out.contains("adapter"));
+    assert!(out.contains("[E] Editor") || out.contains("[E] Edit in $EDITOR"));
+
+    // 3. Verify Calibration & Storage statistics display
+    assert!(out.contains("142 KB"));
+    assert!(out.contains("12") && out.contains("sessions"));
+    assert!(out.contains("1420") || out.contains("epochs"));
+    assert!(out.contains("8500") || out.contains("raw"));
+    assert!(out.contains("Calibrated"));
+    assert!(out.contains("[U] Undo Boundary") || out.contains("[U] Undo"));
+
+    // 4. Test live toggle on core preference
+    let toggle_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char(' '))));
+    assert!(matches!(toggle_cmd, Some(TuiCommand::ConfigUpdate(_))));
+
+    // 5. Test [E] launches editor handoff
+    let editor_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('E'))));
+    assert_eq!(editor_cmd, Some(TuiCommand::EditorHandoff));
+
+    // 6. Test inline validation error display when config_error is present
+    app.config_error = Some("unknown field `bad_key` in config.toml".into());
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_err = buffer_to_string(terminal.backend().buffer());
+    assert!(out_err.contains("unknown field `bad_key`"));
+    assert!(out_err.contains("preserved") || out_err.contains("active config preserved"));
+    app.config_error = None;
+
+    // 7. Test Soft Re-baseline modal [B]
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('B')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+    // Type seed 54.0
+    for c in "54.0".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    // Tab to reset_floors checkbox and toggle with Space
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char(' '))));
+    // Tab to Submit and Enter
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    let rebase_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        rebase_cmd,
+        Some(TuiCommand::CalibrationSetBoundary {
+            effective_ts_ms: None,
+            seed_sleep_hr: Some(54.0),
+            reset_floors: true,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 8. Test Purge Raw Samples modal [P]
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('P')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::PurgeRawModal { .. }));
+    let purge_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(purge_cmd, Some(TuiCommand::DataPurgeRaw));
+    assert_eq!(app.modal, ModalState::None);
+
+    // 9. Test Hard Wipe modal requiring typed "WIPE" [W]
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('W')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::HardWipeModal { .. }));
+
+    // Typing wrong text "NOPE" -> Enter fails validation
+    for c in "NOPE".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    if let ModalState::HardWipeModal {
+        ref error_message, ..
+    } = app.modal
+    {
+        assert!(error_message.is_some());
+    } else {
+        panic!("HardWipeModal must stay open on invalid confirmation string");
+    }
+
+    // Clear and type "WIPE"
+    for _ in 0..4 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in "WIPE".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let wipe_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        wipe_cmd,
+        Some(TuiCommand::DataHardWipe {
+            confirm: "WIPE".into(),
+            wipe_all: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 10. Test Undo Boundary [U]
+    let undo_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('U'))));
+    assert_eq!(undo_cmd, Some(TuiCommand::CalibrationUndoBoundary));
+}
+
+#[test]
+fn test_offline_read_only_browsing_and_reconnect() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime_dir = temp.path().join("run");
+    let state_dir = temp.path().join("state");
+    let config_dir = temp.path().join("config");
+    let cache_dir = temp.path().join("cache");
+    let data_dir = temp.path().join("data");
+
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    let paths = bpmute::paths::ResolvedPaths {
+        config_file: config_dir.join("config.toml"),
+        data_dir: data_dir.clone(),
+        socket_path: temp.path().join("run/bpmute.sock"),
+    };
+
+    // 1. Write config.toml with responsive sensitivity and custom command
+    let toml_content = r#"
+schema_version = 1
+
+[detection]
+sensitivity = "responsive"
+
+[actions]
+pause_media = false
+lock_screen = true
+power_action = "none"
+grace_period_sec = 60
+custom_command = ["notify-send", "sleepy"]
+"#;
+    std::fs::write(&paths.config_file, toml_content).unwrap();
+
+    // 2. Populate SQLite ledger with 2 sessions, epochs, boundary, and storage stats
+    let (s1_id, _s2_id) = {
+        let db_file = bpmute::storage::db_path_in_data_dir(&paths.data_dir);
+        let db_lock = bpmute::storage::lock_path_in_data_dir(&paths.data_dir);
+        let mut store = bpmute::storage::LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+
+        let desc = bpmute::storage::WearableDescriptor {
+            mac: "AA:BB:CC:DD:EE:01".into(),
+            address_type: "public".into(),
+            alias: Some("OfflineBand".into()),
+            advertised_name: Some("OfflineBand".into()),
+            supports_rr: true,
+            supports_contact: true,
+        };
+        let wid = store.upsert_wearable(&desc, 1_700_000_000_000).unwrap();
+
+        // Insert a calibration boundary
+        store
+            .set_calibration_boundary(
+                Some(1_700_000_000_000),
+                Some(52.0),
+                false,
+                1_700_000_000_000,
+            )
+            .unwrap();
+
+        // Insert session 1 (closed)
+        let s1_id = store
+            .open_session(&bpmute::storage::OpenSessionRequest {
+                wearable_id: wid.clone(),
+                start_ts_ms: 1_700_000_100_000,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &bpmute::storage::CloseSessionRequest {
+                    session_id: s1_id.clone(),
+                    summary: SessionSummary {
+                        session_index: 1,
+                        start_ts_ms: 1_700_000_100_000,
+                        end_ts_ms: 1_700_000_500_000,
+                        end_reason: SessionEndReason::StreamEnded,
+                        candidate_ts_ms: None,
+                        confirmed_ts_ms: None,
+                        sleeping_ts_ms: None,
+                        anomalous: false,
+                        fp_count: 0,
+                        warmup_mu_hr: Some(64.0),
+                        warmup_sigma_hr: Some(2.5),
+                        warmup_ln_rmssd: None,
+                        onset_hr_bpm: Some(54.0),
+                        sleep_mu_hr: Some(54.0),
+                        sleep_ln_rmssd: None,
+                        observed_hr_var_ratio: None,
+                        typical_sqi: None,
+                        post_trigger_sleep_sec: 0,
+                        had_rr: false,
+                        grace_cancel_count: 0,
+                        rapid_wake_fp_count: 0,
+                        snooze_count: 0,
+                        epochs_count: 20,
+                    },
+                    trigger_power_action: bpmute::config::PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                1_700_000_500_000,
+            )
+            .unwrap();
+
+        // Insert session 2 (closed)
+        let s2_id = store
+            .open_session(&bpmute::storage::OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: 1_700_010_100_000,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &bpmute::storage::CloseSessionRequest {
+                    session_id: s2_id.clone(),
+                    summary: SessionSummary {
+                        session_index: 2,
+                        start_ts_ms: 1_700_010_100_000,
+                        end_ts_ms: 1_700_010_600_000,
+                        end_reason: SessionEndReason::StreamEnded,
+                        candidate_ts_ms: None,
+                        confirmed_ts_ms: None,
+                        sleeping_ts_ms: None,
+                        anomalous: false,
+                        fp_count: 0,
+                        warmup_mu_hr: Some(65.0),
+                        warmup_sigma_hr: Some(2.5),
+                        warmup_ln_rmssd: None,
+                        onset_hr_bpm: Some(55.0),
+                        sleep_mu_hr: Some(55.0),
+                        sleep_ln_rmssd: None,
+                        observed_hr_var_ratio: None,
+                        typical_sqi: None,
+                        post_trigger_sleep_sec: 0,
+                        had_rr: false,
+                        grace_cancel_count: 0,
+                        rapid_wake_fp_count: 0,
+                        snooze_count: 0,
+                        epochs_count: 25,
+                    },
+                    trigger_power_action: bpmute::config::PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                1_700_010_600_000,
+            )
+            .unwrap();
+        (s1_id, s2_id)
+    };
+
+    // 3. Initialize TUI app offline
+    let mut app = TuiApp::new(false, false, false);
+    assert!(!app.daemon_connected);
+    app.set_offline_paths(paths.clone());
+
+    let env = bpmute::paths::ProcessEnv;
+    app.load_offline_data(&env);
+
+    // Verify offline loaded state
+    assert_eq!(app.history_sessions.len(), 2);
+    assert_eq!(app.history_boundaries.len(), 1);
+    assert!(app.active_config.is_some());
+    assert!(app.storage_stats.is_some());
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // 4. Test History tab offline browsing
+    app.active_tab = Tab::History;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_hist = buffer_to_string(terminal.backend().buffer());
+    assert!(out_hist.contains("OfflineBand") || out_hist.contains("session-off-2"));
+    assert!(out_hist.contains("Boundary"));
+
+    // Navigate to session 1
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    assert_eq!(app.selected_session_idx, 1);
+    assert_eq!(
+        app.selected_session_detail
+            .as_ref()
+            .map(|d| d.session.id.as_str()),
+        Some(s1_id.as_str())
+    );
+
+    // Mutating keys on History tab are completely disabled while offline
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('f')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('x')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('D')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 5. Test Settings tab offline browsing
+    app.active_tab = Tab::Settings;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_settings = buffer_to_string(terminal.backend().buffer());
+    assert!(out_settings.contains("Responsive"));
+    assert!(out_settings.contains("mutations disabled: daemon offline"));
+    assert!(out_settings.contains("2 sessions"));
+
+    // Mutating keys on Settings tab are completely disabled while offline
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(' ')))),
+        None
+    );
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('B')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('P')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('W')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('U')))),
+        None
+    );
+
+    // 6. Test Live Reconnect
+    app.handle_event(TuiEvent::Ipc(Box::new(IpcEvent::Connected(DaemonStatus {
+        v: 1,
+        daemon_running: true,
+        version: "0.1.0".into(),
+        pid: 1,
+        uptime_sec: 10,
+        monitoring_state: MonitoringState::Idle,
+        armed: true,
+        paused: false,
+        paused_until: None,
+        pause_mode: None,
+        dry_run: false,
+        schedule: ScheduleConfig::default(),
+        config_path: String::new(),
+        config_loaded_from_file: false,
+        socket_path: String::new(),
+        log_biometrics: false,
+        alerts: Vec::new(),
+        idle_backend: Some("test-idle".into()),
+        playing_players_count: Some(0),
+    }))));
+    assert!(app.daemon_connected);
+
+    // After reconnect, mutating keys work immediately
+    let toggle_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char(' '))));
+    assert!(matches!(toggle_cmd, Some(TuiCommand::ConfigUpdate(_))));
+
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('B')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
 }

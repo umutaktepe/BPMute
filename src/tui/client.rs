@@ -11,12 +11,15 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use super::event::{IpcEvent, TuiCommand, TuiEvent};
 use crate::calibration::CalibrationState;
+use crate::config::Config;
 use crate::ipc::framing::{read_bounded_line, write_ndjson_line};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, EnrollmentUpdateEvent,
     EpochUpdateEvent, GraceTickEvent, HrSampleEvent, MAX_FRAME_BYTES, PROTOCOL_VERSION,
     PushEventEnvelope, RequestEnvelope, ResponseEnvelope,
 };
+use crate::replay::TraceFormat;
+use crate::storage::{SessionFullDetail, SessionListPage, StorageStats};
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<ResponseEnvelope>>>>;
 
@@ -131,6 +134,15 @@ impl TuiIpcBridge {
                     .await
                     .is_err()
                 || refresh_calibration(&req_tx, &pending, &self.next_id, &self.event_tx)
+                    .await
+                    .is_err()
+                || refresh_sessions(&req_tx, &pending, &self.next_id, &self.event_tx)
+                    .await
+                    .is_err()
+                || refresh_config(&req_tx, &pending, &self.next_id, &self.event_tx)
+                    .await
+                    .is_err()
+                || refresh_storage_stats(&req_tx, &pending, &self.next_id, &self.event_tx)
                     .await
                     .is_err()
             {
@@ -539,6 +551,303 @@ async fn execute_command(
         TuiCommand::RefreshStatus => {
             refresh_status_event(req_tx, pending, next_id, event_tx, false).await?;
         }
+        TuiCommand::RefreshSessions => {
+            refresh_sessions(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::SessionGet { id } => {
+            refresh_session_detail(req_tx, pending, next_id, &id, event_tx).await?;
+        }
+        TuiCommand::SessionSetFeedback {
+            session_id,
+            verdict,
+            onset_hhmm,
+            avg_sleep_hr,
+            clear,
+        } => {
+            let mut map = serde_json::Map::new();
+            map.insert("session_id".into(), json!(session_id));
+            if clear {
+                map.insert("clear".into(), json!(true));
+            } else {
+                if let Some(v) = verdict {
+                    map.insert("verdict".into(), json!(v));
+                }
+                if let Some(t) = onset_hhmm {
+                    map.insert("onset_hhmm".into(), json!(t));
+                }
+                if let Some(hr) = avg_sleep_hr {
+                    map.insert("avg_sleep_hr".into(), json!(hr));
+                }
+            }
+            send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "session.set_feedback",
+                Value::Object(map),
+                event_tx,
+            )
+            .await?;
+            refresh_sessions(req_tx, pending, next_id, event_tx).await?;
+            refresh_session_detail(req_tx, pending, next_id, &session_id, event_tx).await?;
+            refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::SessionExportTrace {
+            id,
+            path,
+            format,
+            no_anonymize,
+        } => {
+            let format_str = match format {
+                TraceFormat::Csv => "csv",
+                TraceFormat::Jsonl => "jsonl",
+                TraceFormat::SqliteLedger => "sqlite",
+            };
+            let params = json!({
+                "id": id,
+                "session_id": id,
+                "path": path,
+                "destination_path": path,
+                "format": format_str,
+                "no_anonymize": no_anonymize,
+            });
+            send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "session.export_trace",
+                params,
+                event_tx,
+            )
+            .await?;
+        }
+        TuiCommand::SessionDelete { id } => {
+            let params = json!({ "id": id, "session_id": id });
+            send_op_request(req_tx, pending, next_id, "session.delete", params, event_tx).await?;
+            refresh_sessions(req_tx, pending, next_id, event_tx).await?;
+            refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::ConfigGet => {
+            refresh_config(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::ConfigUpdate(patch) => {
+            let val = serde_json::to_value(patch).unwrap_or_else(|_| json!({}));
+            send_op_request(req_tx, pending, next_id, "config.update", val, event_tx).await?;
+            refresh_config(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::ConfigReload => {
+            let resp = send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "config.reload",
+                json!({}),
+                event_tx,
+            )
+            .await?;
+            if resp.ok {
+                refresh_config(req_tx, pending, next_id, event_tx).await?;
+            } else if let Some(err) = resp.error {
+                let _ = event_tx
+                    .send(TuiEvent::ipc(IpcEvent::ConfigError(err.message)))
+                    .await;
+            }
+        }
+        TuiCommand::CalibrationSetSeed(seed) => {
+            let params = json!({ "sleep_hr": seed });
+            send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "calibration.set_seed",
+                params,
+                event_tx,
+            )
+            .await?;
+            refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::CalibrationSetBoundary {
+            effective_ts_ms,
+            seed_sleep_hr,
+            reset_floors,
+        } => {
+            let mut map = serde_json::Map::new();
+            map.insert("reason".into(), json!("manual_rebaseline"));
+            map.insert("reset_floors".into(), json!(reset_floors));
+            if let Some(eff) = effective_ts_ms {
+                map.insert("effective_ts_ms".into(), json!(eff));
+            }
+            if let Some(seed) = seed_sleep_hr {
+                map.insert("seed_sleep_hr".into(), json!(seed));
+                map.insert("seed_avg_sleep_hr".into(), json!(seed));
+            }
+            send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "calibration.set_boundary",
+                Value::Object(map),
+                event_tx,
+            )
+            .await?;
+            refresh_sessions(req_tx, pending, next_id, event_tx).await?;
+            refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::CalibrationUndoBoundary => {
+            send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "calibration.undo_boundary",
+                json!({}),
+                event_tx,
+            )
+            .await?;
+            refresh_sessions(req_tx, pending, next_id, event_tx).await?;
+            refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::DataStats => {
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::DataPurgeRaw => {
+            send_op_request(
+                req_tx,
+                pending,
+                next_id,
+                "data.purge_raw",
+                json!({}),
+                event_tx,
+            )
+            .await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::DataHardWipe { confirm, wipe_all } => {
+            let params = json!({ "confirm": confirm, "wipe_all": wipe_all });
+            send_op_request(req_tx, pending, next_id, "data.hard_wipe", params, event_tx).await?;
+            refresh_sessions(req_tx, pending, next_id, event_tx).await?;
+            refresh_wearables(req_tx, pending, next_id, event_tx).await?;
+            refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+            refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+        }
+        TuiCommand::EditorHandoff => {}
+    }
+    Ok(())
+}
+
+async fn refresh_sessions(
+    req_tx: &mpsc::Sender<RequestEnvelope>,
+    pending: &PendingMap,
+    next_id: &AtomicU64,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), std::io::Error> {
+    let resp = send_request(
+        req_tx,
+        pending,
+        next_id,
+        "session.list",
+        json!({ "limit": 100, "offset": 0 }),
+    )
+    .await?;
+
+    let sessions = if let Some(data) = resp.data
+        && let Ok(page) = serde_json::from_value::<SessionListPage>(data)
+    {
+        page.sessions
+    } else {
+        Vec::new()
+    };
+
+    // Also fetch calibration boundaries from calibration.list_boundaries
+    let bnd_resp = send_request(
+        req_tx,
+        pending,
+        next_id,
+        "calibration.list_boundaries",
+        json!({}),
+    )
+    .await?;
+    let boundaries = if let Some(data) = bnd_resp.data
+        && let Ok(list) =
+            serde_json::from_value::<Vec<crate::calibration::CalibrationBoundaryRecord>>(data)
+    {
+        list
+    } else {
+        Vec::new()
+    };
+
+    let first_id = sessions.first().map(|s| s.id.clone());
+
+    let _ = event_tx
+        .send(TuiEvent::ipc(IpcEvent::SessionsUpdated {
+            sessions,
+            boundaries,
+        }))
+        .await;
+
+    // Automatically load detail for the first session if available
+    if let Some(id) = first_id {
+        let _ = refresh_session_detail(req_tx, pending, next_id, &id, event_tx).await;
+    }
+
+    Ok(())
+}
+
+async fn refresh_session_detail(
+    req_tx: &mpsc::Sender<RequestEnvelope>,
+    pending: &PendingMap,
+    next_id: &AtomicU64,
+    id: &str,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), std::io::Error> {
+    let resp = send_request(req_tx, pending, next_id, "session.get", json!({ "id": id })).await?;
+
+    if let Some(data) = resp.data
+        && let Ok(detail) = serde_json::from_value::<SessionFullDetail>(data)
+    {
+        let _ = event_tx
+            .send(TuiEvent::ipc(IpcEvent::SessionDetailLoaded(Box::new(
+                detail,
+            ))))
+            .await;
+    }
+    Ok(())
+}
+
+async fn refresh_config(
+    req_tx: &mpsc::Sender<RequestEnvelope>,
+    pending: &PendingMap,
+    next_id: &AtomicU64,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), std::io::Error> {
+    let resp = send_request(req_tx, pending, next_id, "config.get", json!({})).await?;
+    if let Some(data) = resp.data
+        && let Ok(cfg) = serde_json::from_value::<Config>(data)
+    {
+        let _ = event_tx
+            .send(TuiEvent::ipc(IpcEvent::ConfigLoaded(cfg)))
+            .await;
+    }
+    Ok(())
+}
+
+async fn refresh_storage_stats(
+    req_tx: &mpsc::Sender<RequestEnvelope>,
+    pending: &PendingMap,
+    next_id: &AtomicU64,
+    event_tx: &mpsc::Sender<TuiEvent>,
+) -> Result<(), std::io::Error> {
+    let resp = send_request(req_tx, pending, next_id, "data.stats", json!({})).await?;
+    if let Some(data) = resp.data
+        && let Ok(stats) = serde_json::from_value::<StorageStats>(data)
+    {
+        let _ = event_tx
+            .send(TuiEvent::ipc(IpcEvent::StorageStatsLoaded(stats)))
+            .await;
     }
     Ok(())
 }

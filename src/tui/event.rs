@@ -1,11 +1,14 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
-use crate::calibration::CalibrationState;
+use crate::calibration::{CalibrationBoundaryRecord, CalibrationState, FeedbackVerdict};
+use crate::config::{Config, ConfigPatch};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
     PauseParams,
 };
+use crate::replay::TraceFormat;
+use crate::storage::{SessionFullDetail, SessionListEntry, StorageStats};
 
 /// Tick cadence of the interactive TUI event loop in milliseconds.
 pub const TUI_TICK_MS: u32 = 250;
@@ -45,6 +48,14 @@ pub enum IpcEvent {
     WearablesUpdated(Vec<EnrolledWearableStatus>),
     EnrollmentDiscovered(Vec<DiscoveredWearable>),
     EnrollmentUpdate(EnrollmentUpdateEvent),
+    SessionsUpdated {
+        sessions: Vec<SessionListEntry>,
+        boundaries: Vec<CalibrationBoundaryRecord>,
+    },
+    SessionDetailLoaded(Box<SessionFullDetail>),
+    ConfigLoaded(Config),
+    ConfigError(String),
+    StorageStatsLoaded(StorageStats),
     OpCompleted {
         op: String,
         success: bool,
@@ -84,4 +95,41 @@ pub enum TuiCommand {
         id: String,
     },
     RefreshStatus,
+    RefreshSessions,
+    SessionGet {
+        id: String,
+    },
+    SessionSetFeedback {
+        session_id: String,
+        verdict: Option<FeedbackVerdict>,
+        onset_hhmm: Option<String>,
+        avg_sleep_hr: Option<f64>,
+        clear: bool,
+    },
+    SessionExportTrace {
+        id: String,
+        path: String,
+        format: TraceFormat,
+        no_anonymize: bool,
+    },
+    SessionDelete {
+        id: String,
+    },
+    ConfigGet,
+    ConfigUpdate(ConfigPatch),
+    ConfigReload,
+    CalibrationSetSeed(Option<f64>),
+    CalibrationSetBoundary {
+        effective_ts_ms: Option<i64>,
+        seed_sleep_hr: Option<f64>,
+        reset_floors: bool,
+    },
+    CalibrationUndoBoundary,
+    DataStats,
+    DataPurgeRaw,
+    DataHardWipe {
+        confirm: String,
+        wipe_all: bool,
+    },
+    EditorHandoff,
 }

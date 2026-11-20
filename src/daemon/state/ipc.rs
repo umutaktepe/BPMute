@@ -266,6 +266,14 @@ impl DaemonCore {
                 self.apply_calibration_update(cal_state.clone());
                 Ok(json!({ "boundary": boundary, "calibration": cal_state }))
             }
+            "calibration.list_boundaries" => {
+                let boundaries = self
+                    .persistence
+                    .list_calibration_boundaries()
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                serialize_json(boundaries)
+            }
             "data.stats" => {
                 let stats = self
                     .persistence

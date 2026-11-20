@@ -14,12 +14,14 @@ use super::views::help::render_help;
 use super::views::history::render_history;
 use super::views::settings::render_settings;
 use super::views::wearables::render_wearables;
-use crate::config::PowerAction;
+use crate::calibration::CalibrationBoundaryRecord;
+use crate::config::{Config, PowerAction};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, MonitoringState,
     PairingPrompt, alert_ids,
 };
 use crate::sleep_engine::{CalibrationMaturity, Epoch, StreamStatus};
+use crate::storage::{SessionFullDetail, SessionListEntry, StorageStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -71,6 +73,32 @@ pub enum UnenrollButton {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackModalField {
+    Verdict,
+    Onset,
+    SleepHr,
+    Submit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportModalField {
+    Format,
+    Path,
+    Anonymize,
+    Submit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftRebaselineField {
+    SeedSleepHr,
+    ResetFloors,
+    Submit,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModalState {
     None,
@@ -97,6 +125,42 @@ pub enum ModalState {
         forget_bluez: bool,
         delete_sessions: bool,
         selected_button: UnenrollButton,
+    },
+    FeedbackModal {
+        session_id: String,
+        session_start_ts_ms: i64,
+        session_end_ts_ms: i64,
+        epochs_pruned: bool,
+        verdict_idx: usize,
+        onset_hhmm_input: String,
+        avg_sleep_hr_input: String,
+        active_field: FeedbackModalField,
+        error_message: Option<String>,
+    },
+    ExportTraceModal {
+        session_id: String,
+        format_idx: usize,
+        destination_path: String,
+        anonymize: bool,
+        active_field: ExportModalField,
+        error_message: Option<String>,
+    },
+    DeleteSessionModal {
+        session_id: String,
+        confirmed: bool,
+    },
+    SoftRebaselineModal {
+        seed_sleep_hr_input: String,
+        reset_floors: bool,
+        active_field: SoftRebaselineField,
+        error_message: Option<String>,
+    },
+    PurgeRawModal {
+        confirmed: bool,
+    },
+    HardWipeModal {
+        typed_input: String,
+        error_message: Option<String>,
     },
 }
 
@@ -137,6 +201,21 @@ pub struct TuiApp {
     pub selected_wearable_idx: usize,
     pub discovered_wearables: Vec<DiscoveredWearable>,
 
+    // History
+    pub history_sessions: Vec<SessionListEntry>,
+    pub history_boundaries: Vec<CalibrationBoundaryRecord>,
+    pub selected_session_idx: usize,
+    pub selected_session_detail: Option<SessionFullDetail>,
+
+    // Settings
+    pub active_config: Option<Config>,
+    pub selected_setting_idx: usize,
+    pub config_error: Option<String>,
+    pub storage_stats: Option<StorageStats>,
+
+    // Offline data browsing paths
+    pub offline_paths: Option<crate::paths::ResolvedPaths>,
+
     // systemd --user service detection
     pub systemd_service_installed: bool,
 }
@@ -173,7 +252,84 @@ impl TuiApp {
             enrolled_wearables: Vec::new(),
             selected_wearable_idx: 0,
             discovered_wearables: Vec::new(),
+            history_sessions: Vec::new(),
+            history_boundaries: Vec::new(),
+            selected_session_idx: 0,
+            selected_session_detail: None,
+            active_config: None,
+            selected_setting_idx: 0,
+            config_error: None,
+            storage_stats: None,
+            offline_paths: None,
             systemd_service_installed,
+        }
+    }
+
+    pub fn set_offline_paths(&mut self, paths: crate::paths::ResolvedPaths) {
+        self.offline_paths = Some(paths);
+    }
+
+    pub fn load_offline_data(&mut self, env: &dyn crate::paths::EnvSource) {
+        let Some(ref paths) = self.offline_paths else {
+            return;
+        };
+        // Load config
+        match crate::config::LoadedConfig::load(
+            &paths.config_file,
+            env,
+            &crate::config::CliOverrides::default(),
+        ) {
+            Ok(loaded) => {
+                self.active_config = Some(loaded.config);
+                self.config_error = None;
+            }
+            Err(crate::config::ConfigError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                self.active_config = Some(crate::config::Config::default());
+                self.config_error = None;
+            }
+            Err(e) => {
+                self.config_error = Some(e.to_string());
+                if self.active_config.is_none() {
+                    self.active_config = Some(crate::config::Config::default());
+                }
+            }
+        }
+
+        // Load storage
+        let db_path = crate::storage::db_path_in_data_dir(&paths.data_dir);
+        if let Ok(Some(store)) = crate::storage::LedgerStore::open_read_only(&db_path) {
+            if let Ok(page) = store.list_sessions(50, 0) {
+                self.history_sessions = page.sessions;
+                if self.selected_session_idx >= self.history_sessions.len() {
+                    self.selected_session_idx = 0;
+                }
+                if let Some(s) = self.history_sessions.get(self.selected_session_idx)
+                    && let Ok(detail) = store.get_session(&s.id)
+                {
+                    self.selected_session_detail = Some(detail);
+                }
+            }
+            if let Ok(boundaries) = store.list_calibration_boundaries() {
+                self.history_boundaries = boundaries;
+            }
+            if let Ok(stats) = store.get_storage_stats() {
+                self.calibration_maturity = stats.calibration_maturity;
+                self.storage_stats = Some(stats);
+            }
+        }
+    }
+
+    pub fn load_session_detail_offline(&mut self, session_id: &str) {
+        let Some(ref paths) = self.offline_paths else {
+            return;
+        };
+        let db_path = crate::storage::db_path_in_data_dir(&paths.data_dir);
+        if let Ok(Some(store)) = crate::storage::LedgerStore::open_read_only(&db_path)
+            && let Ok(detail) = store.get_session(session_id)
+        {
+            self.selected_session_detail = Some(detail);
         }
     }
 
@@ -193,6 +349,19 @@ impl TuiApp {
                 Some(PairingPromptModalState::Passkey { .. })
                     | Some(PairingPromptModalState::PinCode { .. })
             ),
+            ModalState::FeedbackModal {
+                active_field: FeedbackModalField::Onset | FeedbackModalField::SleepHr,
+                ..
+            } => true,
+            ModalState::ExportTraceModal {
+                active_field: ExportModalField::Path,
+                ..
+            } => true,
+            ModalState::SoftRebaselineModal {
+                active_field: SoftRebaselineField::SeedSleepHr,
+                ..
+            } => true,
+            ModalState::HardWipeModal { .. } => true,
             _ => false,
         }
     }
@@ -417,6 +586,30 @@ impl TuiApp {
                         *pairing_prompt = Some(prompt_modal);
                     }
                 }
+            }
+            IpcEvent::SessionsUpdated {
+                sessions,
+                boundaries,
+            } => {
+                self.history_sessions = sessions;
+                self.history_boundaries = boundaries;
+                if self.selected_session_idx >= self.history_sessions.len() {
+                    self.selected_session_idx = self.history_sessions.len().saturating_sub(1);
+                }
+            }
+            IpcEvent::SessionDetailLoaded(detail) => {
+                self.selected_session_detail = Some(*detail);
+            }
+            IpcEvent::ConfigLoaded(cfg) => {
+                self.active_config = Some(cfg);
+                self.config_error = None;
+            }
+            IpcEvent::ConfigError(err) => {
+                self.config_error = Some(err);
+            }
+            IpcEvent::StorageStatsLoaded(stats) => {
+                self.calibration_maturity = stats.calibration_maturity;
+                self.storage_stats = Some(stats);
             }
             IpcEvent::OpCompleted {
                 op,

@@ -74,6 +74,71 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             spans.push(Span::styled("[Esc]", key_style));
             spans.push(Span::styled(" Cancel  ", text_style));
         }
+        ModalState::FeedbackModal { .. } => {
+            let cycle_hint = if app.theme.ascii {
+                "[<-/->/Space]"
+            } else {
+                "[←/→/Space]"
+            };
+            spans.push(Span::styled("[Tab]", key_style));
+            spans.push(Span::styled(" Field  ", text_style));
+            spans.push(Span::styled(cycle_hint, key_style));
+            spans.push(Span::styled(" Option  ", text_style));
+            spans.push(Span::styled("[Enter]", key_style));
+            spans.push(Span::styled(" Submit  ", text_style));
+            spans.push(Span::styled("[Esc]", key_style));
+            spans.push(Span::styled(" Cancel  ", text_style));
+        }
+        ModalState::ExportTraceModal { .. } => {
+            let cycle_hint = if app.theme.ascii {
+                "[<-/->/Space]"
+            } else {
+                "[←/→/Space]"
+            };
+            spans.push(Span::styled("[Tab]", key_style));
+            spans.push(Span::styled(" Field  ", text_style));
+            spans.push(Span::styled(cycle_hint, key_style));
+            spans.push(Span::styled(" Toggle  ", text_style));
+            spans.push(Span::styled("[Enter]", key_style));
+            spans.push(Span::styled(" Export  ", text_style));
+            spans.push(Span::styled("[Esc]", key_style));
+            spans.push(Span::styled(" Cancel  ", text_style));
+        }
+        ModalState::DeleteSessionModal { .. } => {
+            let btn_hint = if app.theme.ascii {
+                "[Tab/<-/->]"
+            } else {
+                "[Tab/←/→]"
+            };
+            spans.push(Span::styled(btn_hint, key_style));
+            spans.push(Span::styled(" Button  ", text_style));
+            spans.push(Span::styled("[Enter]", key_style));
+            spans.push(Span::styled(" Confirm Delete  ", text_style));
+            spans.push(Span::styled("[Esc]", key_style));
+            spans.push(Span::styled(" Cancel  ", text_style));
+        }
+        ModalState::SoftRebaselineModal { .. } => {
+            spans.push(Span::styled("[Tab]", key_style));
+            spans.push(Span::styled(" Field  ", text_style));
+            spans.push(Span::styled("[Space]", key_style));
+            spans.push(Span::styled(" Toggle  ", text_style));
+            spans.push(Span::styled("[Enter]", key_style));
+            spans.push(Span::styled(" Submit  ", text_style));
+            spans.push(Span::styled("[Esc]", key_style));
+            spans.push(Span::styled(" Cancel  ", text_style));
+        }
+        ModalState::PurgeRawModal { .. } => {
+            spans.push(Span::styled("[Enter]", key_style));
+            spans.push(Span::styled(" Confirm Purge  ", text_style));
+            spans.push(Span::styled("[Esc]", key_style));
+            spans.push(Span::styled(" Cancel  ", text_style));
+        }
+        ModalState::HardWipeModal { .. } => {
+            spans.push(Span::styled("[Enter]", key_style));
+            spans.push(Span::styled(" Confirm Wipe  ", text_style));
+            spans.push(Span::styled("[Esc]", key_style));
+            spans.push(Span::styled(" Cancel  ", text_style));
+        }
         ModalState::None => {
             spans.push(Span::styled("[1-4]", key_style));
             spans.push(Span::styled(" Tabs  ", text_style));
@@ -107,9 +172,38 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     spans.push(Span::styled("[u]", live_key_style));
                     spans.push(Span::styled(" Unenroll  ", live_text_style));
                 }
-                Tab::History | Tab::Settings => {
+                Tab::History => {
+                    spans.push(Span::styled("[f]", live_key_style));
+                    spans.push(Span::styled(" Feedback  ", live_text_style));
+                    spans.push(Span::styled("[x]", live_key_style));
+                    spans.push(Span::styled(" Export  ", live_text_style));
+                    spans.push(Span::styled("[D]", live_key_style));
+                    spans.push(Span::styled(" Delete  ", live_text_style));
                     spans.push(Span::styled("[j/k]", key_style));
                     spans.push(Span::styled(" Navigate  ", text_style));
+                }
+                Tab::Settings => {
+                    spans.push(Span::styled("[j/k]", key_style));
+                    spans.push(Span::styled(" Navigate  ", text_style));
+                    spans.push(Span::styled("[Space]", live_key_style));
+                    spans.push(Span::styled(" Toggle  ", live_text_style));
+                    spans.push(Span::styled("[E]", key_style));
+                    spans.push(Span::styled(" Editor  ", text_style));
+                    spans.push(Span::styled("[B]", live_key_style));
+                    spans.push(Span::styled(" Rebase  ", live_text_style));
+                    spans.push(Span::styled("[P]", live_key_style));
+                    spans.push(Span::styled(" Purge  ", live_text_style));
+                    spans.push(Span::styled("[W]", live_key_style));
+                    spans.push(Span::styled(" Wipe  ", live_text_style));
+                    if app
+                        .storage_stats
+                        .as_ref()
+                        .and_then(|s| s.active_calibration_boundary.as_ref())
+                        .is_some()
+                    {
+                        spans.push(Span::styled("[U]", live_key_style));
+                        spans.push(Span::styled(" Undo Boundary  ", live_text_style));
+                    }
                 }
             }
 
