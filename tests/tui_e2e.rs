@@ -4779,3 +4779,702 @@ fn test_mouse_rename_and_unenroll_modals_and_backdrop() {
     );
     assert_eq!(app.modal, ModalState::None);
 }
+
+fn make_history_session(
+    id: &str,
+    alias: &str,
+    start_ts_ms: i64,
+    end_ts_ms: i64,
+    status: SessionStatus,
+    epochs_count: u32,
+) -> SessionListEntry {
+    SessionListEntry {
+        id: id.into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some(alias.into()),
+        wearable_mac_masked: "..:22:33".into(),
+        status,
+        start_ts_ms,
+        end_ts_ms,
+        end_reason: (status == SessionStatus::Closed).then_some(SessionEndReason::StreamEnded),
+        detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(70.0),
+        sleep_mu_hr: (status == SessionStatus::Closed).then_some(56.0),
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count,
+        raw_samples_count: 0,
+        feedback: None,
+    }
+}
+
+#[test]
+fn test_mouse_history_master_list_click_online_offline_and_boundary_guard() {
+    // 1. Online mode: clicking Calibration Boundary is ignored; clicking Monitoring Session line 1/2 selects and emits SessionGet
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let s0 = make_history_session(
+        "sess-newest",
+        "Polar H10",
+        1_700_200_000_000,
+        1_700_203_600_000,
+        SessionStatus::Closed,
+        24,
+    );
+    let s1 = make_history_session(
+        "sess-older",
+        "Garmin Strap",
+        1_700_100_000_000,
+        1_700_103_600_000,
+        SessionStatus::Closed,
+        20,
+    );
+    let boundary = CalibrationBoundaryRecord {
+        id: "bnd-1".into(),
+        effective_ts_ms: 1_700_150_000_000,
+        reason: BoundaryReason::ManualRebaseline,
+        seed_sleep_hr: Some(55.0),
+        reset_floors: false,
+        created_at_ms: 1_700_150_000_000,
+        reverted_at_ms: None,
+    };
+    app.history_sessions = vec![s0, s1];
+    app.history_boundaries = vec![boundary];
+    app.selected_session_idx = 0;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // Clicking Calibration Boundary divider row does nothing
+    let (bnd_col, bnd_row) =
+        find_text_coords(terminal.backend().buffer(), "Boundary: Rebaseline").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(bnd_col, bnd_row)), None);
+    assert_eq!(app.selected_session_idx, 0);
+
+    // Clicking Monitoring Session 1 (line 2: wearable label) selects idx 1 and emits SessionGet
+    let (s1_col, s1_row) = find_text_coords(terminal.backend().buffer(), "Garmin Strap").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(s1_col, s1_row)),
+        Some(TuiCommand::SessionGet {
+            id: "sess-older".into(),
+        })
+    );
+    assert_eq!(app.selected_session_idx, 1);
+
+    // Clicking Monitoring Session 0 line 1 (above "Polar H10") selects idx 0 and emits SessionGet
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (s0_col, s0_row) = find_text_coords(terminal.backend().buffer(), "Polar H10").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(s0_col, s0_row - 1)),
+        Some(TuiCommand::SessionGet {
+            id: "sess-newest".into(),
+        })
+    );
+    assert_eq!(app.selected_session_idx, 0);
+
+    // 2. Offline mode: clicking session row loads detail from local SQLite storage without SessionGet
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    fs::create_dir_all(&paths.data_dir).unwrap();
+    let (off_s1_id, off_s2_id) = {
+        let db_file = bpmute::storage::db_path_in_data_dir(&paths.data_dir);
+        let db_lock = bpmute::storage::lock_path_in_data_dir(&paths.data_dir);
+        let mut store = bpmute::storage::LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &bpmute::storage::WearableDescriptor {
+                    mac: "AA:BB:CC:DD:EE:01".into(),
+                    address_type: "public".into(),
+                    alias: Some("OfflineBand".into()),
+                    advertised_name: None,
+                    supports_rr: true,
+                    supports_contact: true,
+                },
+                1_700_000_000_000,
+            )
+            .unwrap();
+        let s1_id = store
+            .open_session(&bpmute::storage::OpenSessionRequest {
+                wearable_id: wid.clone(),
+                start_ts_ms: 1_700_000_100_000,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &bpmute::storage::CloseSessionRequest {
+                    session_id: s1_id.clone(),
+                    summary: SessionSummary {
+                        session_index: 1,
+                        start_ts_ms: 1_700_000_100_000,
+                        end_ts_ms: 1_700_000_500_000,
+                        end_reason: SessionEndReason::StreamEnded,
+                        candidate_ts_ms: None,
+                        confirmed_ts_ms: None,
+                        sleeping_ts_ms: None,
+                        anomalous: false,
+                        fp_count: 0,
+                        warmup_mu_hr: Some(64.0),
+                        warmup_sigma_hr: Some(2.5),
+                        warmup_ln_rmssd: None,
+                        onset_hr_bpm: Some(54.0),
+                        sleep_mu_hr: Some(54.0),
+                        sleep_ln_rmssd: None,
+                        observed_hr_var_ratio: None,
+                        typical_sqi: None,
+                        post_trigger_sleep_sec: 0,
+                        had_rr: false,
+                        grace_cancel_count: 0,
+                        rapid_wake_fp_count: 0,
+                        snooze_count: 0,
+                        epochs_count: 10,
+                    },
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                1_700_000_500_000,
+            )
+            .unwrap();
+
+        let s2_id = store
+            .open_session(&bpmute::storage::OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: 1_700_010_100_000,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &bpmute::storage::CloseSessionRequest {
+                    session_id: s2_id.clone(),
+                    summary: SessionSummary {
+                        session_index: 2,
+                        start_ts_ms: 1_700_010_100_000,
+                        end_ts_ms: 1_700_010_600_000,
+                        end_reason: SessionEndReason::StreamEnded,
+                        candidate_ts_ms: None,
+                        confirmed_ts_ms: None,
+                        sleeping_ts_ms: None,
+                        anomalous: false,
+                        fp_count: 0,
+                        warmup_mu_hr: Some(65.0),
+                        warmup_sigma_hr: Some(2.5),
+                        warmup_ln_rmssd: None,
+                        onset_hr_bpm: Some(55.0),
+                        sleep_mu_hr: Some(55.0),
+                        sleep_ln_rmssd: None,
+                        observed_hr_var_ratio: None,
+                        typical_sqi: None,
+                        post_trigger_sleep_sec: 0,
+                        had_rr: false,
+                        grace_cancel_count: 0,
+                        rapid_wake_fp_count: 0,
+                        snooze_count: 0,
+                        epochs_count: 12,
+                    },
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                1_700_010_600_000,
+            )
+            .unwrap();
+        (s1_id, s2_id)
+    };
+
+    let mut offline_app = TuiApp::new(false, false, false);
+    offline_app.set_offline_paths(paths);
+    offline_app.load_offline_data(&env);
+    offline_app.active_tab = Tab::History;
+    assert_eq!(offline_app.selected_session_idx, 0);
+    assert_eq!(
+        offline_app
+            .selected_session_detail
+            .as_ref()
+            .map(|d| d.session.id.as_str()),
+        Some(off_s2_id.as_str())
+    );
+
+    terminal
+        .draw(|f| offline_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    // OfflineBand appears twice (newest idx 0 on top, older idx 1 below it); click the second row
+    let buf = terminal.backend().buffer();
+    let mut band_rows = Vec::new();
+    for row in 0..buf.area.height {
+        if let Some((col, r)) = find_text_coords_in_row(buf, row, "OfflineBand")
+            && col < 34
+        {
+            band_rows.push((col, r));
+        }
+    }
+    assert_eq!(band_rows.len(), 2);
+    let (click_col, click_row) = band_rows[1];
+    assert_eq!(
+        offline_app.handle_event(mouse_left_click(click_col, click_row)),
+        None
+    );
+    assert_eq!(offline_app.selected_session_idx, 1);
+    assert_eq!(
+        offline_app
+            .selected_session_detail
+            .as_ref()
+            .map(|d| d.session.id.as_str()),
+        Some(off_s1_id.as_str())
+    );
+}
+
+#[test]
+fn test_mouse_history_wheel_scoping_and_overflow_scroll() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    app.history_sessions = (0..14)
+        .map(|i| {
+            make_history_session(
+                &format!("s-{i:02}"),
+                &format!("Band-{i:02}"),
+                1_700_300_000_000 - (i as i64) * 100_000,
+                1_700_303_600_000 - (i as i64) * 100_000,
+                SessionStatus::Closed,
+                20,
+            )
+        })
+        .collect();
+    app.selected_session_idx = 0;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let initial_buf = buffer_to_string(terminal.backend().buffer());
+    assert!(initial_buf.contains("Band-00"));
+    assert!(!initial_buf.contains("Band-13"));
+
+    // 1. Wheel over right Epoch Detail & Chart pane does nothing (no scroll, no SessionGet)
+    let (detail_col, detail_row) =
+        find_text_coords(terminal.backend().buffer(), "Epoch Detail & Chart").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_scroll_down(detail_col + 2, detail_row + 4)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_scroll_up(detail_col + 2, detail_row + 4)),
+        None
+    );
+    assert_eq!(app.selected_session_idx, 0);
+
+    // 2. Wheel ScrollUp at top bound (idx 0) over left master list is a no-op
+    let (list_col, list_row) =
+        find_text_coords(terminal.backend().buffer(), "Monitoring Sessions").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_scroll_up(list_col + 1, list_row + 2)),
+        None
+    );
+    assert_eq!(app.selected_session_idx, 0);
+
+    // 3. Wheel ScrollDown over left master list navigates and scrolls Band-13 into view
+    for expected in 1..14 {
+        assert_eq!(
+            app.handle_event(mouse_scroll_down(list_col + 1, list_row + 2)),
+            Some(TuiCommand::SessionGet {
+                id: format!("s-{expected:02}"),
+            })
+        );
+        assert_eq!(app.selected_session_idx, expected);
+    }
+    // Scrolling past end is a no-op
+    assert_eq!(
+        app.handle_event(mouse_scroll_down(list_col + 1, list_row + 2)),
+        None
+    );
+    assert_eq!(app.selected_session_idx, 13);
+
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let scrolled_buf = buffer_to_string(terminal.backend().buffer());
+    assert!(scrolled_buf.contains("Band-13"));
+    assert!(!scrolled_buf.contains("Band-00"));
+
+    // 4. Wheel ScrollUp scrolls back up to Band-00
+    for expected in (0..13).rev() {
+        assert_eq!(
+            app.handle_event(mouse_scroll_up(list_col + 1, list_row + 2)),
+            Some(TuiCommand::SessionGet {
+                id: format!("s-{expected:02}"),
+            })
+        );
+        assert_eq!(app.selected_session_idx, expected);
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let top_buf = buffer_to_string(terminal.backend().buffer());
+    assert!(top_buf.contains("Band-00"));
+    assert!(!top_buf.contains("Band-13"));
+}
+
+#[test]
+fn test_mouse_history_feedback_modal_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let s_with_epochs = make_history_session(
+        "sess-fb-1",
+        "Polar H10",
+        1_700_100_000_000,
+        1_700_103_600_000,
+        SessionStatus::Closed,
+        24,
+    );
+    let s_pruned = make_history_session(
+        "sess-fb-pruned",
+        "Polar H10",
+        1_700_050_000_000,
+        1_700_053_600_000,
+        SessionStatus::Closed,
+        0,
+    );
+    app.history_sessions = vec![s_with_epochs.clone(), s_pruned];
+    app.selected_session_idx = 0;
+
+    // Open FeedbackModal via [f]
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    assert!(matches!(app.modal, ModalState::FeedbackModal { .. }));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Backdrop clicks do not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::FeedbackModal { .. }));
+
+    // 2. Click Wearable Onset -> focuses Onset input, type invalid time first
+    let (onset_col, onset_row) =
+        find_text_coords(terminal.backend().buffer(), "[ HH:MM ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(onset_col + 2, onset_row)),
+        None
+    );
+    assert!(app.is_input_focused());
+    for c in "99:99".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // 3. Click Avg Sleep HR -> focuses SleepHr input, type "57.5"
+    let (hr_col, hr_row) = find_text_coords(terminal.backend().buffer(), "[ 30–120 ]").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(hr_col + 2, hr_row)), None);
+    assert!(app.is_input_focused());
+    for c in "57.5".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // 4. Click '<' on Verdict -> focuses Verdict (unfocusing text input) and steps backward to Anomalous (Exclude)
+    let (v_col, v_row) = find_text_coords(terminal.backend().buffer(), "< None >").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(v_col, v_row)), None);
+    assert!(!app.is_input_focused());
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("< Anomalous (Exclude) >"));
+
+    // 5. Click middle of Verdict -> steps forward to None
+    let (mid_col, mid_row) =
+        find_text_coords(terminal.backend().buffer(), "< Anomalous (Exclude) >").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(mid_col + 5, mid_row)),
+        None
+    );
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("< None >"));
+
+    // 6. Click '>' of Verdict -> steps forward to False Positive
+    let (gt_col, gt_row) = find_text_coords(terminal.backend().buffer(), "< None >").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(gt_col + 7, gt_row)), None);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("< False Positive >"));
+
+    // 7. Click [ Submit ] with invalid onset -> stays open with Error:
+    let (sub_col, sub_row) = find_text_coords(terminal.backend().buffer(), "[ Submit ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(sub_col + 2, sub_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::FeedbackModal {
+            error_message: Some(_),
+            ..
+        }
+    ));
+
+    // Fix onset input via click and valid HH:MM inside session window
+    let (onset_val_col, onset_val_row) =
+        find_text_coords(terminal.backend().buffer(), "[ 99:99 ]").unwrap();
+    app.handle_event(mouse_left_click(onset_val_col + 2, onset_val_row));
+    for _ in 0..5 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    let valid_hhmm = chrono::Local
+        .timestamp_millis_opt(s_with_epochs.start_ts_ms + 1_800_000)
+        .single()
+        .unwrap()
+        .format("%H:%M")
+        .to_string();
+    for c in valid_hhmm.chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // Re-render and click [ Submit ] -> validates and emits SessionSetFeedback
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (sub_col2, sub_row2) = find_text_coords(terminal.backend().buffer(), "[ Submit ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(sub_col2 + 2, sub_row2)),
+        Some(TuiCommand::SessionSetFeedback {
+            session_id: "sess-fb-1".into(),
+            verdict: Some(FeedbackVerdict::FalsePositive),
+            onset_hhmm: Some(valid_hhmm),
+            avg_sleep_hr: Some(57.5),
+            clear: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 8. Pruned epochs session: clicking Wearable Onset does NOT focus Onset; clicking [ Cancel ] closes
+    app.selected_session_idx = 1;
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (pruned_col, pruned_row) =
+        find_text_coords(terminal.backend().buffer(), "Wearable Onset:").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(pruned_col + 2, pruned_row)),
+        None
+    );
+    assert!(!app.is_input_focused());
+
+    let (canc_col, canc_row) = find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_mouse_history_export_trace_modal_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+    app.history_sessions = vec![make_history_session(
+        "sess-exp-1",
+        "Polar H10",
+        1_700_100_000_000,
+        1_700_103_600_000,
+        SessionStatus::Closed,
+        24,
+    )];
+    app.selected_session_idx = 0;
+
+    // Open ExportTraceModal via [x]
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('x'))));
+    assert!(matches!(app.modal, ModalState::ExportTraceModal { .. }));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Backdrop clicks do not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::ExportTraceModal { .. }));
+
+    // 2. Click Path -> focuses text input; replace path with dot-directory filename without extension
+    let (path_col, path_row) = find_text_coords(terminal.backend().buffer(), "Path:").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(path_col + 10, path_row)),
+        None
+    );
+    assert!(app.is_input_focused());
+    for _ in 0..32 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in "/tmp/.hidden/my_trace".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // 3. Click '<' on < CSV > -> focuses Format (unfocuses Path) and cycles to JSONL cleanly
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (fmt_col, fmt_row) = find_text_coords(terminal.backend().buffer(), "< CSV >").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(fmt_col, fmt_row)), None);
+    assert!(!app.is_input_focused());
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_jsonl = buffer_to_string(terminal.backend().buffer());
+    assert!(buf_jsonl.contains("< JSONL >"));
+    assert!(buf_jsonl.contains("/tmp/.hidden/my_trace.jsonl"));
+
+    // 4. Click middle on < JSONL > -> cycles back to CSV
+    let (mid_col, mid_row) = find_text_coords(terminal.backend().buffer(), "< JSONL >").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(mid_col + 3, mid_row)),
+        None
+    );
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_csv = buffer_to_string(terminal.backend().buffer());
+    assert!(buf_csv.contains("< CSV >"));
+    assert!(buf_csv.contains("/tmp/.hidden/my_trace.csv"));
+
+    // 5. Click '>' on < CSV > -> cycles to JSONL
+    let (gt_col, gt_row) = find_text_coords(terminal.backend().buffer(), "< CSV >").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(gt_col + 6, gt_row)), None);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("< JSONL >"));
+
+    // 6. Click [x] Anonymize -> toggles off and focuses Anonymize; click again -> toggles on; click again -> off
+    let (anon_col, anon_row) =
+        find_text_coords(terminal.backend().buffer(), "[x] Anonymize").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(anon_col + 1, anon_row)),
+        None
+    );
+    assert!(!app.is_input_focused());
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("[ ] Anonymize"));
+
+    assert_eq!(
+        app.handle_event(mouse_left_click(anon_col + 1, anon_row)),
+        None
+    );
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("[x] Anonymize"));
+
+    assert_eq!(
+        app.handle_event(mouse_left_click(anon_col + 1, anon_row)),
+        None
+    );
+
+    // 7. Click [ Export ] -> emits SessionExportTrace and closes modal
+    let (exp_col, exp_row) = find_text_coords(terminal.backend().buffer(), "[ Export ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(exp_col + 2, exp_row)),
+        Some(TuiCommand::SessionExportTrace {
+            id: "sess-exp-1".into(),
+            path: "/tmp/.hidden/my_trace.jsonl".into(),
+            format: bpmute::replay::TraceFormat::Jsonl,
+            no_anonymize: true,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 8. Reopen and click [ Cancel ] -> closes without command
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('x'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (canc_col, canc_row) = find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_mouse_history_delete_session_modal_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+    app.history_sessions = vec![make_history_session(
+        "sess-del-1",
+        "Polar H10",
+        1_700_100_000_000,
+        1_700_103_600_000,
+        SessionStatus::Closed,
+        24,
+    )];
+    app.selected_session_idx = 0;
+
+    // Open DeleteSessionModal via [D]
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('D'))));
+    assert!(matches!(
+        app.modal,
+        ModalState::DeleteSessionModal {
+            confirmed: true,
+            ..
+        }
+    ));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Backdrop clicks do not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::DeleteSessionModal { .. }));
+
+    // 2. Even when [ Cancel ] is focused (confirmed == false), clicking [ Delete ] dispatches SessionDelete immediately
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert!(matches!(
+        app.modal,
+        ModalState::DeleteSessionModal {
+            confirmed: false,
+            ..
+        }
+    ));
+    let (del_col, del_row) = find_text_coords(terminal.backend().buffer(), "[ Delete ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(del_col + 2, del_row)),
+        Some(TuiCommand::SessionDelete {
+            id: "sess-del-1".into(),
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 3. Reopen (confirmed == true) and click [ Cancel ] -> closes without deleting
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('D'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (canc_col, canc_row) = find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}

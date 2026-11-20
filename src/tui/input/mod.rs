@@ -74,15 +74,7 @@ impl TuiApp {
                 } else if self.active_tab == Tab::History
                     && self.selected_session_idx + 1 < self.history_sessions.len()
                 {
-                    self.selected_session_idx += 1;
-                    if let Some(s) = self.history_sessions.get(self.selected_session_idx) {
-                        if !self.daemon_connected {
-                            let sid = s.id.clone();
-                            self.load_session_detail_offline(&sid);
-                            return None;
-                        }
-                        return Some(TuiCommand::SessionGet { id: s.id.clone() });
-                    }
+                    return self.select_history_session(self.selected_session_idx + 1);
                 } else if self.active_tab == Tab::Settings && self.selected_setting_idx + 1 < 6 {
                     self.selected_setting_idx += 1;
                 }
@@ -92,15 +84,8 @@ impl TuiApp {
                 if self.active_tab == Tab::Wearables {
                     self.selected_wearable_idx = self.selected_wearable_idx.saturating_sub(1);
                 } else if self.active_tab == Tab::History {
-                    self.selected_session_idx = self.selected_session_idx.saturating_sub(1);
-                    if let Some(s) = self.history_sessions.get(self.selected_session_idx) {
-                        if !self.daemon_connected {
-                            let sid = s.id.clone();
-                            self.load_session_detail_offline(&sid);
-                            return None;
-                        }
-                        return Some(TuiCommand::SessionGet { id: s.id.clone() });
-                    }
+                    return self
+                        .select_history_session(self.selected_session_idx.saturating_sub(1));
                 } else if self.active_tab == Tab::Settings {
                     self.selected_setting_idx = self.selected_setting_idx.saturating_sub(1);
                 }
@@ -174,6 +159,17 @@ impl TuiApp {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    pub(super) fn select_history_session(&mut self, idx: usize) -> Option<TuiCommand> {
+        let sid = self.history_sessions.get(idx)?.id.clone();
+        self.selected_session_idx = idx;
+        if !self.daemon_connected {
+            self.load_session_detail_offline(&sid);
+            None
+        } else {
+            Some(TuiCommand::SessionGet { id: sid })
         }
     }
 

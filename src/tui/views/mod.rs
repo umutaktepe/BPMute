@@ -8,6 +8,7 @@ pub mod footer;
 pub mod header;
 pub mod help;
 pub mod history;
+mod history_modals;
 pub mod settings;
 pub mod wearables;
 

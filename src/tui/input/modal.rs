@@ -140,29 +140,13 @@ impl TuiApp {
                 KeyCode::Left | KeyCode::Char('h')
                     if active_field == FeedbackModalField::Verdict =>
                 {
-                    if let ModalState::FeedbackModal {
-                        ref mut verdict_idx,
-                        ..
-                    } = self.modal
-                    {
-                        *verdict_idx = if *verdict_idx == 0 {
-                            3
-                        } else {
-                            *verdict_idx - 1
-                        };
-                    }
+                    self.step_feedback_verdict(false);
                     None
                 }
                 KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ')
                     if active_field == FeedbackModalField::Verdict =>
                 {
-                    if let ModalState::FeedbackModal {
-                        ref mut verdict_idx,
-                        ..
-                    } = self.modal
-                    {
-                        *verdict_idx = (*verdict_idx + 1) % 4;
-                    }
+                    self.step_feedback_verdict(true);
                     None
                 }
                 KeyCode::Enter => {
@@ -214,19 +198,7 @@ impl TuiApp {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                     if active_field == ExportModalField::Format =>
                 {
-                    if let ModalState::ExportTraceModal {
-                        ref mut format_idx,
-                        ref mut destination_path,
-                        ..
-                    } = self.modal
-                    {
-                        *format_idx = (*format_idx + 1) % 2;
-                        let ext = if *format_idx == 0 { "csv" } else { "jsonl" };
-                        if let Some(dot_idx) = destination_path.rfind('.') {
-                            destination_path.truncate(dot_idx + 1);
-                            destination_path.push_str(ext);
-                        }
-                    }
+                    self.cycle_export_format();
                     None
                 }
                 KeyCode::Char(' ') if active_field == ExportModalField::Anonymize => {
@@ -262,7 +234,7 @@ impl TuiApp {
                     *confirmed = !*confirmed;
                     None
                 }
-                KeyCode::Enter => self.confirm_delete_session_modal(),
+                KeyCode::Enter => self.delete_session_modal(true),
                 _ => None,
             },
             ModalState::SoftRebaselineModal { active_field, .. } => match key.code {

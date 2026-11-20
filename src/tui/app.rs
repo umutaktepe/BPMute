@@ -747,7 +747,7 @@ impl TuiApp {
 
         match self.active_tab {
             Tab::Dashboard => render_dashboard(self, content_area, buf, &mut hit_map),
-            Tab::History => render_history(self, content_area, buf),
+            Tab::History => render_history(self, content_area, buf, &mut hit_map),
             Tab::Wearables => {
                 let scroll = render_wearables(self, content_area, buf, &mut hit_map);
                 self.wearables_scroll_offset = scroll.table;

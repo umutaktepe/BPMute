@@ -1,6 +1,6 @@
 use ratatui::layout::{Position, Rect};
 
-use super::app::Tab;
+use super::app::{ExportModalField, FeedbackModalField, Tab};
 
 /// Checkbox targeted inside `UnenrollModal`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,7 @@ pub(crate) enum ClickTarget {
     WearablesReconnect,
     WearablesUnenroll,
     SelectWearable(usize),
+    SelectSession(usize),
     HistoryFeedback,
     HistoryExport,
     HistoryDelete,
@@ -46,6 +47,12 @@ pub(crate) enum ClickTarget {
     PairingConfirm(bool),
     UnenrollToggle(UnenrollCheckbox),
     UnenrollConfirm,
+    FeedbackVerdictStep(bool),
+    FeedbackFocusField(FeedbackModalField),
+    ExportCycleFormat,
+    ExportFocusField(ExportModalField),
+    ExportToggleAnonymize,
+    DeleteSessionConfirm,
     PauseOption(usize),
     Consume,
 }
@@ -54,6 +61,7 @@ pub(crate) enum ClickTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScrollTarget {
     WearablesTable,
+    HistorySessions,
     EnrollmentList,
     HelpModal,
     PausePopover,

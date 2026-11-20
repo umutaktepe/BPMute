@@ -1,6 +1,9 @@
 use chrono::TimeZone;
 
-use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
+use super::super::app::{
+    ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState, TuiApp,
+    UnenrollButton,
+};
 use super::super::event::TuiCommand;
 use super::super::hit_map::UnenrollCheckbox;
 use super::step_index;
@@ -224,7 +227,7 @@ impl TuiApp {
             }
             ModalState::FeedbackModal { .. } => self.submit_feedback_modal(),
             ModalState::ExportTraceModal { .. } => self.submit_export_trace_modal(),
-            ModalState::DeleteSessionModal { .. } => self.confirm_delete_session_modal(),
+            ModalState::DeleteSessionModal { .. } => self.delete_session_modal(true),
             ModalState::SoftRebaselineModal { .. } => self.submit_soft_rebaseline_modal(),
             ModalState::PurgeRawModal { .. } => self.confirm_purge_raw_modal(),
             ModalState::HardWipeModal { .. } => self.submit_hard_wipe_modal(),
@@ -315,6 +318,38 @@ impl TuiApp {
         })
     }
 
+    pub(super) fn step_feedback_verdict(&mut self, forward: bool) {
+        if let ModalState::FeedbackModal {
+            ref mut verdict_idx,
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *active_field = FeedbackModalField::Verdict;
+            *verdict_idx = if forward {
+                (*verdict_idx + 1) % 4
+            } else if *verdict_idx == 0 {
+                3
+            } else {
+                *verdict_idx - 1
+            };
+        }
+    }
+
+    pub(super) fn focus_feedback_field(&mut self, field: FeedbackModalField) {
+        if let ModalState::FeedbackModal {
+            epochs_pruned,
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            if field == FeedbackModalField::Onset && epochs_pruned {
+                return;
+            }
+            *active_field = field;
+        }
+    }
+
     pub(super) fn submit_feedback_modal(&mut self) -> Option<TuiCommand> {
         let ModalState::FeedbackModal {
             ref session_id,
@@ -350,6 +385,43 @@ impl TuiApp {
         }
     }
 
+    pub(super) fn cycle_export_format(&mut self) {
+        if let ModalState::ExportTraceModal {
+            ref mut format_idx,
+            ref mut destination_path,
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *active_field = ExportModalField::Format;
+            *format_idx = (*format_idx + 1) % 2;
+            let ext = if *format_idx == 0 { "csv" } else { "jsonl" };
+            update_export_path_extension(destination_path, ext);
+        }
+    }
+
+    pub(super) fn focus_export_field(&mut self, field: ExportModalField) {
+        if let ModalState::ExportTraceModal {
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *active_field = field;
+        }
+    }
+
+    pub(super) fn toggle_export_anonymize(&mut self) {
+        if let ModalState::ExportTraceModal {
+            ref mut anonymize,
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *anonymize = !*anonymize;
+            *active_field = ExportModalField::Anonymize;
+        }
+    }
+
     pub(super) fn submit_export_trace_modal(&mut self) -> Option<TuiCommand> {
         let ModalState::ExportTraceModal {
             ref session_id,
@@ -377,7 +449,7 @@ impl TuiApp {
         })
     }
 
-    pub(super) fn confirm_delete_session_modal(&mut self) -> Option<TuiCommand> {
+    pub(super) fn delete_session_modal(&mut self, require_confirmed: bool) -> Option<TuiCommand> {
         let ModalState::DeleteSessionModal {
             ref session_id,
             confirmed,
@@ -387,7 +459,7 @@ impl TuiApp {
         };
         let sid = session_id.clone();
         self.modal = ModalState::None;
-        confirmed.then_some(TuiCommand::SessionDelete { id: sid })
+        (!require_confirmed || confirmed).then_some(TuiCommand::SessionDelete { id: sid })
     }
 
     pub(super) fn submit_soft_rebaseline_modal(&mut self) -> Option<TuiCommand> {
@@ -442,6 +514,22 @@ impl TuiApp {
             *error_message = Some("Confirmation mismatch: please type 'WIPE' to proceed".into());
             None
         }
+    }
+}
+
+fn update_export_path_extension(path: &mut String, ext: &str) {
+    if path.trim().is_empty() || path.ends_with('/') {
+        return;
+    }
+    let file_start = path.rfind('/').map_or(0, |i| i + 1);
+    if let Some(rel_dot) = path[file_start..].rfind('.')
+        && rel_dot > 0
+    {
+        path.truncate(file_start + rel_dot + 1);
+        path.push_str(ext);
+    } else {
+        path.push('.');
+        path.push_str(ext);
     }
 }
 

@@ -2,10 +2,13 @@ use chrono::{Local, TimeZone};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 
-use super::super::app::{ExportModalField, FeedbackModalField, ModalState, TuiApp};
-use super::centered_rect;
+use super::super::app::{ModalState, TuiApp};
+use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
+use super::history_modals::{
+    render_delete_session_modal, render_export_trace_modal, render_feedback_modal,
+};
 use crate::calibration::{CalibrationBoundaryRecord, FeedbackVerdict};
 use crate::logging::format_wearable_label;
 use crate::sleep_engine::SessionEndReason;
@@ -19,7 +22,7 @@ enum HistoryRow<'a> {
     Boundary(&'a CalibrationBoundaryRecord),
 }
 
-pub fn render_history(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_history(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.width < 10 || area.height < 5 {
         return;
     }
@@ -35,18 +38,21 @@ pub fn render_history(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let master_area = chunks[0];
     let detail_area = chunks[1];
 
-    render_master_list(app, master_area, buf);
+    render_master_list(app, master_area, buf, hit_map);
     render_detail_pane(app, detail_area, buf);
 
     match app.modal {
-        ModalState::FeedbackModal { .. } => render_feedback_modal(app, area, buf),
-        ModalState::ExportTraceModal { .. } => render_export_trace_modal(app, area, buf),
-        ModalState::DeleteSessionModal { .. } => render_delete_session_modal(app, area, buf),
+        ModalState::FeedbackModal { .. } => render_feedback_modal(app, area, buf, hit_map),
+        ModalState::ExportTraceModal { .. } => render_export_trace_modal(app, area, buf, hit_map),
+        ModalState::DeleteSessionModal { .. } => {
+            render_delete_session_modal(app, area, buf, hit_map)
+        }
         _ => {}
     }
 }
 
-fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+    hit_map.push_scroll(area, ScrollTarget::HistorySessions);
     let block = app.theme.card_block(format!(
         " Monitoring Sessions ({}) ",
         app.history_sessions.len()
@@ -183,6 +189,10 @@ fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     Span::styled(line1, bg_style),
                 ];
                 buf.set_line(inner.x, current_y, &Line::from(line1_spans), inner.width);
+                hit_map.push_click(
+                    Rect::new(inner.x, current_y, inner.width, 1),
+                    ClickTarget::SelectSession(*session_idx),
+                );
                 current_y += 1;
 
                 if current_y >= inner.bottom() {
@@ -222,6 +232,10 @@ fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                     } else {
                         app.theme.muted()
                     },
+                );
+                hit_map.push_click(
+                    Rect::new(inner.x, current_y, inner.width, 1),
+                    ClickTarget::SelectSession(*session_idx),
                 );
                 current_y += 1;
             }
@@ -632,292 +646,4 @@ fn format_duration_compact(sec: i64) -> String {
         let m = (sec % 3600) / 60;
         format!("{h}h {m}m")
     }
-}
-
-fn render_feedback_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let ModalState::FeedbackModal {
-        ref session_id,
-        epochs_pruned,
-        verdict_idx,
-        ref onset_hhmm_input,
-        ref avg_sleep_hr_input,
-        active_field,
-        ref error_message,
-        ..
-    } = app.modal
-    else {
-        return;
-    };
-
-    let modal_area = centered_rect(area, 58, 14);
-    Clear.render(modal_area, buf);
-
-    let block = app
-        .theme
-        .card_block(" Manual Feedback / Wearable-Report ")
-        .border_style(app.theme.primary());
-    let inner = block.inner(modal_area);
-    block.render(modal_area, buf);
-
-    let verdict_options = [
-        "None",
-        "False Positive",
-        "Missed Sleep",
-        "Anomalous (Exclude)",
-    ];
-    let cur_verdict = verdict_options.get(verdict_idx).unwrap_or(&"None");
-
-    let is_verdict_focused = active_field == FeedbackModalField::Verdict;
-    let is_onset_focused = active_field == FeedbackModalField::Onset;
-    let is_hr_focused = active_field == FeedbackModalField::SleepHr;
-    let is_submit_focused = active_field == FeedbackModalField::Submit;
-    let is_cancel_focused = active_field == FeedbackModalField::Cancel;
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(" Session: ", app.theme.muted()),
-        Span::styled(session_id, app.theme.base()),
-    ]));
-
-    lines.push(Line::from(""));
-
-    // Verdict line
-    let verdict_style = if is_verdict_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" Verdict: ", app.theme.key_hint()),
-        Span::styled(format!("< {cur_verdict} >"), verdict_style),
-        Span::styled("  (Space / ←/→)", app.theme.muted()),
-    ]));
-
-    // Onset line
-    if epochs_pruned {
-        lines.push(Line::from(vec![
-            Span::styled(" Wearable Onset: ", app.theme.muted()),
-            Span::styled(
-                "[pruned: epoch trace pruned by retention]",
-                app.theme.muted(),
-            ),
-        ]));
-    } else {
-        let onset_disp = if onset_hhmm_input.is_empty() {
-            "HH:MM"
-        } else {
-            onset_hhmm_input
-        };
-        let onset_style = if is_onset_focused {
-            app.theme.highlight()
-        } else {
-            app.theme.base()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(" Wearable Onset: ", app.theme.key_hint()),
-            Span::styled(format!("[ {onset_disp} ]"), onset_style),
-            Span::styled(" (local time)", app.theme.muted()),
-        ]));
-    }
-
-    // Avg sleep HR line
-    let hr_disp = if avg_sleep_hr_input.is_empty() {
-        "30–120"
-    } else {
-        avg_sleep_hr_input
-    };
-    let hr_style = if is_hr_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" Avg Sleep HR:   ", app.theme.key_hint()),
-        Span::styled(format!("[ {hr_disp} ]"), hr_style),
-        Span::styled(" BPM (+2.5 bpm nadir offset applied)", app.theme.muted()),
-    ]));
-
-    // Error message line
-    if let Some(err) = error_message {
-        lines.push(Line::from(vec![
-            Span::styled(" Error: ", app.theme.danger()),
-            Span::styled(err, app.theme.danger()),
-        ]));
-    } else {
-        lines.push(Line::from(""));
-    }
-
-    // Buttons line
-    let submit_style = if is_submit_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    let cancel_style = if is_cancel_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.muted()
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("   ", app.theme.base()),
-        Span::styled("[ Submit ]", submit_style),
-        Span::styled("       ", app.theme.base()),
-        Span::styled("[ Cancel ]", cancel_style),
-    ]));
-
-    Paragraph::new(lines).render(inner, buf);
-}
-
-fn render_export_trace_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let ModalState::ExportTraceModal {
-        ref session_id,
-        format_idx,
-        ref destination_path,
-        anonymize,
-        active_field,
-        ref error_message,
-    } = app.modal
-    else {
-        return;
-    };
-
-    let modal_area = centered_rect(area, 60, 12);
-    Clear.render(modal_area, buf);
-
-    let block = app
-        .theme
-        .card_block(" Export Trace ")
-        .border_style(app.theme.primary());
-    let inner = block.inner(modal_area);
-    block.render(modal_area, buf);
-
-    let format_str = if format_idx == 0 { "CSV" } else { "JSONL" };
-    let is_fmt_focused = active_field == ExportModalField::Format;
-    let is_path_focused = active_field == ExportModalField::Path;
-    let is_anon_focused = active_field == ExportModalField::Anonymize;
-    let is_submit_focused = active_field == ExportModalField::Submit;
-    let is_cancel_focused = active_field == ExportModalField::Cancel;
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(" Session: ", app.theme.muted()),
-        Span::styled(session_id, app.theme.base()),
-    ]));
-
-    // Format line
-    let fmt_style = if is_fmt_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" Format:  ", app.theme.key_hint()),
-        Span::styled(format!("< {format_str} >"), fmt_style),
-        Span::styled("  (Space / ←/→)", app.theme.muted()),
-    ]));
-
-    // Path line
-    let path_style = if is_path_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(" Path:    ", app.theme.key_hint()),
-        Span::styled(format!("[ {destination_path} ]"), path_style),
-    ]));
-
-    // Anonymize line
-    let anon_check = if anonymize { "[x]" } else { "[ ]" };
-    let anon_style = if is_anon_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(format!(" {anon_check} Anonymize"), anon_style),
-        Span::styled(" (strip MAC addresses and PII)", app.theme.muted()),
-    ]));
-
-    if let Some(err) = error_message {
-        lines.push(Line::from(vec![
-            Span::styled(" Error: ", app.theme.danger()),
-            Span::styled(err, app.theme.danger()),
-        ]));
-    } else {
-        lines.push(Line::from(""));
-    }
-
-    let submit_style = if is_submit_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-    let cancel_style = if is_cancel_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.muted()
-    };
-
-    lines.push(Line::from(vec![
-        Span::styled("   ", app.theme.base()),
-        Span::styled("[ Export ]", submit_style),
-        Span::styled("       ", app.theme.base()),
-        Span::styled("[ Cancel ]", cancel_style),
-    ]));
-
-    Paragraph::new(lines).render(inner, buf);
-}
-
-fn render_delete_session_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let ModalState::DeleteSessionModal {
-        ref session_id,
-        confirmed,
-    } = app.modal
-    else {
-        return;
-    };
-
-    let modal_area = centered_rect(area, 54, 8);
-    Clear.render(modal_area, buf);
-
-    let block = app
-        .theme
-        .card_block(" Delete Session ")
-        .border_style(app.theme.danger());
-    let inner = block.inner(modal_area);
-    block.render(modal_area, buf);
-
-    let submit_style = if confirmed {
-        app.theme.highlight()
-    } else {
-        app.theme.danger()
-    };
-    let cancel_style = if !confirmed {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(" Delete session '", app.theme.base()),
-            Span::styled(session_id, app.theme.warning()),
-            Span::styled("'?", app.theme.base()),
-        ]),
-        Line::from(vec![Span::styled(
-            " Calibration will be recomputed bit-for-bit.",
-            app.theme.muted(),
-        )]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("   ", app.theme.base()),
-            Span::styled("[ Delete ]", submit_style),
-            Span::styled("       ", app.theme.base()),
-            Span::styled("[ Cancel ]", cancel_style),
-        ]),
-    ];
-
-    Paragraph::new(lines).render(inner, buf);
 }

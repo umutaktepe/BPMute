@@ -43,6 +43,7 @@ impl TuiApp {
                         }
                         None
                     }
+                    ClickTarget::SelectSession(idx) => self.select_history_session(idx),
                     ClickTarget::HistoryFeedback => self.open_history_feedback_modal(),
                     ClickTarget::HistoryExport => self.open_history_export_modal(),
                     ClickTarget::HistoryDelete => self.open_history_delete_modal(),
@@ -88,6 +89,27 @@ impl TuiApp {
                         None
                     }
                     ClickTarget::UnenrollConfirm => self.confirm_unenroll_modal(),
+                    ClickTarget::FeedbackVerdictStep(forward) => {
+                        self.step_feedback_verdict(forward);
+                        None
+                    }
+                    ClickTarget::FeedbackFocusField(field) => {
+                        self.focus_feedback_field(field);
+                        None
+                    }
+                    ClickTarget::ExportCycleFormat => {
+                        self.cycle_export_format();
+                        None
+                    }
+                    ClickTarget::ExportFocusField(field) => {
+                        self.focus_export_field(field);
+                        None
+                    }
+                    ClickTarget::ExportToggleAnonymize => {
+                        self.toggle_export_anonymize();
+                        None
+                    }
+                    ClickTarget::DeleteSessionConfirm => self.delete_session_modal(false),
                     ClickTarget::PauseOption(idx) => self.click_pause_option(idx),
                     ClickTarget::Consume => None,
                 }
@@ -102,18 +124,22 @@ impl TuiApp {
                 match target {
                     ScrollTarget::WearablesTable => {
                         self.scroll_wearables_selection(delta);
+                        None
                     }
+                    ScrollTarget::HistorySessions => self.scroll_history_selection(delta),
                     ScrollTarget::EnrollmentList => {
                         self.scroll_enrollment_list(delta);
+                        None
                     }
                     ScrollTarget::HelpModal => {
                         self.scroll_help(delta);
+                        None
                     }
                     ScrollTarget::PausePopover => {
                         self.scroll_pause_popover(delta);
+                        None
                     }
                 }
-                None
             }
             _ => None,
         }
@@ -131,5 +157,17 @@ impl TuiApp {
             self.enrolled_wearables.len(),
             delta,
         );
+    }
+
+    fn scroll_history_selection(&mut self, delta: isize) -> Option<TuiCommand> {
+        let next = step_index(
+            self.selected_session_idx,
+            self.history_sessions.len(),
+            delta,
+        );
+        if next == self.selected_session_idx {
+            return None;
+        }
+        self.select_history_session(next)
     }
 }
