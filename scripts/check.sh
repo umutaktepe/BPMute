@@ -6,23 +6,18 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/dev/null
 export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/dev/null}"
 
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
 
-if cargo tree -e normal --prefix none | grep -Eq '^(reqwest|hyper|rustls|native-tls|openssl|openssl-sys|ureq|curl|curl-sys|h2|tokio-rustls|webpki|rustls-webpki|libsystemd|libsystemd-sys|libdbus-sys|dbus|bluer|btleplug) '; then
-  echo "error: forbidden outbound HTTP/TLS or C system dependency detected (ADR-0001)" >&2
-  exit 1
-fi
-
-if cargo tree --depth 1 -e normal --prefix none | grep -Eq '^(rand|rand_chacha|rand_core) '; then
-  echo "error: dev-only synthetic harness dependency leaked into normal dependencies (ADR-0007)" >&2
-  exit 1
-fi
-
-mapfile -d '' sync_files < <(find src/sleep_engine src/calibration -name '*.rs' -print0)
-if [ "${#sync_files[@]}" -gt 0 ] && awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rusqlite|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }' "${sync_files[@]}"; then
-  echo "error: forbidden async, wall-clock, I/O, SQLite, or RNG usage inside pure-sync core (ADR-0007)" >&2
-  exit 1
-fi
+while IFS= read -r -d '' file; do
+  lines=$(wc -l < "$file")
+  limit=1000
+  case "$file" in
+    ./src/sleep_engine/state_machine.rs) limit=1041 ;;
+  esac
+  if [ "$lines" -gt "$limit" ]; then
+    echo "error: $file has $lines lines (limit: $limit); split into sibling submodules" >&2
+    exit 1
+  fi
+done < <(find ./src -name '*.rs' -print0)
 
 if grep -Eq 'DaemonOptions\s*\{' tests/*.rs; then
   echo "error: direct DaemonOptions struct literal forbidden in tests; use DaemonOptions::for_testing(...) (docs/agents/testing.md:27)" >&2
@@ -74,7 +69,42 @@ for path in files:
         sys.exit(
             f"error: raw JSON string-key indexing forbidden in {path}; deserialize typed response structs from src/ipc/protocol.rs"
         )
+
+for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
+    content = open(path, encoding="utf-8").read()
+    has_vacuum = bool(re.search(r'\bVACUUM;|PRAGMA\s+incremental_vacuum\b', content))
+    if has_vacuum and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(', content):
+        sys.exit(
+            f"error: {path} runs VACUUM or PRAGMA incremental_vacuum without wal_checkpoint(TRUNCATE) / flush_wal()"
+        )
+    if "VACUUM;" in content and "PRAGMA auto_vacuum" in content:
+        if content.index("VACUUM;") < content.index("PRAGMA auto_vacuum"):
+            sys.exit(
+                f"error: {path} sets PRAGMA auto_vacuum after VACUUM;; set it before VACUUM"
+            )
 PY
+
+if awk '
+  FNR == 1 { in_test = 0; paused = 0 }
+  /^[[:space:]]*#\[tokio::test/ {
+    in_test = 1
+    paused = ($0 ~ /start_paused[[:space:]]*=[[:space:]]*true/)
+  }
+  /^\}/ { in_test = 0; paused = 0 }
+  /tokio::time::pause\(\)/ { paused = 1 }
+  {
+    line = $0
+    sub(/\/\/.*/, "", line)
+    if (in_test && !paused && line ~ /tokio::time::(sleep|timeout|interval)/) {
+      print FILENAME ":" FNR ":" $0
+      found = 1
+    }
+  }
+  END { exit !found }
+' tests/*.rs; then
+  echo "error: tokio::time::{sleep,timeout,interval} inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
+  exit 1
+fi
 
 for script in scripts/*.sh .githooks/*; do
   [ -f "$script" ] || continue
@@ -118,38 +148,21 @@ if command -v dist >/dev/null 2>&1; then
   dist generate --check
 fi
 
-while IFS= read -r -d '' file; do
-  lines=$(wc -l < "$file")
-  limit=1000
-  case "$file" in
-    ./src/storage/store/mod.rs) limit=1061 ;;
-    ./src/sleep_engine/state_machine.rs) limit=1041 ;;
-  esac
-  if [ "$lines" -gt "$limit" ]; then
-    echo "error: $file has $lines lines (limit: $limit); split into sibling submodules" >&2
-    exit 1
-  fi
-done < <(find ./src -name '*.rs' -print0)
+cargo clippy --all-targets -- -D warnings
 
-if awk '
-  FNR == 1 { in_test = 0; paused = 0 }
-  /^[[:space:]]*#\[tokio::test/ {
-    in_test = 1
-    paused = ($0 ~ /start_paused[[:space:]]*=[[:space:]]*true/)
-  }
-  /^\}/ { in_test = 0; paused = 0 }
-  /tokio::time::pause\(\)/ { paused = 1 }
-  {
-    line = $0
-    sub(/\/\/.*/, "", line)
-    if (in_test && !paused && line ~ /tokio::time::(sleep|timeout|interval)/) {
-      print FILENAME ":" FNR ":" $0
-      found = 1
-    }
-  }
-  END { exit !found }
-' tests/*.rs; then
-  echo "error: tokio::time::{sleep,timeout,interval} inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
+if cargo tree -e normal --prefix none | grep -Eq '^(reqwest|hyper|rustls|native-tls|openssl|openssl-sys|ureq|curl|curl-sys|h2|tokio-rustls|webpki|rustls-webpki|libsystemd|libsystemd-sys|libdbus-sys|dbus|bluer|btleplug) '; then
+  echo "error: forbidden outbound HTTP/TLS or C system dependency detected (ADR-0001)" >&2
+  exit 1
+fi
+
+if cargo tree --depth 1 -e normal --prefix none | grep -Eq '^(rand|rand_chacha|rand_core) '; then
+  echo "error: dev-only synthetic harness dependency leaked into normal dependencies (ADR-0007)" >&2
+  exit 1
+fi
+
+mapfile -d '' sync_files < <(find src/sleep_engine src/calibration -name '*.rs' -print0)
+if [ "${#sync_files[@]}" -gt 0 ] && awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rusqlite|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }' "${sync_files[@]}"; then
+  echo "error: forbidden async, wall-clock, I/O, SQLite, or RNG usage inside pure-sync core (ADR-0007)" >&2
   exit 1
 fi
 

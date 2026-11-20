@@ -570,7 +570,7 @@ fn render_purge_raw_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &
     let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            " Purge all raw biometrics older than retention window?",
+            " Purge all raw samples across closed sessions?",
             app.theme.base(),
         )]),
         Line::from(vec![Span::styled(

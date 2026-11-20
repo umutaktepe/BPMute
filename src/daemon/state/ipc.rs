@@ -310,14 +310,31 @@ impl DaemonCore {
                     )
                 })?;
                 let now_ms = self.clock.now_utc().timestamp_millis();
+                self.signal_arousal_abort().await;
+                let (wipe_tx, wipe_rx) = tokio::sync::oneshot::channel();
+                if self
+                    .engine_ctrl_tx
+                    .send(crate::daemon::EngineControlEvent::HardWipe {
+                        wipe_all: parsed.all,
+                        reply: wipe_tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    let _ = wipe_rx.await;
+                }
                 {
                     let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
                     guard.active_session_id = None;
                     guard.detector_state = crate::sleep_engine::DetectorState::Idle;
                     guard.hr_ring_buffer.clear();
                     guard.calibration_state = CalibrationState::default();
+                    if parsed.all {
+                        guard.active_wearable_id = None;
+                    }
                 }
-                self.persistence
+                let cal_state = self
+                    .persistence
                     .hard_wipe(parsed.all, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
@@ -328,7 +345,7 @@ impl DaemonCore {
                     self.wearable_source.notify_allowlist_changed();
                     self.publish_wearables_updated().await;
                 }
-                self.apply_calibration_update(CalibrationState::default());
+                self.apply_calibration_update(cal_state);
                 Ok(json!({ "wiped": true }))
             }
             "data.backup_sqlite" => {

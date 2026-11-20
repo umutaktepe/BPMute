@@ -150,7 +150,7 @@ impl LedgerStore {
         delete_sessions: bool,
         now_ms: i64,
     ) -> Result<(EnrolledWearable, Option<CalibrationState>), StorageError> {
-        self.write_tx(|tx| {
+        let result = self.write_tx(|tx| {
             let id = resolve_wearable_id(tx, id_or_prefix)?;
             let mut cal_state = None;
             if delete_sessions {
@@ -170,7 +170,7 @@ impl LedgerStore {
                     "DELETE FROM sessions WHERE wearable_id = ?1",
                     params![id],
                 )?;
-                let _ = tx.execute("PRAGMA incremental_vacuum(500);", []);
+                let _ = tx.execute("PRAGMA incremental_vacuum;", []);
                 cal_state = Some(recompute_and_persist_in_tx(tx, now_ms)?);
             }
             tx.execute(
@@ -179,7 +179,11 @@ impl LedgerStore {
             )?;
             let enrolled = load_enrolled_wearable_in_conn(tx, &id)?;
             Ok((enrolled, cal_state))
-        })
+        })?;
+        if delete_sessions {
+            self.flush_wal()?;
+        }
+        Ok(result)
     }
 }
 

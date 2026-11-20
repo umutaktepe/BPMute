@@ -289,6 +289,8 @@ pub struct PruneSummary {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StorageStats {
     pub db_size_bytes: u64,
+    #[serde(default)]
+    pub wal_size_bytes: u64,
     pub db_size_formatted: String,
     pub sessions_count: usize,
     pub session_epochs_count: usize,

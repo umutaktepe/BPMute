@@ -4,7 +4,7 @@ Review-stage standards for BPMute. Mechanical checks live in `./scripts/check.sh
 
 ## Judgement Rules
 
-- **State-transition completeness**: When exiting an active phase (e.g., `Candidate`, `Confirmed`, `Signal Lost`, or stream-mode switch), reset or update all companion timers, streaks, and trackers in one dedicated helper rather than mutating fields inline. Snapshot historical milestone values (such as warmup baseline HR) at the transition rather than deriving them from later mutable state.
+- **State-transition completeness**: When exiting an active phase (e.g., `Candidate`, `Confirmed`, `Signal Lost`, or stream-mode switch) or executing a destructive/bulk IPC state reset (e.g., `data.hard_wipe`, `data.import`), synchronize every affected actor (`DaemonCore`, `MonitoringContext`, active `GraceCoordinator`) in one dedicated helper, derive updated in-memory `CalibrationState` from `recompute_and_persist_in_tx` rather than synthesizing defaults, and snapshot historical milestone values at the transition.
 - **No speculative unused API surface**: Do not add unused struct fields, enum variants, or constants ahead of their ticket unless required by a persisted schema or wire contract.
 
 - **Biometric redaction completeness**: Every `tracing` backend (including `tracing-journald`) and both span attributes/records and events must pass through the shared redaction path so raw BPM/RR telemetry and full MAC addresses never appear unless `--log-biometrics` / `BPMUTE_LOG_BIOMETRICS=1` is active. Redaction helpers (`mask_mac`, text scrubbing) must be idempotent so nested layers never corrupt already-masked values.

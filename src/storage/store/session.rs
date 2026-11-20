@@ -315,8 +315,14 @@ impl LedgerStore {
             )?;
 
             let state = recompute_and_persist_in_tx(tx, now_ms)?;
-            let _ = super::prune_retention_in_tx(tx, &retention, now_ms)?;
+            let pruned = super::maintenance::prune_retention_in_tx(tx, &retention, now_ms)?;
             let detail = load_session_detail_in_conn(tx, &req.session_id)?;
+            Ok((detail, state, pruned))
+        })
+        .and_then(|(detail, state, pruned)| {
+            if pruned.raw_samples_pruned > 0 || pruned.session_epochs_pruned > 0 {
+                self.flush_wal()?;
+            }
             Ok((detail, state))
         })
     }
@@ -527,7 +533,7 @@ impl LedgerStore {
         id_or_prefix: &str,
         now_ms: i64,
     ) -> Result<(String, CalibrationState), StorageError> {
-        self.write_tx(|tx| {
+        let result = self.write_tx(|tx| {
             let session_id = resolve_session_id(tx, id_or_prefix)?;
             let status: String = tx.query_row(
                 "SELECT status FROM sessions WHERE id = ?1",
@@ -541,10 +547,12 @@ impl LedgerStore {
             }
 
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
-            let _ = tx.execute("PRAGMA incremental_vacuum(500);", []);
+            let _ = tx.execute("PRAGMA incremental_vacuum;", []);
             let state = recompute_and_persist_in_tx(tx, now_ms)?;
             Ok((session_id, state))
-        })
+        })?;
+        self.flush_wal()?;
+        Ok(result)
     }
 
     /// Exports a session trace to canonical `CSV` or `JSONL` format directly replayable by `bpmute replay`.

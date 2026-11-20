@@ -47,6 +47,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                     },
                     Ok(None) => StorageStats {
                         db_size_bytes: 0,
+                        wal_size_bytes: 0,
                         db_size_formatted: "0 B".to_string(),
                         sessions_count: 0,
                         session_epochs_count: 0,
@@ -71,8 +72,8 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
             let _ = writeln!(stdout, "Storage Statistics:");
             let _ = writeln!(
                 stdout,
-                "  Database size: {} ({} bytes)",
-                stats.db_size_formatted, stats.db_size_bytes
+                "  Database size: {} ({} bytes; WAL: {} bytes)",
+                stats.db_size_formatted, stats.db_size_bytes, stats.wal_size_bytes
             );
             let _ = writeln!(stdout, "  Sessions: {}", stats.sessions_count);
             let _ = writeln!(stdout, "  Epochs: {}", stats.session_epochs_count);

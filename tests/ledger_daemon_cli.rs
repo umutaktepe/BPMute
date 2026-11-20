@@ -1454,3 +1454,134 @@ async fn eacces_on_data_dir_or_ledger_db_maps_to_exit_code_5() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn live_daemon_hard_wipe_aborts_active_session_and_resets_engine() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = test_paths_and_env(&temp);
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (wearable_tx, wearable_source) = FakeWearableSource::channel();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(wearable_source)),
+    )
+    .await
+    .unwrap();
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _snapshot = client.next_event().await.unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:77".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("ActiveWipeBand".to_string()),
+        advertised_name: Some("ActiveWipeBand".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+    let base_ts = start_utc.timestamp_millis();
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: desc.clone(),
+            state: bpmute::sleep_engine::StreamState {
+                ts_ms: base_ts,
+                status: bpmute::sleep_engine::StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Send 20 seconds of HR packets so an active session opens and emits an epoch.
+    for sec in 1..=20 {
+        wearable_tx
+            .send(WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms: base_ts + sec * 1_000,
+                    bpm: 64.0,
+                    rr_ms: vec![930.0],
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    let first_sid = loop {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "EpochUpdate" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+
+    let stats_before = client.request("data.stats", json!({})).await.unwrap();
+    assert_eq!(stats_before["sessions_count"], 1);
+    let status_before = client.request("daemon.status", json!({})).await.unwrap();
+    assert_ne!(status_before["monitoring_state"], "Idle");
+    let sessions_before = client.request("session.list", json!({})).await.unwrap();
+    assert_eq!(sessions_before["sessions"][0]["id"], first_sid);
+    assert_eq!(sessions_before["sessions"][0]["status"], "active");
+
+    // Hard wipe (keep enrolled wearables) while monitoring session is active.
+    client
+        .request("data.hard_wipe", json!({ "all": false }))
+        .await
+        .unwrap();
+
+    let status_after = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(status_after["monitoring_state"], "Idle");
+    let sessions_after = client.request("session.list", json!({})).await.unwrap();
+    assert!(sessions_after["sessions"].as_array().unwrap().is_empty());
+
+    let cal_after = client
+        .request("calibration.status", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(cal_after["wearables"].as_object().unwrap().len(), 1);
+
+    let stats_after = client.request("data.stats", json!({})).await.unwrap();
+    assert_eq!(stats_after["sessions_count"], 0);
+
+    // Subsequent stream packets must start a fresh session cleanly without stale session FK errors.
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: desc.clone(),
+            state: bpmute::sleep_engine::StreamState {
+                ts_ms: base_ts + 25_000,
+                status: bpmute::sleep_engine::StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+    for sec in 26..=45 {
+        wearable_tx
+            .send(WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms: base_ts + sec * 1_000,
+                    bpm: 64.0,
+                    rr_ms: vec![930.0],
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    let second_sid = loop {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "EpochUpdate" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+    assert_ne!(second_sid, first_sid);
+
+    let stats_new = client.request("data.stats", json!({})).await.unwrap();
+    assert_eq!(stats_new["sessions_count"], 1);
+
+    drop(wearable_tx);
+    daemon.shutdown().await;
+}

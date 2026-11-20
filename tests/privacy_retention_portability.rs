@@ -1227,3 +1227,124 @@ async fn test_online_cli_sessions_and_data_ipc_roundtrip() {
 
     daemon.shutdown().await;
 }
+
+#[test]
+fn test_purge_and_hard_wipe_reclaim_storage_and_truncate_wal() {
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+    let wal_len = || std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+
+    // Populate wearable + 2 closed sessions with 200 raw samples each
+    let wid = store
+        .upsert_wearable(
+            &WearableDescriptor {
+                mac: "AA:BB:CC:DD:EE:01".to_string(),
+                address_type: "public".to_string(),
+                alias: Some("Band".to_string()),
+                advertised_name: None,
+                supports_rr: true,
+                supports_contact: true,
+            },
+            1000,
+        )
+        .unwrap();
+    for s_idx in 0..2 {
+        let base = (s_idx + 1) * 1_000_000;
+        let sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid.clone(),
+                start_ts_ms: base,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        let raw: Vec<(u32, HrPacket)> = (0..200)
+            .map(|i| {
+                (
+                    i,
+                    HrPacket {
+                        ts_ms: base + (i as i64) * 1000,
+                        bpm: 65.0,
+                        rr_ms: vec![920.0],
+                        contact_status: ContactStatus::Contact,
+                    },
+                )
+            })
+            .collect();
+        let raw_refs: Vec<(u32, &HrPacket)> = raw.iter().map(|(seq, p)| (*seq, p)).collect();
+        store.append_epoch_and_raw(&sid, None, &raw_refs).unwrap();
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: sid,
+                    summary: sample_summary(base, base + 200_000, 56.0),
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                base + 200_000,
+            )
+            .unwrap();
+    }
+
+    let size_before_purge = store.get_storage_stats().unwrap().db_size_bytes;
+    let purged = store.purge_raw_samples().unwrap();
+    assert_eq!(purged, 400);
+    assert_eq!(wal_len(), 0, "purge_raw_samples must truncate WAL");
+    let after_purge_stats = store.get_storage_stats().unwrap();
+    assert_eq!(after_purge_stats.wal_size_bytes, 0);
+    let size_after_purge = after_purge_stats.db_size_bytes;
+    assert!(
+        size_after_purge < size_before_purge,
+        "purge_raw_samples must shrink DB size: before={size_before_purge}, after={size_after_purge}"
+    );
+
+    // Repeating purge when 0 closed raw samples remain must be a no-op on DB size.
+    let purged2 = store.purge_raw_samples().unwrap();
+    assert_eq!(purged2, 0);
+    assert_eq!(wal_len(), 0);
+    let size_after_purge2 = store.get_storage_stats().unwrap().db_size_bytes;
+    assert_eq!(size_after_purge2, size_after_purge);
+
+    // Soft rebaseline preserves sessions while resetting maturity to ColdStart.
+    let (_b1_rec, cal_b1) = store
+        .set_calibration_boundary(None, Some(52.0), true, 3_000_000)
+        .unwrap();
+    assert_eq!(cal_b1.valid_sessions, 0);
+    assert_eq!(cal_b1.maturity, CalibrationMaturity::ColdStart);
+
+    // Repeated hard_wipe calls must reclaim space, truncate WAL, and stay constant in size.
+    let size_before_wipe = store.get_storage_stats().unwrap().db_size_bytes;
+    let cal_w1 = store.hard_wipe(false, 5_000_000).unwrap();
+    assert_eq!(cal_w1.valid_sessions, 0);
+    assert!(
+        cal_w1.wearables.contains_key(&wid),
+        "hard_wipe(false) must preserve enrolled wearable calibration metadata"
+    );
+    assert_eq!(wal_len(), 0, "hard_wipe must truncate WAL");
+    let after_wipe1_stats = store.get_storage_stats().unwrap();
+    assert_eq!(after_wipe1_stats.wal_size_bytes, 0);
+    let size_after_wipe1 = after_wipe1_stats.db_size_bytes;
+    assert!(
+        size_after_wipe1 < size_before_wipe,
+        "first hard_wipe must shrink DB: before={size_before_wipe}, after={size_after_wipe1}"
+    );
+
+    store.hard_wipe(false, 6_000_000).unwrap();
+    assert_eq!(wal_len(), 0);
+    let size_after_wipe2 = store.get_storage_stats().unwrap().db_size_bytes;
+    assert_eq!(
+        size_after_wipe2, size_after_wipe1,
+        "second hard_wipe must not grow DB: w1={size_after_wipe1}, w2={size_after_wipe2}"
+    );
+
+    store.hard_wipe(false, 7_000_000).unwrap();
+    assert_eq!(wal_len(), 0);
+    let size_after_wipe3 = store.get_storage_stats().unwrap().db_size_bytes;
+    assert_eq!(
+        size_after_wipe3, size_after_wipe2,
+        "third hard_wipe must not grow DB: w2={size_after_wipe2}, w3={size_after_wipe3}"
+    );
+}

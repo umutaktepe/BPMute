@@ -1789,6 +1789,7 @@ fn test_settings_live_reconfig_editor_and_calibration_storage() {
 
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 145_408,
+        wal_size_bytes: 0,
         db_size_formatted: "142 KB".into(),
         sessions_count: 12,
         session_epochs_count: 1420,
@@ -2396,6 +2397,7 @@ fn test_mouse_footer_tab_actions_and_navigation_hint_ignores() {
     }];
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 1024,
+        wal_size_bytes: 0,
         db_size_formatted: "1.0 KB".into(),
         sessions_count: 1,
         session_epochs_count: 10,
@@ -2699,6 +2701,7 @@ fn test_mouse_footer_disabled_and_muted_guards() {
     app.history_sessions = vec![active_session];
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 1024,
+        wal_size_bytes: 0,
         db_size_formatted: "1.0 KB".into(),
         sessions_count: 1,
         session_epochs_count: 5,
@@ -5581,6 +5584,7 @@ fn test_mouse_settings_controls_and_guards() {
     app.active_config = Some(bpmute::config::Config::default());
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 145_408,
+        wal_size_bytes: 0,
         db_size_formatted: "142 KB".into(),
         sessions_count: 12,
         session_epochs_count: 1420,
@@ -6398,6 +6402,115 @@ async fn test_real_socket_history_feedback_and_unenroll_delete_sessions_e2e() {
         "all wearable session counts should reset to 0: {cal_resp:?}"
     );
     assert!(h.app.selected_session_detail.is_none());
+
+    h.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_settings_purge_rebaseline_and_repeated_wipe_db_size() {
+    let mut h = RealSocketTuiHarness::spawn(3, true).await;
+
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('4'))));
+    assert_eq!(h.app.active_tab, Tab::Settings);
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.storage_stats.is_some()
+    })
+    .await;
+
+    let initial_stats = h.app.storage_stats.as_ref().unwrap().clone();
+    assert_eq!(initial_stats.sessions_count, 3);
+    assert!(initial_stats.raw_samples_count > 0);
+    let size_initial = initial_stats.db_size_bytes;
+
+    // 1. Purge Raw ('P') -> clears raw samples and shrinks DB size
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('P'))));
+    let purge_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("PurgeRawModal should emit DataPurgeRaw");
+    h.app.storage_stats = None;
+    h.cmd_tx.send(purge_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.storage_stats
+            .as_ref()
+            .is_some_and(|s| s.raw_samples_count == 0)
+    })
+    .await;
+    let after_purge_stats = h.app.storage_stats.as_ref().unwrap().clone();
+    assert_eq!(after_purge_stats.sessions_count, 3);
+    assert!(
+        after_purge_stats.db_size_bytes < size_initial,
+        "Purge Raw should shrink DB size: initial={size_initial}, after_purge={}",
+        after_purge_stats.db_size_bytes
+    );
+
+    // 2. Soft Rebaseline ('B') + Undo ('U')
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('B'))));
+    let rebaseline_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("SoftRebaselineModal should emit CalibrationSetBoundary");
+    h.app.storage_stats = None;
+    h.cmd_tx.send(rebaseline_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_boundaries.len() == 1
+            && a.storage_stats
+                .as_ref()
+                .is_some_and(|s| s.active_calibration_boundary.is_some())
+    })
+    .await;
+    assert_eq!(h.app.calibration_maturity, CalibrationMaturity::ColdStart);
+
+    let undo_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Char('U'))))
+        .expect("Undo should emit CalibrationUndoBoundary");
+    h.app.storage_stats = None;
+    h.cmd_tx.send(undo_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_boundaries
+            .first()
+            .is_some_and(|b| b.reverted_at_ms.is_some())
+            && a.storage_stats
+                .as_ref()
+                .is_some_and(|s| s.active_calibration_boundary.is_none())
+    })
+    .await;
+
+    // 3. Repeated Hard Wipe ('W' + "WIPE") -> shrinks DB size on first wipe and stays constant
+    let size_before_wipe = h.app.storage_stats.as_ref().unwrap().db_size_bytes;
+    let mut wipe_sizes = Vec::with_capacity(3);
+    for _ in 0..3 {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('W'))));
+        for c in "WIPE".chars() {
+            h.app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+        }
+        let wipe_cmd = h
+            .app
+            .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+            .expect("HardWipeModal should emit DataHardWipe");
+        h.app.storage_stats = None;
+        h.cmd_tx.send(wipe_cmd).await.unwrap();
+        wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+            a.history_sessions.is_empty() && a.storage_stats.is_some()
+        })
+        .await;
+        wipe_sizes.push(h.app.storage_stats.as_ref().unwrap().db_size_bytes);
+    }
+
+    assert!(
+        wipe_sizes[0] < size_before_wipe,
+        "First WIPE should shrink DB size: before={size_before_wipe}, after_w1={}",
+        wipe_sizes[0]
+    );
+    assert_eq!(
+        wipe_sizes[1], wipe_sizes[0],
+        "Second WIPE must not grow DB size: {wipe_sizes:?}"
+    );
+    assert_eq!(
+        wipe_sizes[2], wipe_sizes[1],
+        "Third WIPE must not grow DB size: {wipe_sizes:?}"
+    );
 
     h.shutdown().await;
 }

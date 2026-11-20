@@ -107,7 +107,7 @@ enum DbCommand {
     HardWipe {
         wipe_all: bool,
         now_ms: i64,
-        reply: oneshot::Sender<Result<(), StorageError>>,
+        reply: oneshot::Sender<Result<CalibrationState, StorageError>>,
     },
     BackupSqlite {
         dest_path: PathBuf,
@@ -623,7 +623,11 @@ impl PersistenceHandle {
             .await
     }
 
-    pub async fn hard_wipe(&self, wipe_all: bool, now_ms: i64) -> Result<(), StorageError> {
+    pub async fn hard_wipe(
+        &self,
+        wipe_all: bool,
+        now_ms: i64,
+    ) -> Result<CalibrationState, StorageError> {
         self.call(|reply| DbCommand::HardWipe {
             wipe_all,
             now_ms,

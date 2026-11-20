@@ -16,6 +16,10 @@ Single-context layout (`GLOSSARY.md` and `docs/adr/` at the repo root). See `doc
 
 Testing conventions, concurrency pitfalls, and virtual-time execution. See `docs/agents/testing.md`.
 
+### Architecture
+
+Runtime actor ownership (`DaemonCore`, `MonitoringContext`, `GraceCoordinator`, `LedgerStore`) and cross-actor reset boundaries. See `docs/agents/architecture.md`.
+
 ## Verification
 
 Run iterative tests with `./scripts/test.sh <args>` (enforces 30 s timeout and hermetic D-Bus isolation); run `./scripts/check.sh` before finishing any change.

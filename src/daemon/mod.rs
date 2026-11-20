@@ -14,7 +14,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::actions::traits::{ActionExecutor, Notifier};
@@ -55,6 +55,10 @@ pub enum DaemonError {
 
 pub enum EngineControlEvent {
     GraceOutcome(GraceOutcome),
+    HardWipe {
+        wipe_all: bool,
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// Startup parameters for [`DaemonHandle::spawn`].
@@ -459,16 +463,45 @@ impl MonitoringContext {
     }
 
     async fn handle_control_event(&mut self, ctrl: EngineControlEvent) {
-        let Some(wearable_id) = self.active_wearable_id.clone() else {
-            return;
-        };
-        let outputs = match ctrl {
+        match ctrl {
             EngineControlEvent::GraceOutcome(gr) => {
+                let Some(wearable_id) = self.active_wearable_id.clone() else {
+                    return;
+                };
                 self.last_event_ts_ms = Some(gr.ts_ms);
-                self.engine.handle_event(EngineEvent::GraceOutcome(gr))
+                let outputs = self.engine.handle_event(EngineEvent::GraceOutcome(gr));
+                self.process_outputs(&wearable_id, outputs).await;
             }
-        };
-        self.process_outputs(&wearable_id, outputs).await;
+            EngineControlEvent::HardWipe { wipe_all, reply } => {
+                self.abort_active_session(wipe_all);
+                let _ = reply.send(());
+            }
+        }
+    }
+
+    fn abort_active_session(&mut self, wipe_all: bool) {
+        self.active_session_id = None;
+        self.epoch_seq = 0;
+        self.raw_seq = 0;
+        self.pending_raw.clear();
+        self.last_event_ts_ms = None;
+        if wipe_all {
+            self.wearable_cache.clear();
+            self.active_wearable_id = None;
+        }
+        let cal = self.core.calibration_state();
+        let floor = self
+            .active_wearable_id
+            .as_deref()
+            .map(|id| cal.wearable_floor(id))
+            .unwrap_or_default();
+        self.engine = SleepEngine::new(EngineConfig {
+            detection: self.detection_cfg.clone(),
+            priors: cal.to_priors(),
+            wearable_floor: floor,
+        });
+        self.core
+            .set_detector_phase(DetectorState::Idle, None, self.active_wearable_id.clone());
     }
 
     async fn flush_close_latest(&mut self, reason: SessionEndReason) {
@@ -502,6 +535,11 @@ impl MonitoringContext {
                             self.epoch_seq = 0;
                             self.raw_seq = 0;
                             self.pending_raw.clear();
+                            self.core.set_detector_phase(
+                                self.engine.state(),
+                                self.active_session_id.clone(),
+                                self.active_wearable_id.clone(),
+                            );
                         }
                         Err(err) => {
                             tracing::error!(error = %err, "failed to open monitoring session in SQLite");
