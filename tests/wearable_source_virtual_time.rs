@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use bpmute::bluetooth::packet::parse_hr_measurement;
 use bpmute::config::{CliOverrides, LoadedConfig};
@@ -97,6 +96,12 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
     let status_res = client.request("daemon.status", json!({})).await.unwrap();
     assert_eq!(status_res["daemon_running"], true);
 
+    let mut sub_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub_client
+        .request("daemon.subscribe", json!({}))
+        .await
+        .unwrap();
+
     // 2. Feed stream state: Connecting -> Acquiring -> Streaming
     feed_tx
         .send(WearableEvent::StreamState {
@@ -172,8 +177,13 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
         .await
         .unwrap();
 
-    // Give daemon monitoring loop a moment to ingest packets
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait until the daemon has opened the session and broadcast the final ingested HR packet
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "HrSample" && ev.data["ts_ms"].as_i64() == Some(t0 + 5500) {
+            break;
+        }
+    }
 
     // 4. Verify session list now has 1 open monitoring session
     let list_res = client
@@ -189,7 +199,7 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
     let session_id = sessions[0]["id"].as_str().unwrap().to_string();
     assert_eq!(sessions[0]["wearable_alias"].as_str(), Some("Test Strap"));
 
-    // 5. Feed StreamState Disconnected to end session
+    // 5. Feed StreamState Disconnected and close the stream source to flush/close the session
     feed_tx
         .send(WearableEvent::StreamState {
             wearable: wearable.clone(),
@@ -200,8 +210,14 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
         })
         .await
         .unwrap();
+    drop(feed_tx);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionClosed" {
+            break;
+        }
+    }
 
     // 6. Verify session stored in SQLite ledger directly with end_reason StreamEnded
     let db_path = db_path_in_data_dir(&paths.data_dir);

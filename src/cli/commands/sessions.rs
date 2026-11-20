@@ -10,7 +10,7 @@ use crate::cli::args::{CalibrationCommand, SessionsCommand};
 use crate::config::{LoadedConfig, PatchField};
 use crate::exit_code::ExitCode;
 use crate::logging::format_wearable_label;
-use crate::paths::ResolvedPaths;
+use crate::paths::{EnvSource, ResolvedPaths};
 use crate::replay::{
     ReplayFidelity, ReplayOptions, TraceFormat, replay_file, replay_stored_session,
 };
@@ -129,6 +129,7 @@ pub(crate) fn run_replay<WOut: Write, WErr: Write>(
 pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
     action: SessionsCommand,
     paths: &ResolvedPaths,
+    env: &dyn EnvSource,
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> ExitCode {
@@ -377,7 +378,7 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             }
         }
         SessionsCommand::Delete { id, yes } => {
-            match confirm_action(&format!("Delete session '{id}'?"), yes, stdout, stderr) {
+            match confirm_action(&format!("Delete session '{id}'?"), yes, env, stdout, stderr) {
                 Ok(true) => {}
                 Ok(false) => return ExitCode::Success,
                 Err(code) => return code,
@@ -501,6 +502,7 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
 pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
     action: CalibrationCommand,
     paths: &ResolvedPaths,
+    env: &dyn EnvSource,
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> ExitCode {
@@ -709,6 +711,7 @@ pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
             match confirm_action(
                 "Set calibration boundary and rebaseline personal physiology to Cold Start?",
                 yes,
+                env,
                 stdout,
                 stderr,
             ) {
@@ -765,6 +768,7 @@ pub(crate) async fn run_calibration<WOut: Write, WErr: Write>(
             match confirm_action(
                 "Undo the most recent calibration boundary?",
                 yes,
+                env,
                 stdout,
                 stderr,
             ) {

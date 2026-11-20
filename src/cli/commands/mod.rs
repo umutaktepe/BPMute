@@ -97,11 +97,13 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
             stdout,
             stderr,
         ),
-        Some(Command::Sessions { action }) => run_sessions(action, &paths, stdout, stderr).await,
-        Some(Command::Calibration { action }) => {
-            run_calibration(action, &paths, stdout, stderr).await
+        Some(Command::Sessions { action }) => {
+            run_sessions(action, &paths, env, stdout, stderr).await
         }
-        Some(Command::Data { action }) => run_data(action, &paths, stdout, stderr).await,
+        Some(Command::Calibration { action }) => {
+            run_calibration(action, &paths, env, stdout, stderr).await
+        }
+        Some(Command::Data { action }) => run_data(action, &paths, env, stdout, stderr).await,
         Some(Command::Wearables { action }) => run_wearables(action, &paths, stdout, stderr).await,
         Some(Command::Enroll { address, alias }) => {
             run_enroll(address.as_deref(), alias.as_deref(), &paths, stdout, stderr).await
@@ -598,23 +600,22 @@ pub(crate) fn report_ipc_error<WErr: Write>(err: IpcClientError, stderr: &mut WE
     }
 }
 
-fn is_interactive() -> bool {
+fn is_interactive(env: &dyn EnvSource) -> bool {
     use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
-        && std::env::var_os("BPMUTE_NON_INTERACTIVE").is_none()
-        && std::env::var_os("CARGO_MANIFEST_DIR").is_none()
+    std::io::stdin().is_terminal() && env.get("BPMUTE_NON_INTERACTIVE").is_none()
 }
 
 pub(crate) fn confirm_action<WOut: Write, WErr: Write>(
     prompt: &str,
     skip_confirmation: bool,
+    env: &dyn EnvSource,
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> Result<bool, ExitCode> {
     if skip_confirmation {
         return Ok(true);
     }
-    if !is_interactive() {
+    if !is_interactive(env) {
         let _ = writeln!(
             stderr,
             "error: interactive confirmation required (or use --yes)"
@@ -640,6 +641,7 @@ pub(crate) fn confirm_action<WOut: Write, WErr: Write>(
 pub(crate) fn confirm_wipe<WOut: Write, WErr: Write>(
     confirm_arg: Option<&str>,
     all: bool,
+    env: &dyn EnvSource,
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> Result<bool, ExitCode> {
@@ -651,7 +653,7 @@ pub(crate) fn confirm_wipe<WOut: Write, WErr: Write>(
             return Err(ExitCode::UsageOrConfigError);
         }
     }
-    if !is_interactive() {
+    if !is_interactive(env) {
         let _ = writeln!(
             stderr,
             "error: --confirm WIPE is required when invoked non-interactively"

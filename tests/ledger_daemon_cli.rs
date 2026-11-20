@@ -12,7 +12,7 @@ use bpmute::config::{CliOverrides, LoadedConfig, PatchField, PowerAction, Sensit
 use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock, WearableEvent, WearableSource};
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
-use bpmute::paths::{MapEnv, ResolvedPaths};
+use bpmute::paths::{EnvSource, MapEnv, ProcessEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
     CalibrationMaturity, ContactStatus, DetectorState, EngineEvent, Epoch, EpochFeatures,
     GraceOutcome, GraceResult, HrPacket, SessionEndReason, SessionSummary,
@@ -660,7 +660,7 @@ async fn run_inproc_cli(args: &[&str], env: &MapEnv) -> (ExitCode, String, Strin
 fn run_real_bin(temp: &TempDir, args: &[&str]) -> std::process::Output {
     ProcessCommand::new(env!("CARGO_BIN_EXE_bpmute"))
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", ProcessEnv.get("PATH").unwrap_or_default())
         .env("HOME", temp.path().join("home"))
         .env("XDG_CONFIG_HOME", temp.path().join("cfg"))
         .env("XDG_DATA_HOME", temp.path().join("data"))

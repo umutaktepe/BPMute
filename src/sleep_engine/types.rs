@@ -435,12 +435,19 @@ pub enum GraceAbortReason {
 /// Extracted 15-second `Epoch` feature vector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpochFeatures {
+    /// 60-second median filtered heart rate (bpm).
     pub hr_bpm_60s: f64,
+    /// Z-score of `hr_bpm_60s` relative to `Quiet-Wake Baseline` (dimensionless, sigma units).
     pub z_hr: f64,
+    /// 4-minute linear regression slope of filtered HR, already in bpm/min (not bpm/sec).
     pub hr_slope_4m: f64,
+    /// 120-second local MAD variance ratio relative to baseline sigma, floored per Wearable (dimensionless; not bpm²).
     pub r_var_120s: f64,
+    /// Natural log of 60-second RMSSD (`ln(ms)`), `None` in BPM-only mode or when HRV is invalid.
     pub ln_rmssd_60s: Option<f64>,
+    /// Delta of `ln_rmssd_60s` relative to `Quiet-Wake Baseline` `ln(RMSSD)` (`ln(ms)` delta).
     pub delta_ln_rmssd_60s: Option<f64>,
+    /// 120-second `RMSSD / SDNN` ratio (dimensionless), `None` when HRV is unavailable.
     pub rmssd_sdnn_120s: Option<f64>,
 }
 

@@ -18,4 +18,4 @@ Testing conventions, concurrency pitfalls, and virtual-time execution. See `docs
 
 ## Verification
 
-Wrap iterative test runs in `timeout 30` (or `./scripts/test.sh`); run `./scripts/check.sh` before finishing any change or closing an issue.
+Run iterative tests with `./scripts/test.sh <args>` (enforces 30 s timeout and hermetic D-Bus isolation); run `./scripts/check.sh` before finishing any change.

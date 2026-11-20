@@ -24,6 +24,10 @@ pub trait EnvSource: Send + Sync {
 pub struct ProcessEnv;
 
 impl EnvSource for ProcessEnv {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "ProcessEnv is the concrete EnvSource boundary"
+    )]
     fn get(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
     }

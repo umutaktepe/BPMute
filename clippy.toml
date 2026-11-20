@@ -6,5 +6,9 @@ await-holding-invalid-types = [
 
 disallowed-methods = [
   { path = "std::path::Path::exists", reason = "Path::exists() swallows EACCES into false (violating ADR-0009 exit code 5); use Path::try_exists() instead" },
+  { path = "std::env::var", reason = "Use injected EnvSource instead of process-global std::env::var (CODING_STANDARDS.md: Boundary trait preservation)" },
+  { path = "std::env::var_os", reason = "Use injected EnvSource instead of process-global std::env::var_os (CODING_STANDARDS.md: Boundary trait preservation)" },
+  { path = "std::env::vars", reason = "Use injected EnvSource instead of process-global std::env::vars (CODING_STANDARDS.md: Boundary trait preservation)" },
+  { path = "std::env::vars_os", reason = "Use injected EnvSource instead of process-global std::env::vars_os (CODING_STANDARDS.md: Boundary trait preservation)" },
 ]
 

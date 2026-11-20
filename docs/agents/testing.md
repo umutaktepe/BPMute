@@ -27,6 +27,12 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 - **Host D-Bus isolation**: Test processes must never connect to the developer's live system or session D-Bus. `./scripts/test.sh` and `./scripts/check.sh` enforce `DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null"` and `DBUS_SYSTEM_BUS_ADDRESS="unix:path=/dev/null"`. Any test requiring OS or notification interactions must use in-memory doubles (`FakeActionExecutor`, `FakeNotifier`).
 - **Daemon options in tests**: Use `DaemonOptions::for_testing(...)` rather than constructing raw struct literals. This defaults OS-touching handles (`action_executor`, `notifier`, `wearable_source`) safely to in-memory test doubles and insulates tests from future struct field additions.
 
+## TUI Rendering & Interactive IPC
+
+- **Populated-state rendering**: Assert `--ascii`, `NO_COLOR`, and `80×24` layout behavior on populated app state (enrolled wearables, live telemetry, alerts, tables/modals) rather than empty-state CTAs, which hide Unicode leaks and column clipping.
+- **ASCII progress bars**: `ratatui::widgets::Gauge` renders Unicode `'█'` even when `use_unicode(false)` is set; render explicit ASCII progress bars (`[#---]`) whenever `theme.ascii` is enabled.
+- **Non-blocking interactive IPC ops**: Operations that wait on follow-up requests over the same socket (such as `wearable.enroll_select` awaiting `wearable.enroll_auth_response`) must run as spawned tasks on the connection handler rather than blocking the socket read loop.
+
 ## Test Execution
 
-- **Timeout bounds**: Wrap iterative test runs in a timeout (`timeout 30 cargo test ...` or `./scripts/test.sh ...`). If a test hangs, an unbounded run will wait indefinitely.
+- **Canonical runner**: Run iterative test subsets with `./scripts/test.sh <args>` (enforces the `timeout 30` bound and hermetic `DBUS_*` isolation) so hung tests fail fast without touching host D-Bus.

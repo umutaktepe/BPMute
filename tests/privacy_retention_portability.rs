@@ -607,7 +607,8 @@ async fn test_data_purge_raw_and_hard_wipe_guardrails() {
     assert!(paths.config_file.try_exists().unwrap());
 
     // 2) Test wipe non-interactive confirmation failure: requires --confirm WIPE
-    let (code, _, err) = run_inproc_cli(&["bpmute", "data", "wipe"], &env).await;
+    let non_interactive_env = env.clone().with("BPMUTE_NON_INTERACTIVE", "1");
+    let (code, _, err) = run_inproc_cli(&["bpmute", "data", "wipe"], &non_interactive_env).await;
     assert_eq!(
         code,
         ExitCode::UsageOrConfigError,

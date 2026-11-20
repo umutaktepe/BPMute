@@ -28,6 +28,41 @@ if grep -Eq 'DaemonOptions\s*\{' tests/*.rs; then
   exit 1
 fi
 
+while IFS= read -r -d '' file; do
+  lines=$(wc -l < "$file")
+  limit=1000
+  case "$file" in
+    ./src/storage/store/mod.rs) limit=1294 ;;
+    ./src/sleep_engine/state_machine.rs) limit=1041 ;;
+  esac
+  if [ "$lines" -gt "$limit" ]; then
+    echo "error: $file has $lines lines (limit: $limit); split into sibling submodules" >&2
+    exit 1
+  fi
+done < <(find ./src -name '*.rs' -print0)
+
+if awk '
+  FNR == 1 { in_test = 0; paused = 0 }
+  /^[[:space:]]*#\[tokio::test/ {
+    in_test = 1
+    paused = ($0 ~ /start_paused[[:space:]]*=[[:space:]]*true/)
+  }
+  /^\}/ { in_test = 0; paused = 0 }
+  /tokio::time::pause\(\)/ { paused = 1 }
+  {
+    line = $0
+    sub(/\/\/.*/, "", line)
+    if (in_test && !paused && line ~ /tokio::time::sleep/) {
+      print FILENAME ":" FNR ":" $0
+      found = 1
+    }
+  }
+  END { exit !found }
+' tests/*.rs; then
+  echo "error: tokio::time::sleep inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
+  exit 1
+fi
+
 timeout 60 cargo test
 timeout 5 cargo test --test sleep_engine
 timeout 5 cargo test --test calibration_ledger

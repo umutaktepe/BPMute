@@ -10,7 +10,7 @@ use bpmute::config::{CliOverrides, LoadedConfig};
 use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
-use bpmute::paths::{MapEnv, ResolvedPaths};
+use bpmute::paths::{EnvSource, MapEnv, ProcessEnv, ResolvedPaths};
 use chrono::{Local, TimeZone, Timelike, Utc};
 use clap::Parser;
 use serde_json::Value;
@@ -50,7 +50,7 @@ fn bin_path() -> &'static str {
 fn base_cli_cmd(temp: &TempDir) -> Command {
     let mut cmd = Command::new(bin_path());
     cmd.env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", ProcessEnv.get("PATH").unwrap_or_default())
         .env("HOME", temp.path().join("home"))
         .env("XDG_CONFIG_HOME", temp.path().join("xdg-config"))
         .env("XDG_DATA_HOME", temp.path().join("xdg-data"))

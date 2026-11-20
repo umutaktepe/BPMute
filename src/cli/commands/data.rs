@@ -10,7 +10,7 @@ use crate::cli::commands::{
     write_json_line,
 };
 use crate::exit_code::ExitCode;
-use crate::paths::ResolvedPaths;
+use crate::paths::{EnvSource, ResolvedPaths};
 use crate::sleep_engine::CalibrationMaturity;
 use crate::storage::{
     ExportBundleOptions, ImportMode, LedgerStore, StorageStats, db_path_in_data_dir,
@@ -20,6 +20,7 @@ use crate::storage::{
 pub(crate) async fn run_data<WOut: Write, WErr: Write>(
     action: DataCommand,
     paths: &ResolvedPaths,
+    env: &dyn EnvSource,
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> ExitCode {
@@ -114,6 +115,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
             match confirm_action(
                 "Purge and zero-overwrite all raw biometric samples across closed sessions?",
                 yes,
+                env,
                 stdout,
                 stderr,
             ) {
@@ -163,7 +165,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
         }
 
         DataCommand::Wipe { all, confirm } => {
-            match confirm_wipe(confirm.as_deref(), all, stdout, stderr) {
+            match confirm_wipe(confirm.as_deref(), all, env, stdout, stderr) {
                 Ok(true) => {}
                 Ok(false) => return ExitCode::Success,
                 Err(code) => return code,
@@ -320,6 +322,7 @@ pub(crate) async fn run_data<WOut: Write, WErr: Write>(
                         abs_path.display()
                     ),
                     yes,
+                    env,
                     stdout,
                     stderr,
                 ) {

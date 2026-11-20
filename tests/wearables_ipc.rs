@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use bpmute::config::{CliOverrides, LoadedConfig};
 use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
@@ -122,9 +121,17 @@ async fn enrollment_single_owner_lock_and_client_disconnect_autocancel() {
         other => panic!("expected Server error with ENROLLMENT_IN_PROGRESS, got: {other:?}"),
     }
 
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", json!({})).await.unwrap();
+
     // Client 1 disconnects
     drop(client1);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "EnrollmentUpdate" && ev.data["remaining_sec"].as_u64() == Some(0) {
+            break;
+        }
+    }
 
     // Now Client 2 can acquire the enrollment lock (auto-cancelled on client 1 disconnect)
     let enroll2_res = client2
