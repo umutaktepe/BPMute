@@ -7,9 +7,9 @@ use super::app::{
 };
 use super::event::TuiCommand;
 use crate::calibration::FeedbackVerdict;
-use crate::storage::SessionStatus;
 
 mod modal;
+mod modal_actions;
 mod mouse;
 
 impl TuiApp {
@@ -31,7 +31,7 @@ impl TuiApp {
                 None
             }
             KeyCode::Char('?') => {
-                self.modal = ModalState::Help;
+                self.open_help_modal();
                 None
             }
             KeyCode::Char('1') => {
@@ -113,18 +113,8 @@ impl TuiApp {
     fn handle_tab_key(&mut self, key: KeyEvent) -> Option<TuiCommand> {
         match self.active_tab {
             Tab::Dashboard => match key.code {
-                KeyCode::Char('d') => {
-                    self.is_diagnostics_open = !self.is_diagnostics_open;
-                    if self.is_diagnostics_open && self.daemon_connected {
-                        Some(TuiCommand::RefreshStatus)
-                    } else {
-                        None
-                    }
-                }
-                KeyCode::Char('p') if self.daemon_connected => {
-                    self.modal = ModalState::PausePopover { selected_idx: 0 };
-                    None
-                }
+                KeyCode::Char('d') => self.toggle_diagnostics(),
+                KeyCode::Char('p') if self.daemon_connected => self.open_pause_popover(),
                 KeyCode::Char('e')
                     if self.daemon_connected && self.enrolled_wearables.is_empty() =>
                 {
@@ -156,138 +146,31 @@ impl TuiApp {
             },
             Tab::Wearables if self.daemon_connected => match key.code {
                 KeyCode::Char('e') => Some(self.open_enrollment_modal()),
-                KeyCode::Char('n') if !self.enrolled_wearables.is_empty() => {
-                    let w = &self.enrolled_wearables[self.selected_wearable_idx];
-                    let cur = w.wearable.alias.clone().unwrap_or_default();
-                    self.modal = ModalState::RenameModal {
-                        wearable_id: w.wearable.id.clone(),
-                        current_alias: cur.clone(),
-                        input: cur,
-                    };
-                    None
+                KeyCode::Char('n') if self.can_act_on_selected_wearable() => {
+                    self.open_rename_selected_wearable_modal()
                 }
-                KeyCode::Char('c') if !self.enrolled_wearables.is_empty() => {
-                    let id = self.enrolled_wearables[self.selected_wearable_idx]
-                        .wearable
-                        .id
-                        .clone();
-                    Some(TuiCommand::WearableConnect { id })
+                KeyCode::Char('c') if self.can_act_on_selected_wearable() => {
+                    self.reconnect_selected_wearable()
                 }
-                KeyCode::Char('u') if !self.enrolled_wearables.is_empty() => {
-                    let w = self.enrolled_wearables[self.selected_wearable_idx].clone();
-                    self.modal = ModalState::UnenrollModal {
-                        wearable: w,
-                        forget_bluez: false,
-                        delete_sessions: false,
-                        selected_button: UnenrollButton::Confirm,
-                    };
-                    None
+                KeyCode::Char('u') if self.can_act_on_selected_wearable() => {
+                    self.open_unenroll_selected_wearable_modal()
                 }
                 _ => None,
             },
-            Tab::History if self.daemon_connected => {
-                let s = self.history_sessions.get(self.selected_session_idx)?;
-                if s.status == SessionStatus::Active {
-                    return None;
-                }
-
-                match key.code {
-                    KeyCode::Char('f') => {
-                        let epochs_pruned = s.epochs_count == 0;
-                        let (v_idx, onset_str, hr_str) = if let Some(fb) = &s.feedback {
-                            let vi = match fb.verdict {
-                                None => 0,
-                                Some(FeedbackVerdict::FalsePositive) => 1,
-                                Some(FeedbackVerdict::MissedSleep) => 2,
-                                Some(FeedbackVerdict::AnomalousExclude) => 3,
-                            };
-                            let o = fb
-                                .manual_onset_ts_ms
-                                .and_then(|ts| {
-                                    chrono::Local
-                                        .timestamp_millis_opt(ts)
-                                        .single()
-                                        .map(|dt| dt.format("%H:%M").to_string())
-                                })
-                                .unwrap_or_default();
-                            let h = fb
-                                .manual_avg_sleep_hr
-                                .map(|v| format!("{v:.1}"))
-                                .unwrap_or_default();
-                            (vi, o, h)
-                        } else {
-                            (0, String::new(), String::new())
-                        };
-
-                        self.modal = ModalState::FeedbackModal {
-                            session_id: s.id.clone(),
-                            session_start_ts_ms: s.start_ts_ms,
-                            session_end_ts_ms: s.end_ts_ms,
-                            epochs_pruned,
-                            verdict_idx: v_idx,
-                            onset_hhmm_input: onset_str,
-                            avg_sleep_hr_input: hr_str,
-                            active_field: FeedbackModalField::Verdict,
-                            error_message: None,
-                        };
-                        None
-                    }
-                    KeyCode::Char('x') => {
-                        let default_path = if let Some(ref paths) = self.offline_paths {
-                            paths
-                                .data_dir
-                                .join("exports")
-                                .join(format!("session-{}.csv", s.id))
-                                .to_string_lossy()
-                                .to_string()
-                        } else {
-                            format!("session-{}.csv", s.id)
-                        };
-                        self.modal = ModalState::ExportTraceModal {
-                            session_id: s.id.clone(),
-                            format_idx: 0,
-                            destination_path: default_path,
-                            anonymize: true,
-                            active_field: ExportModalField::Submit,
-                            error_message: None,
-                        };
-                        None
-                    }
-                    KeyCode::Char('D') => {
-                        self.modal = ModalState::DeleteSessionModal {
-                            session_id: s.id.clone(),
-                            confirmed: true,
-                        };
-                        None
-                    }
-                    _ => None,
-                }
-            }
+            Tab::History if self.can_act_on_selected_session() => match key.code {
+                KeyCode::Char('f') => self.open_history_feedback_modal(),
+                KeyCode::Char('x') => self.open_history_export_modal(),
+                KeyCode::Char('D') => self.open_history_delete_modal(),
+                _ => None,
+            },
             Tab::Settings => match key.code {
                 KeyCode::Char('E') => Some(TuiCommand::EditorHandoff),
                 KeyCode::Char(' ') | KeyCode::Enter if self.daemon_connected => {
                     self.toggle_selected_setting()
                 }
-                KeyCode::Char('B') if self.daemon_connected => {
-                    self.modal = ModalState::SoftRebaselineModal {
-                        seed_sleep_hr_input: String::new(),
-                        reset_floors: false,
-                        active_field: SoftRebaselineField::SeedSleepHr,
-                        error_message: None,
-                    };
-                    None
-                }
-                KeyCode::Char('P') if self.daemon_connected => {
-                    self.modal = ModalState::PurgeRawModal { confirmed: true };
-                    None
-                }
-                KeyCode::Char('W') if self.daemon_connected => {
-                    self.modal = ModalState::HardWipeModal {
-                        typed_input: String::new(),
-                        error_message: None,
-                    };
-                    None
-                }
+                KeyCode::Char('B') if self.daemon_connected => self.open_soft_rebaseline_modal(),
+                KeyCode::Char('P') if self.daemon_connected => self.open_purge_raw_modal(),
+                KeyCode::Char('W') if self.daemon_connected => self.open_hard_wipe_modal(),
                 KeyCode::Char('U') if self.daemon_connected => {
                     Some(TuiCommand::CalibrationUndoBoundary)
                 }
@@ -295,6 +178,177 @@ impl TuiApp {
             },
             _ => None,
         }
+    }
+
+    pub(super) fn toggle_diagnostics(&mut self) -> Option<TuiCommand> {
+        self.is_diagnostics_open = !self.is_diagnostics_open;
+        if self.is_diagnostics_open && self.daemon_connected {
+            Some(TuiCommand::RefreshStatus)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn open_pause_popover(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        self.modal = ModalState::PausePopover { selected_idx: 0 };
+        None
+    }
+
+    pub(super) fn open_rename_selected_wearable_modal(&mut self) -> Option<TuiCommand> {
+        if !self.can_act_on_selected_wearable() {
+            return None;
+        }
+        let w = &self.enrolled_wearables[self.selected_wearable_idx];
+        let cur = w.wearable.alias.clone().unwrap_or_default();
+        self.modal = ModalState::RenameModal {
+            wearable_id: w.wearable.id.clone(),
+            current_alias: cur.clone(),
+            input: cur,
+        };
+        None
+    }
+
+    pub(super) fn reconnect_selected_wearable(&self) -> Option<TuiCommand> {
+        if !self.can_act_on_selected_wearable() {
+            return None;
+        }
+        let id = self.enrolled_wearables[self.selected_wearable_idx]
+            .wearable
+            .id
+            .clone();
+        Some(TuiCommand::WearableConnect { id })
+    }
+
+    pub(super) fn open_unenroll_selected_wearable_modal(&mut self) -> Option<TuiCommand> {
+        if !self.can_act_on_selected_wearable() {
+            return None;
+        }
+        let w = self.enrolled_wearables[self.selected_wearable_idx].clone();
+        self.modal = ModalState::UnenrollModal {
+            wearable: w,
+            forget_bluez: false,
+            delete_sessions: false,
+            selected_button: UnenrollButton::Confirm,
+        };
+        None
+    }
+
+    pub(super) fn open_history_feedback_modal(&mut self) -> Option<TuiCommand> {
+        if !self.can_act_on_selected_session() {
+            return None;
+        }
+        let s = self.history_sessions.get(self.selected_session_idx)?;
+        let epochs_pruned = s.epochs_count == 0;
+        let (v_idx, onset_str, hr_str) = if let Some(fb) = &s.feedback {
+            let vi = match fb.verdict {
+                None => 0,
+                Some(FeedbackVerdict::FalsePositive) => 1,
+                Some(FeedbackVerdict::MissedSleep) => 2,
+                Some(FeedbackVerdict::AnomalousExclude) => 3,
+            };
+            let o = fb
+                .manual_onset_ts_ms
+                .and_then(|ts| {
+                    chrono::Local
+                        .timestamp_millis_opt(ts)
+                        .single()
+                        .map(|dt| dt.format("%H:%M").to_string())
+                })
+                .unwrap_or_default();
+            let h = fb
+                .manual_avg_sleep_hr
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_default();
+            (vi, o, h)
+        } else {
+            (0, String::new(), String::new())
+        };
+
+        self.modal = ModalState::FeedbackModal {
+            session_id: s.id.clone(),
+            session_start_ts_ms: s.start_ts_ms,
+            session_end_ts_ms: s.end_ts_ms,
+            epochs_pruned,
+            verdict_idx: v_idx,
+            onset_hhmm_input: onset_str,
+            avg_sleep_hr_input: hr_str,
+            active_field: FeedbackModalField::Verdict,
+            error_message: None,
+        };
+        None
+    }
+
+    pub(super) fn open_history_export_modal(&mut self) -> Option<TuiCommand> {
+        if !self.can_act_on_selected_session() {
+            return None;
+        }
+        let s = self.history_sessions.get(self.selected_session_idx)?;
+        let default_path = if let Some(ref paths) = self.offline_paths {
+            paths
+                .data_dir
+                .join("exports")
+                .join(format!("session-{}.csv", s.id))
+                .to_string_lossy()
+                .to_string()
+        } else {
+            format!("session-{}.csv", s.id)
+        };
+        self.modal = ModalState::ExportTraceModal {
+            session_id: s.id.clone(),
+            format_idx: 0,
+            destination_path: default_path,
+            anonymize: true,
+            active_field: ExportModalField::Submit,
+            error_message: None,
+        };
+        None
+    }
+
+    pub(super) fn open_history_delete_modal(&mut self) -> Option<TuiCommand> {
+        if !self.can_act_on_selected_session() {
+            return None;
+        }
+        let s = self.history_sessions.get(self.selected_session_idx)?;
+        self.modal = ModalState::DeleteSessionModal {
+            session_id: s.id.clone(),
+            confirmed: true,
+        };
+        None
+    }
+
+    pub(super) fn open_soft_rebaseline_modal(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        self.modal = ModalState::SoftRebaselineModal {
+            seed_sleep_hr_input: String::new(),
+            reset_floors: false,
+            active_field: SoftRebaselineField::SeedSleepHr,
+            error_message: None,
+        };
+        None
+    }
+
+    pub(super) fn open_purge_raw_modal(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        self.modal = ModalState::PurgeRawModal { confirmed: true };
+        None
+    }
+
+    pub(super) fn open_hard_wipe_modal(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        self.modal = ModalState::HardWipeModal {
+            typed_input: String::new(),
+            error_message: None,
+        };
+        None
     }
 
     fn toggle_selected_setting(&mut self) -> Option<TuiCommand> {

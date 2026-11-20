@@ -51,22 +51,33 @@ fn buffer_to_string(buf: &Buffer) -> String {
     out
 }
 
+fn find_text_coords_in_row(buf: &Buffer, row: u16, needle: &str) -> Option<(u16, u16)> {
+    if row >= buf.area.height {
+        return None;
+    }
+    let mut row_str = String::new();
+    let mut col_starts = Vec::new();
+    for x in 0..buf.area.width {
+        let sym = buf[(x, row)].symbol();
+        col_starts.push((row_str.len(), x));
+        row_str.push_str(sym);
+    }
+    let byte_idx = row_str.find(needle)?;
+    let &(_, col) = col_starts.iter().find(|&&(b, _)| b == byte_idx)?;
+    Some((col, row))
+}
+
 fn find_text_coords(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
     for y in 0..buf.area.height {
-        let mut row_str = String::new();
-        let mut col_starts = Vec::new();
-        for x in 0..buf.area.width {
-            let sym = buf[(x, y)].symbol();
-            col_starts.push((row_str.len(), x));
-            row_str.push_str(sym);
-        }
-        if let Some(byte_idx) = row_str.find(needle)
-            && let Some(&(_, col)) = col_starts.iter().find(|&&(b, _)| b == byte_idx)
-        {
-            return Some((col, y));
+        if let Some(coords) = find_text_coords_in_row(buf, y, needle) {
+            return Some(coords);
         }
     }
     None
+}
+
+fn find_footer_coords(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
+    find_text_coords_in_row(buf, buf.area.height.saturating_sub(1), needle)
 }
 
 fn mouse_left_click(col: u16, row: u16) -> TuiEvent {
@@ -2330,4 +2341,1063 @@ async fn test_real_socket_wearable_stream_status_and_disconnect_updates_live_tui
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;
     daemon.shutdown().await;
+}
+
+#[test]
+fn test_mouse_footer_tab_actions_and_navigation_hint_ignores() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_config = Some(bpmute::config::Config::default());
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:01",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        None,
+    )];
+    app.grace_state = Some(GraceState {
+        session_id: "s-1".into(),
+        remaining_sec: 40,
+        total_sec: 60,
+        planned_actions: vec!["Pause Media".into()],
+        dry_run: false,
+    });
+    app.alerts = vec![DaemonAlert {
+        id: alert_ids::PERSISTENT_SHIFT.into(),
+        kind: "calibration".into(),
+        severity: AlertSeverity::Info,
+        message: "Persistent baseline shift detected".into(),
+        dismissible: true,
+    }];
+    app.history_sessions = vec![SessionListEntry {
+        id: "hist-1".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:01".into(),
+        status: SessionStatus::Closed,
+        start_ts_ms: 1_700_000_000_000,
+        end_ts_ms: 1_700_003_600_000,
+        end_reason: Some(SessionEndReason::StreamEnded),
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(72.0),
+        sleep_mu_hr: Some(58.0),
+        onset_confirmed_ts_ms: Some(1_700_001_200_000),
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 10,
+        raw_samples_count: 100,
+        feedback: None,
+    }];
+    app.storage_stats = Some(bpmute::storage::StorageStats {
+        db_size_bytes: 1024,
+        db_size_formatted: "1.0 KB".into(),
+        sessions_count: 1,
+        session_epochs_count: 10,
+        raw_samples_count: 100,
+        session_feedback_count: 0,
+        calibration_boundaries_count: 1,
+        wearables_count: 1,
+        session_epochs_retention: "90d".into(),
+        raw_samples_retention: "7d".into(),
+        calibration_maturity: CalibrationMaturity::Calibrated,
+        active_calibration_boundary: Some(CalibrationBoundaryRecord {
+            id: "bnd-1".into(),
+            effective_ts_ms: 1_700_000_000_000,
+            created_at_ms: 1_700_000_000_000,
+            reason: BoundaryReason::ManualRebaseline,
+            seed_sleep_hr: Some(55.0),
+            reset_floors: false,
+            reverted_at_ms: None,
+        }),
+    });
+
+    // Use 140x24 so full footer lines fit without right-edge clipping
+    let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+    // 1. Dashboard footer
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    // Pure navigation hint [1-4] Tabs must ignore clicks
+    let (tabs_col, tabs_row) = find_footer_coords(buf, "[1-4] Tabs").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(tabs_col + 1, tabs_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    assert_eq!(app.modal, ModalState::None);
+
+    // [d] Diagnostics toggles diagnostics pane and requests refresh when opening
+    let (diag_col, diag_row) = find_footer_coords(buf, "[d] Diagnostics").unwrap();
+    assert!(!app.is_diagnostics_open);
+    assert_eq!(
+        app.handle_event(mouse_left_click(diag_col + 1, diag_row)),
+        Some(TuiCommand::RefreshStatus)
+    );
+    assert!(app.is_diagnostics_open);
+    assert_eq!(
+        app.handle_event(mouse_left_click(diag_col + 1, diag_row)),
+        None
+    );
+    assert!(!app.is_diagnostics_open);
+
+    // [c] Cancel, [s] Snooze, [a] Accept Shift, [i] Ignore Shift
+    let (cancel_col, cancel_row) = find_footer_coords(buf, "[c] Cancel").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(cancel_col + 1, cancel_row)),
+        Some(TuiCommand::CancelGrace)
+    );
+    let (snooze_col, snooze_row) = find_footer_coords(buf, "[s] Snooze").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(snooze_col + 1, snooze_row)),
+        Some(TuiCommand::SnoozeGrace(None))
+    );
+    let (accept_col, accept_row) = find_footer_coords(buf, "[a] Accept Shift").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(accept_col + 1, accept_row)),
+        Some(TuiCommand::AcceptShift)
+    );
+    let (ignore_col, ignore_row) = find_footer_coords(buf, "[i] Ignore Shift").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(ignore_col + 1, ignore_row)),
+        Some(TuiCommand::DismissShift)
+    );
+
+    // [p] Pause opens PausePopover; clicking gap between [d] Diagnostics and [p] Pause does nothing
+    let (pause_col, pause_row) = find_footer_coords(buf, "[p] Pause").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(pause_col - 1, pause_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(mouse_left_click(pause_col + 1, pause_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::PausePopover { .. }));
+    app.modal = ModalState::None;
+
+    // 2. Wearables footer
+    app.active_tab = Tab::Wearables;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    let (conn_col, conn_row) = find_footer_coords(buf, "[c] Reconnect").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(conn_col + 1, conn_row)),
+        Some(TuiCommand::WearableConnect { id: "w-1".into() })
+    );
+    let (rename_col, rename_row) = find_footer_coords(buf, "[n] Rename").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(rename_col + 1, rename_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::RenameModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (unenroll_col, unenroll_row) =
+        find_footer_coords(terminal.backend().buffer(), "[u] Unenroll").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(unenroll_col + 1, unenroll_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::UnenrollModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (enroll_col, enroll_row) =
+        find_footer_coords(terminal.backend().buffer(), "[e] Enroll").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(enroll_col + 1, enroll_row)),
+        Some(TuiCommand::EnrollStart(Some(30)))
+    );
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+    app.modal = ModalState::None;
+
+    // 3. History footer
+    app.active_tab = Tab::History;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    let (jk_col, jk_row) = find_footer_coords(buf, "[j/k] Navigate").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(jk_col + 1, jk_row)), None);
+    assert_eq!(app.modal, ModalState::None);
+
+    let (fb_col, fb_row) = find_footer_coords(buf, "[f] Feedback").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(fb_col + 1, fb_row)), None);
+    assert!(matches!(app.modal, ModalState::FeedbackModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (exp_col, exp_row) = find_footer_coords(terminal.backend().buffer(), "[x] Export").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(exp_col + 1, exp_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::ExportTraceModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (del_col, del_row) = find_footer_coords(terminal.backend().buffer(), "[D] Delete").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(del_col + 1, del_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::DeleteSessionModal { .. }));
+    app.modal = ModalState::None;
+
+    // 4. Settings footer
+    app.active_tab = Tab::Settings;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    let (s_jk_col, s_jk_row) = find_footer_coords(buf, "[j/k] Navigate").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(s_jk_col + 1, s_jk_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // [Space] Toggle cycles currently selected preference (index 0 = Sensitivity: Balanced -> Responsive)
+    let (space_col, space_row) = find_footer_coords(buf, "[Space] Toggle").unwrap();
+    let toggle_cmd = app.handle_event(mouse_left_click(space_col + 1, space_row));
+    assert!(matches!(
+        toggle_cmd,
+        Some(TuiCommand::ConfigUpdate(bpmute::config::ConfigPatch {
+            detection: Some(bpmute::config::DetectionPatch {
+                sensitivity: Some(bpmute::config::Sensitivity::Responsive),
+                ..
+            }),
+            ..
+        }))
+    ));
+
+    let (ed_col, ed_row) = find_footer_coords(buf, "[E] Editor").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(ed_col + 1, ed_row)),
+        Some(TuiCommand::EditorHandoff)
+    );
+
+    let (undo_col, undo_row) = find_footer_coords(buf, "[U] Undo Boundary").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(undo_col + 1, undo_row)),
+        Some(TuiCommand::CalibrationUndoBoundary)
+    );
+
+    let (rebase_col, rebase_row) = find_footer_coords(buf, "[B] Rebase").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(rebase_col + 1, rebase_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (purge_col, purge_row) =
+        find_footer_coords(terminal.backend().buffer(), "[P] Purge").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(purge_col + 1, purge_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::PurgeRawModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (wipe_col, wipe_row) = find_footer_coords(terminal.backend().buffer(), "[W] Wipe").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(wipe_col + 1, wipe_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::HardWipeModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 5. Global [?] Help and [q] Quit
+    let (help_col, help_row) = find_footer_coords(terminal.backend().buffer(), "[?] Help").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(help_col + 1, help_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::Help);
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (quit_col, quit_row) = find_footer_coords(terminal.backend().buffer(), "[q] Quit").unwrap();
+    assert!(!app.should_quit);
+    assert_eq!(
+        app.handle_event(mouse_left_click(quit_col + 1, quit_row)),
+        None
+    );
+    assert!(app.should_quit);
+}
+
+#[test]
+fn test_mouse_footer_disabled_and_muted_guards() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_config = Some(bpmute::config::Config::default());
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:01",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        None,
+    )];
+    let active_session = SessionListEntry {
+        id: "hist-active".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:01".into(),
+        status: SessionStatus::Active,
+        start_ts_ms: 1_700_000_000_000,
+        end_ts_ms: 1_700_000_600_000,
+        end_reason: None,
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(72.0),
+        sleep_mu_hr: None,
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 5,
+        raw_samples_count: 100,
+        feedback: None,
+    };
+    app.history_sessions = vec![active_session];
+    app.storage_stats = Some(bpmute::storage::StorageStats {
+        db_size_bytes: 1024,
+        db_size_formatted: "1.0 KB".into(),
+        sessions_count: 1,
+        session_epochs_count: 5,
+        raw_samples_count: 100,
+        session_feedback_count: 0,
+        calibration_boundaries_count: 1,
+        wearables_count: 1,
+        session_epochs_retention: "90d".into(),
+        raw_samples_retention: "7d".into(),
+        calibration_maturity: CalibrationMaturity::Calibrated,
+        active_calibration_boundary: Some(CalibrationBoundaryRecord {
+            id: "bnd-1".into(),
+            effective_ts_ms: 1_700_000_000_000,
+            created_at_ms: 1_700_000_000_000,
+            reason: BoundaryReason::ManualRebaseline,
+            seed_sleep_hr: Some(55.0),
+            reset_floors: false,
+            reverted_at_ms: None,
+        }),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+
+    // 1. Active Monitoring Session in History: [f], [x], [D] must be muted and ignore clicks
+    app.active_tab = Tab::History;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for label in ["[f] Feedback", "[x] Export", "[D] Delete"] {
+        let (col, row) = find_footer_coords(terminal.backend().buffer(), label).unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(col, row)].fg,
+            Color::DarkGray,
+            "{label} must render muted when selected session is Active"
+        );
+        assert_eq!(app.handle_event(mouse_left_click(col + 1, row)), None);
+        assert_eq!(app.modal, ModalState::None);
+    }
+
+    // 2. Settings: remove active Calibration Boundary -> [U] disappears and stale coords ignore clicks
+    app.active_tab = Tab::Settings;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (undo_col, undo_row) =
+        find_footer_coords(terminal.backend().buffer(), "[U] Undo Boundary").unwrap();
+    app.storage_stats
+        .as_mut()
+        .unwrap()
+        .active_calibration_boundary = None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_footer_coords(terminal.backend().buffer(), "[U] Undo Boundary").is_none());
+    // Because [U] disappeared, [?] Help shifted into [U]'s former columns (proving dynamic HitMap alignment)
+    assert_ne!(
+        app.handle_event(mouse_left_click(undo_col + 1, undo_row)),
+        Some(TuiCommand::CalibrationUndoBoundary)
+    );
+    app.modal = ModalState::None;
+
+    // 3. Wearables with empty enrolled list: [n], [c], [u] are muted and ignore clicks
+    app.active_tab = Tab::Wearables;
+    app.enrolled_wearables.clear();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for label in ["[n] Rename", "[c] Reconnect", "[u] Unenroll"] {
+        let (col, row) = find_footer_coords(terminal.backend().buffer(), label).unwrap();
+        assert_eq!(terminal.backend().buffer()[(col, row)].fg, Color::DarkGray);
+        assert_eq!(app.handle_event(mouse_left_click(col + 1, row)), None);
+        assert_eq!(app.modal, ModalState::None);
+    }
+
+    // 4. Daemon offline: mutating footer actions across tabs are muted and ignore clicks,
+    // while local actions ([d] Diagnostics, [E] Editor, [?] Help, [q] Quit) still work.
+    app.daemon_connected = false;
+
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (pause_col, pause_row) =
+        find_footer_coords(terminal.backend().buffer(), "[p] Pause").unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(pause_col, pause_row)].fg,
+        Color::DarkGray
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(pause_col + 1, pause_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    let (diag_col, diag_row) =
+        find_footer_coords(terminal.backend().buffer(), "[d] Diagnostics").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(diag_col + 1, diag_row)),
+        None
+    );
+    assert!(app.is_diagnostics_open);
+
+    app.active_tab = Tab::Wearables;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (enroll_col, enroll_row) =
+        find_footer_coords(terminal.backend().buffer(), "[e] Enroll").unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(enroll_col, enroll_row)].fg,
+        Color::DarkGray
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(enroll_col + 1, enroll_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    app.active_tab = Tab::Settings;
+    app.storage_stats
+        .as_mut()
+        .unwrap()
+        .active_calibration_boundary = Some(CalibrationBoundaryRecord {
+        id: "bnd-1".into(),
+        effective_ts_ms: 1_700_000_000_000,
+        created_at_ms: 1_700_000_000_000,
+        reason: BoundaryReason::ManualRebaseline,
+        seed_sleep_hr: Some(55.0),
+        reset_floors: false,
+        reverted_at_ms: None,
+    });
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for label in [
+        "[Space] Toggle",
+        "[B] Rebase",
+        "[P] Purge",
+        "[W] Wipe",
+        "[U] Undo Boundary",
+    ] {
+        let (col, row) = find_footer_coords(terminal.backend().buffer(), label).unwrap();
+        assert_eq!(terminal.backend().buffer()[(col, row)].fg, Color::DarkGray);
+        assert_eq!(app.handle_event(mouse_left_click(col + 1, row)), None);
+        assert_eq!(app.modal, ModalState::None);
+    }
+    let (ed_col, ed_row) = find_footer_coords(terminal.backend().buffer(), "[E] Editor").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(ed_col + 1, ed_row)),
+        Some(TuiCommand::EditorHandoff)
+    );
+}
+
+#[test]
+fn test_mouse_modal_footer_actions_and_orientation_hint_ignores() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.discovered_wearables = vec![DiscoveredWearable {
+        address: "AA:BB:CC:DD:EE:01".into(),
+        address_type: "public".into(),
+        name: Some("Polar H10".into()),
+        rssi: Some(-55),
+        paired: false,
+        already_enrolled: false,
+        uuids: vec![],
+    }];
+    let sample_wearable = make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:01",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        None,
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+
+    // 1. Help modal footer: [Esc/?] Close Help and [q] Quit
+    app.modal = ModalState::Help;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (close_col, close_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Esc/?] Close Help").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(close_col + 1, close_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    app.modal = ModalState::Help;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (quit_col, quit_row) = find_footer_coords(terminal.backend().buffer(), "[q] Quit").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(quit_col + 1, quit_row)),
+        None
+    );
+    assert!(app.should_quit);
+    app.should_quit = false;
+
+    // 2. PausePopover footer
+    app.modal = ModalState::PausePopover { selected_idx: 2 };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (sel_col, sel_row) =
+        find_footer_coords(terminal.backend().buffer(), "[1-5/j/k] Select").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(sel_col + 1, sel_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::PausePopover { .. }));
+
+    let (enter_col, enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Confirm").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(enter_col + 1, enter_row)),
+        Some(TuiCommand::Pause(PauseParams {
+            mode: Some(PauseMode::Duration),
+            duration_sec: Some(3600),
+        }))
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    app.modal = ModalState::PausePopover { selected_idx: 0 };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (esc_col, esc_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(esc_col + 1, esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 3. EnrollmentModal footer: navigation hint ignored, [r] Rescan, [Enter] Enroll, [Esc] Cancel
+    app.active_tab = Tab::Wearables;
+    app.modal = ModalState::EnrollmentModal {
+        scanning_remaining_ms: 5_000,
+        selected_discovered_idx: 0,
+        alias_input: "Sleep Strap".into(),
+        alias_focused: false,
+        enrolling: false,
+        error_message: Some("old err".into()),
+        pairing_prompt: None,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (nav_col, nav_row) =
+        find_footer_coords(terminal.backend().buffer(), "[j/k/↑/↓] Select Wearable").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(nav_col + 1, nav_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+
+    let (rescan_col, rescan_row) =
+        find_footer_coords(terminal.backend().buffer(), "[r] Rescan").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(rescan_col + 1, rescan_row)),
+        Some(TuiCommand::EnrollStart(Some(30)))
+    );
+    if let ModalState::EnrollmentModal {
+        scanning_remaining_ms,
+        ref error_message,
+        ..
+    } = app.modal
+    {
+        assert_eq!(scanning_remaining_ms, 30_000);
+        assert_eq!(*error_message, None);
+    } else {
+        panic!("EnrollmentModal should stay open on rescan");
+    }
+
+    let (enroll_col, enroll_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Enroll").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(enroll_col + 1, enroll_row)),
+        Some(TuiCommand::EnrollSelect {
+            address: "AA:BB:CC:DD:EE:01".into(),
+            alias: Some("Sleep Strap".into()),
+        })
+    );
+
+    let (e_esc_col, e_esc_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(e_esc_col + 1, e_esc_row)),
+        Some(TuiCommand::EnrollCancel)
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 4. RenameModal footer
+    app.modal = ModalState::RenameModal {
+        wearable_id: "w-1".into(),
+        current_alias: "Old".into(),
+        input: "New Name".into(),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (save_col, save_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Save Alias").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(save_col + 1, save_row)),
+        Some(TuiCommand::WearableRename {
+            id: "w-1".into(),
+            alias: Some("New Name".into()),
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    app.modal = ModalState::RenameModal {
+        wearable_id: "w-1".into(),
+        current_alias: "Old".into(),
+        input: "New Name".into(),
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (r_esc_col, r_esc_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(r_esc_col + 1, r_esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 5. UnenrollModal footer
+    app.modal = ModalState::UnenrollModal {
+        wearable: sample_wearable.clone(),
+        forget_bluez: true,
+        delete_sessions: false,
+        selected_button: UnenrollButton::Confirm,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for hint in ["[1/2/Space] Toggle", "[Tab/←/→] Button"] {
+        let (h_col, h_row) = find_footer_coords(terminal.backend().buffer(), hint).unwrap();
+        assert_eq!(app.handle_event(mouse_left_click(h_col + 1, h_row)), None);
+        assert!(matches!(app.modal, ModalState::UnenrollModal { .. }));
+    }
+    let (u_enter_col, u_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Confirm").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(u_enter_col + 1, u_enter_row)),
+        Some(TuiCommand::WearableUnenroll {
+            id: "w-1".into(),
+            forget_bluez: true,
+            delete_sessions: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    app.modal = ModalState::UnenrollModal {
+        wearable: sample_wearable,
+        forget_bluez: false,
+        delete_sessions: false,
+        selected_button: UnenrollButton::Confirm,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (u_esc_col, u_esc_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(u_esc_col + 1, u_esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 6. FeedbackModal footer
+    app.active_tab = Tab::History;
+    app.modal = ModalState::FeedbackModal {
+        session_id: "s-1".into(),
+        session_start_ts_ms: 1_700_000_000_000,
+        session_end_ts_ms: 1_700_003_600_000,
+        epochs_pruned: false,
+        verdict_idx: 1,
+        onset_hhmm_input: String::new(),
+        avg_sleep_hr_input: "56.0".into(),
+        active_field: bpmute::tui::app::FeedbackModalField::Verdict,
+        error_message: None,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for hint in ["[Tab] Field", "[←/→/Space] Option"] {
+        let (h_col, h_row) = find_footer_coords(terminal.backend().buffer(), hint).unwrap();
+        assert_eq!(app.handle_event(mouse_left_click(h_col + 1, h_row)), None);
+        assert!(matches!(app.modal, ModalState::FeedbackModal { .. }));
+    }
+    let (f_enter_col, f_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Submit").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(f_enter_col + 1, f_enter_row)),
+        Some(TuiCommand::SessionSetFeedback {
+            session_id: "s-1".into(),
+            verdict: Some(FeedbackVerdict::FalsePositive),
+            onset_hhmm: None,
+            avg_sleep_hr: Some(56.0),
+            clear: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 7. ExportTraceModal footer
+    app.modal = ModalState::ExportTraceModal {
+        session_id: "s-1".into(),
+        format_idx: 0,
+        destination_path: "/tmp/out.csv".into(),
+        anonymize: true,
+        active_field: bpmute::tui::app::ExportModalField::Submit,
+        error_message: None,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for hint in ["[Tab] Field", "[←/→/Space] Toggle"] {
+        let (h_col, h_row) = find_footer_coords(terminal.backend().buffer(), hint).unwrap();
+        assert_eq!(app.handle_event(mouse_left_click(h_col + 1, h_row)), None);
+        assert!(matches!(app.modal, ModalState::ExportTraceModal { .. }));
+    }
+    let (x_enter_col, x_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Export").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(x_enter_col + 1, x_enter_row)),
+        Some(TuiCommand::SessionExportTrace {
+            id: "s-1".into(),
+            path: "/tmp/out.csv".into(),
+            format: bpmute::replay::TraceFormat::Csv,
+            no_anonymize: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 8. DeleteSessionModal footer
+    app.modal = ModalState::DeleteSessionModal {
+        session_id: "s-1".into(),
+        confirmed: true,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (d_hint_col, d_hint_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Tab/←/→] Button").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(d_hint_col + 1, d_hint_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::DeleteSessionModal { .. }));
+    let (d_enter_col, d_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Confirm Delete").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(d_enter_col + 1, d_enter_row)),
+        Some(TuiCommand::SessionDelete { id: "s-1".into() })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 9. SoftRebaselineModal footer
+    app.active_tab = Tab::Settings;
+    app.modal = ModalState::SoftRebaselineModal {
+        seed_sleep_hr_input: "54.5".into(),
+        reset_floors: true,
+        active_field: bpmute::tui::app::SoftRebaselineField::SeedSleepHr,
+        error_message: None,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    for hint in ["[Tab] Field", "[Space] Toggle"] {
+        let (h_col, h_row) = find_footer_coords(terminal.backend().buffer(), hint).unwrap();
+        assert_eq!(app.handle_event(mouse_left_click(h_col + 1, h_row)), None);
+        assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+    }
+    let (b_enter_col, b_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Submit").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(b_enter_col + 1, b_enter_row)),
+        Some(TuiCommand::CalibrationSetBoundary {
+            effective_ts_ms: None,
+            seed_sleep_hr: Some(54.5),
+            reset_floors: true,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 10. PurgeRawModal footer
+    app.modal = ModalState::PurgeRawModal { confirmed: true };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (p_enter_col, p_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Confirm Purge").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(p_enter_col + 1, p_enter_row)),
+        Some(TuiCommand::DataPurgeRaw)
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 11. HardWipeModal footer (validation error then valid WIPE, plus Esc cancel)
+    app.modal = ModalState::HardWipeModal {
+        typed_input: "nope".into(),
+        error_message: None,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (w_enter_col, w_enter_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Confirm Wipe").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(w_enter_col + 1, w_enter_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::HardWipeModal {
+            error_message: Some(_),
+            ..
+        }
+    ));
+
+    if let ModalState::HardWipeModal {
+        ref mut typed_input,
+        ..
+    } = app.modal
+    {
+        *typed_input = "WIPE".into();
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(w_enter_col + 1, w_enter_row)),
+        Some(TuiCommand::DataHardWipe {
+            confirm: "WIPE".into(),
+            wipe_all: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    app.modal = ModalState::HardWipeModal {
+        typed_input: String::new(),
+        error_message: None,
+    };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (w_esc_col, w_esc_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(w_esc_col + 1, w_esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_mouse_help_modal_scrolling_and_backdrop_dismissal() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Wearables;
+    app.enrolled_wearables = vec![
+        make_wearable(
+            "w-1",
+            "AA:BB:CC:11:22:01",
+            Some("Strap 1"),
+            StreamStatus::Streaming,
+            Some(90),
+            None,
+        ),
+        make_wearable(
+            "w-2",
+            "AA:BB:CC:11:22:02",
+            Some("Strap 2"),
+            StreamStatus::Disconnected,
+            Some(70),
+            None,
+        ),
+    ];
+
+    // Open Help at minimum 60x18 viewport
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('?'))));
+    assert_eq!(app.modal, ModalState::Help);
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 18)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let initial_out = buffer_to_string(terminal.backend().buffer());
+    assert!(initial_out.contains("Global Navigation:"));
+    assert!(
+        !initial_out.contains("Mouse: Click tabs/buttons/rows or scroll with mouse wheel."),
+        "Bottom Help line overflows 60x18 viewport before scrolling"
+    );
+
+    // ScrollUp at top clamps cleanly at 0
+    let (title_col, title_row) = find_text_coords(
+        terminal.backend().buffer(),
+        "BPMute Keyboard & Mouse Shortcuts",
+    )
+    .unwrap();
+    app.handle_event(mouse_scroll_up(title_col + 2, title_row + 2));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Global Navigation:"));
+
+    // ScrollDown from inside the modal and from over the shadowed backdrop (0, 5)
+    // reaches the bottom lines while leaving background Wearables selection untouched.
+    app.handle_event(mouse_scroll_down(title_col + 2, title_row + 2));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let after_one = buffer_to_string(terminal.backend().buffer());
+    assert!(!after_one.contains("Global Navigation:"));
+
+    // Scroll down past the end (e.g., 40 ticks) from shadowed background area (0, 5)
+    for _ in 0..40 {
+        app.handle_event(mouse_scroll_down(0, 5));
+    }
+    assert_eq!(
+        app.selected_wearable_idx, 0,
+        "Help wheel scrolling must not leak to background Wearables table"
+    );
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let bottom_out = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        bottom_out.contains("Unenroll selected wearable"),
+        "Wearables Help section must be reachable by scrolling at 60x18"
+    );
+    assert!(
+        bottom_out.contains("Click tabs/buttons/rows") && bottom_out.contains("wheel."),
+        "Final Help line must be reachable by scrolling at 60x18"
+    );
+
+    // Scrolling up once from clamped bottom immediately moves up (no unclamped dead zone)
+    app.handle_event(mouse_scroll_up(title_col + 2, title_row + 2));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let scrolled_up_one = buffer_to_string(terminal.backend().buffer());
+    assert_ne!(
+        scrolled_up_one, bottom_out,
+        "Single ScrollUp from clamped bottom must immediately scroll back up"
+    );
+
+    // Left-clicking inside the Help modal box does NOT close Help
+    app.handle_event(mouse_left_click(title_col + 2, title_row + 3));
+    assert_eq!(
+        app.modal,
+        ModalState::Help,
+        "Clicking inside the Help modal box must not dismiss it"
+    );
+
+    // Left-clicking outside the Help modal box (on the backdrop) closes Help
+    app.handle_event(mouse_left_click(0, 0));
+    assert_eq!(
+        app.modal,
+        ModalState::None,
+        "Clicking the backdrop outside the Help modal box must close Help"
+    );
+
+    // Reopening Help resets scroll offset back to top
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('?'))));
+    assert_eq!(app.modal, ModalState::Help);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Global Navigation:"));
+
+    // Backdrop click on left margin (0, 8) also dismisses Help
+    app.handle_event(mouse_left_click(0, 8));
+    assert_eq!(app.modal, ModalState::None);
+
+    // Resize below 60x18 clears Help backdrop & scroll HitMap targets
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('?'))));
+    assert_eq!(app.modal, ModalState::Help);
+    let mut small_term = Terminal::new(TestBackend::new(55, 15)).unwrap();
+    small_term
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    app.handle_event(mouse_scroll_down(10, 5));
+    assert_eq!(app.help_scroll_offset, 0);
+    app.handle_event(mouse_left_click(0, 0));
+    assert_eq!(app.modal, ModalState::Help);
+
+    // --no-mouse suppresses Help wheel scroll and backdrop dismissal
+    let mut app_nm = TuiApp::new(true, false, false);
+    app_nm.handle_event(TuiEvent::Key(key(KeyCode::Char('?'))));
+    terminal
+        .draw(|f| app_nm.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    app_nm.handle_event(mouse_scroll_down(10, 5));
+    assert_eq!(app_nm.help_scroll_offset, 0);
+    app_nm.handle_event(mouse_left_click(0, 0));
+    assert_eq!(app_nm.modal, ModalState::Help);
 }

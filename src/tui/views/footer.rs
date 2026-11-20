@@ -1,42 +1,111 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{ModalState, Tab, TuiApp};
+use crate::tui::hit_map::{ClickTarget, HitMap};
 
-pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+struct FooterWriter<'a> {
+    area: Rect,
+    x: u16,
+    spans: Vec<Span<'a>>,
+    hit_map: &'a mut HitMap,
+    modal_active: bool,
+    key_style: Style,
+    text_style: Style,
+    muted_style: Style,
+}
+
+impl<'a> FooterWriter<'a> {
+    fn new(app: &TuiApp, area: Rect, hit_map: &'a mut HitMap) -> Self {
+        Self {
+            area,
+            x: area.x,
+            spans: Vec::new(),
+            hit_map,
+            modal_active: app.modal != ModalState::None,
+            key_style: app.theme.key_hint(),
+            text_style: app.theme.base(),
+            muted_style: app.theme.muted(),
+        }
+    }
+
+    fn push_item_with_gap(
+        &mut self,
+        key: &'a str,
+        label: &'a str,
+        gap: &'a str,
+        enabled: bool,
+        target: Option<ClickTarget>,
+    ) {
+        let (key_style, text_style) = if enabled {
+            (self.key_style, self.text_style)
+        } else {
+            (self.muted_style, self.muted_style)
+        };
+        let key_span = Span::styled(key, key_style);
+        let label_span = Span::styled(label, text_style);
+        let gap_span = Span::styled(gap, text_style);
+        let item_w = (key_span.width() + label_span.width()) as u16;
+        let gap_w = gap_span.width() as u16;
+
+        if enabled
+            && let Some(click_target) = target
+            && self.x < self.area.right()
+        {
+            let visible_w = item_w.min(self.area.right().saturating_sub(self.x));
+            let rect = Rect::new(self.x, self.area.y, visible_w, 1);
+            if self.modal_active {
+                self.hit_map.push_modal_click(rect, click_target);
+            } else {
+                self.hit_map.push_click(rect, click_target);
+            }
+        }
+
+        self.x = self.x.saturating_add(item_w).saturating_add(gap_w);
+        self.spans.push(key_span);
+        self.spans.push(label_span);
+        if !gap.is_empty() {
+            self.spans.push(gap_span);
+        }
+    }
+
+    fn push_hint(&mut self, key: &'a str, label: &'a str) {
+        self.push_item_with_gap(key, label, "  ", true, None);
+    }
+
+    fn push_action(&mut self, key: &'a str, label: &'a str, enabled: bool, target: ClickTarget) {
+        self.push_item_with_gap(key, label, "  ", enabled, Some(target));
+    }
+
+    fn push_modal_confirm_cancel(&mut self, confirm_label: &'a str) {
+        self.push_action("[Enter]", confirm_label, true, ClickTarget::ModalConfirm);
+        self.push_action("[Esc]", " Cancel", true, ClickTarget::CloseModal);
+    }
+
+    fn finish(self, buf: &mut Buffer) {
+        let line = Line::from(self.spans);
+        buf.set_line(self.area.x, self.area.y, &line, self.area.width);
+    }
+}
+
+pub(crate) fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
-    let mut spans = Vec::new();
-    let key_style = app.theme.key_hint();
-    let live_key_style = if app.daemon_connected {
-        key_style
-    } else {
-        app.theme.muted()
-    };
-    let text_style = app.theme.base();
-    let live_text_style = if app.daemon_connected {
-        text_style
-    } else {
-        app.theme.muted()
-    };
+    let mut writer = FooterWriter::new(app, area, hit_map);
+    let connected = app.daemon_connected;
 
     match app.modal {
         ModalState::Help => {
-            spans.push(Span::styled("[Esc/?]", key_style));
-            spans.push(Span::styled(" Close Help  ", text_style));
-            spans.push(Span::styled("[q]", key_style));
-            spans.push(Span::styled(" Quit  ", text_style));
+            writer.push_action("[Esc/?]", " Close Help", true, ClickTarget::CloseModal);
+            writer.push_action("[q]", " Quit", true, ClickTarget::Quit);
         }
         ModalState::PausePopover { .. } => {
-            spans.push(Span::styled("[1-5/j/k]", key_style));
-            spans.push(Span::styled(" Select  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Confirm  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint("[1-5/j/k]", " Select");
+            writer.push_modal_confirm_cancel(" Confirm");
         }
         ModalState::EnrollmentModal { .. } => {
             let nav_hint = if app.theme.ascii {
@@ -44,20 +113,13 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 "[j/k/↑/↓]"
             };
-            spans.push(Span::styled(nav_hint, key_style));
-            spans.push(Span::styled(" Select Wearable  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Enroll  ", text_style));
-            spans.push(Span::styled("[r]", key_style));
-            spans.push(Span::styled(" Rescan  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint(nav_hint, " Select Wearable");
+            writer.push_action("[Enter]", " Enroll", true, ClickTarget::ModalConfirm);
+            writer.push_action("[r]", " Rescan", true, ClickTarget::ModalRescan);
+            writer.push_action("[Esc]", " Cancel", true, ClickTarget::CloseModal);
         }
         ModalState::RenameModal { .. } => {
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Save Alias  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_modal_confirm_cancel(" Save Alias");
         }
         ModalState::UnenrollModal { .. } => {
             let btn_hint = if app.theme.ascii {
@@ -65,14 +127,9 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 "[Tab/←/→]"
             };
-            spans.push(Span::styled("[1/2/Space]", key_style));
-            spans.push(Span::styled(" Toggle  ", text_style));
-            spans.push(Span::styled(btn_hint, key_style));
-            spans.push(Span::styled(" Button  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Confirm  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint("[1/2/Space]", " Toggle");
+            writer.push_hint(btn_hint, " Button");
+            writer.push_modal_confirm_cancel(" Confirm");
         }
         ModalState::FeedbackModal { .. } => {
             let cycle_hint = if app.theme.ascii {
@@ -80,14 +137,9 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 "[←/→/Space]"
             };
-            spans.push(Span::styled("[Tab]", key_style));
-            spans.push(Span::styled(" Field  ", text_style));
-            spans.push(Span::styled(cycle_hint, key_style));
-            spans.push(Span::styled(" Option  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Submit  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint("[Tab]", " Field");
+            writer.push_hint(cycle_hint, " Option");
+            writer.push_modal_confirm_cancel(" Submit");
         }
         ModalState::ExportTraceModal { .. } => {
             let cycle_hint = if app.theme.ascii {
@@ -95,14 +147,9 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 "[←/→/Space]"
             };
-            spans.push(Span::styled("[Tab]", key_style));
-            spans.push(Span::styled(" Field  ", text_style));
-            spans.push(Span::styled(cycle_hint, key_style));
-            spans.push(Span::styled(" Toggle  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Export  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint("[Tab]", " Field");
+            writer.push_hint(cycle_hint, " Toggle");
+            writer.push_modal_confirm_cancel(" Export");
         }
         ModalState::DeleteSessionModal { .. } => {
             let btn_hint = if app.theme.ascii {
@@ -110,110 +157,87 @@ pub fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             } else {
                 "[Tab/←/→]"
             };
-            spans.push(Span::styled(btn_hint, key_style));
-            spans.push(Span::styled(" Button  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Confirm Delete  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint(btn_hint, " Button");
+            writer.push_modal_confirm_cancel(" Confirm Delete");
         }
         ModalState::SoftRebaselineModal { .. } => {
-            spans.push(Span::styled("[Tab]", key_style));
-            spans.push(Span::styled(" Field  ", text_style));
-            spans.push(Span::styled("[Space]", key_style));
-            spans.push(Span::styled(" Toggle  ", text_style));
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Submit  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_hint("[Tab]", " Field");
+            writer.push_hint("[Space]", " Toggle");
+            writer.push_modal_confirm_cancel(" Submit");
         }
         ModalState::PurgeRawModal { .. } => {
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Confirm Purge  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_modal_confirm_cancel(" Confirm Purge");
         }
         ModalState::HardWipeModal { .. } => {
-            spans.push(Span::styled("[Enter]", key_style));
-            spans.push(Span::styled(" Confirm Wipe  ", text_style));
-            spans.push(Span::styled("[Esc]", key_style));
-            spans.push(Span::styled(" Cancel  ", text_style));
+            writer.push_modal_confirm_cancel(" Confirm Wipe");
         }
         ModalState::None => {
-            spans.push(Span::styled("[1-4]", key_style));
-            spans.push(Span::styled(" Tabs  ", text_style));
+            writer.push_hint("[1-4]", " Tabs");
 
             match app.active_tab {
                 Tab::Dashboard => {
-                    spans.push(Span::styled("[d]", key_style));
-                    spans.push(Span::styled(" Diagnostics  ", text_style));
-                    spans.push(Span::styled("[p]", live_key_style));
-                    spans.push(Span::styled(" Pause  ", live_text_style));
-                    if app.daemon_connected && app.grace_state.is_some() {
-                        spans.push(Span::styled("[c]", key_style));
-                        spans.push(Span::styled(" Cancel  ", text_style));
-                        spans.push(Span::styled("[s]", key_style));
-                        spans.push(Span::styled(" Snooze  ", text_style));
+                    writer.push_action("[d]", " Diagnostics", true, ClickTarget::ToggleDiagnostics);
+                    writer.push_action("[p]", " Pause", connected, ClickTarget::OpenPausePopover);
+                    if connected && app.grace_state.is_some() {
+                        writer.push_action("[c]", " Cancel", true, ClickTarget::CancelGrace);
+                        writer.push_action("[s]", " Snooze", true, ClickTarget::SnoozeGrace);
                     }
-                    if app.daemon_connected && app.has_persistent_shift_alert() {
-                        spans.push(Span::styled("[a]", key_style));
-                        spans.push(Span::styled(" Accept Shift  ", text_style));
-                        spans.push(Span::styled("[i]", key_style));
-                        spans.push(Span::styled(" Ignore Shift  ", text_style));
+                    if connected && app.has_persistent_shift_alert() {
+                        writer.push_action("[a]", " Accept Shift", true, ClickTarget::AcceptShift);
+                        writer.push_action("[i]", " Ignore Shift", true, ClickTarget::IgnoreShift);
                     }
                 }
                 Tab::Wearables => {
-                    spans.push(Span::styled("[e]", live_key_style));
-                    spans.push(Span::styled(" Enroll  ", live_text_style));
-                    spans.push(Span::styled("[n]", live_key_style));
-                    spans.push(Span::styled(" Rename  ", live_text_style));
-                    spans.push(Span::styled("[c]", live_key_style));
-                    spans.push(Span::styled(" Reconnect  ", live_text_style));
-                    spans.push(Span::styled("[u]", live_key_style));
-                    spans.push(Span::styled(" Unenroll  ", live_text_style));
+                    let can_act = app.can_act_on_selected_wearable();
+                    writer.push_action("[e]", " Enroll", connected, ClickTarget::WearablesEnroll);
+                    writer.push_action("[n]", " Rename", can_act, ClickTarget::WearablesRename);
+                    writer.push_action(
+                        "[c]",
+                        " Reconnect",
+                        can_act,
+                        ClickTarget::WearablesReconnect,
+                    );
+                    writer.push_action("[u]", " Unenroll", can_act, ClickTarget::WearablesUnenroll);
                 }
                 Tab::History => {
-                    spans.push(Span::styled("[f]", live_key_style));
-                    spans.push(Span::styled(" Feedback  ", live_text_style));
-                    spans.push(Span::styled("[x]", live_key_style));
-                    spans.push(Span::styled(" Export  ", live_text_style));
-                    spans.push(Span::styled("[D]", live_key_style));
-                    spans.push(Span::styled(" Delete  ", live_text_style));
-                    spans.push(Span::styled("[j/k]", key_style));
-                    spans.push(Span::styled(" Navigate  ", text_style));
+                    let can_act = app.can_act_on_selected_session();
+                    writer.push_action("[f]", " Feedback", can_act, ClickTarget::HistoryFeedback);
+                    writer.push_action("[x]", " Export", can_act, ClickTarget::HistoryExport);
+                    writer.push_action("[D]", " Delete", can_act, ClickTarget::HistoryDelete);
+                    writer.push_hint("[j/k]", " Navigate");
                 }
                 Tab::Settings => {
-                    spans.push(Span::styled("[j/k]", key_style));
-                    spans.push(Span::styled(" Navigate  ", text_style));
-                    spans.push(Span::styled("[Space]", live_key_style));
-                    spans.push(Span::styled(" Toggle  ", live_text_style));
-                    spans.push(Span::styled("[E]", key_style));
-                    spans.push(Span::styled(" Editor  ", text_style));
-                    spans.push(Span::styled("[B]", live_key_style));
-                    spans.push(Span::styled(" Rebase  ", live_text_style));
-                    spans.push(Span::styled("[P]", live_key_style));
-                    spans.push(Span::styled(" Purge  ", live_text_style));
-                    spans.push(Span::styled("[W]", live_key_style));
-                    spans.push(Span::styled(" Wipe  ", live_text_style));
-                    if app
-                        .storage_stats
-                        .as_ref()
-                        .and_then(|s| s.active_calibration_boundary.as_ref())
-                        .is_some()
-                    {
-                        spans.push(Span::styled("[U]", live_key_style));
-                        spans.push(Span::styled(" Undo Boundary  ", live_text_style));
+                    writer.push_hint("[j/k]", " Navigate");
+                    writer.push_action(
+                        "[Space]",
+                        " Toggle",
+                        connected,
+                        ClickTarget::SettingsToggleSelected,
+                    );
+                    writer.push_action("[E]", " Editor", true, ClickTarget::SettingsEditorHandoff);
+                    writer.push_action(
+                        "[B]",
+                        " Rebase",
+                        connected,
+                        ClickTarget::SettingsOpenRebase,
+                    );
+                    writer.push_action("[P]", " Purge", connected, ClickTarget::SettingsOpenPurge);
+                    writer.push_action("[W]", " Wipe", connected, ClickTarget::SettingsOpenWipe);
+                    if app.has_active_calibration_boundary() {
+                        writer.push_action(
+                            "[U]",
+                            " Undo Boundary",
+                            connected,
+                            ClickTarget::SettingsUndoBoundary,
+                        );
                     }
                 }
             }
 
-            spans.push(Span::styled("[?]", key_style));
-            spans.push(Span::styled(" Help  ", text_style));
-            spans.push(Span::styled("[q]", key_style));
-            spans.push(Span::styled(" Quit", text_style));
+            writer.push_action("[?]", " Help", true, ClickTarget::OpenHelp);
+            writer.push_item_with_gap("[q]", " Quit", "", true, Some(ClickTarget::Quit));
         }
     }
 
-    let line = Line::from(spans);
-    buf.set_line(area.x, area.y, &line, area.width);
+    writer.finish(buf);
 }

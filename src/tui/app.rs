@@ -221,6 +221,10 @@ pub struct TuiApp {
 
     // Render-emitted mouse hit-testing map (ADR-0010)
     pub(crate) hit_map: HitMap,
+
+    // Help modal vertical scroll state
+    pub help_scroll_offset: u16,
+    pub(crate) help_max_scroll: u16,
 }
 
 impl TuiApp {
@@ -265,6 +269,8 @@ impl TuiApp {
             offline_paths: None,
             systemd_service_installed,
             hit_map: HitMap::default(),
+            help_scroll_offset: 0,
+            help_max_scroll: 0,
         }
     }
 
@@ -384,6 +390,37 @@ impl TuiApp {
         self.alerts
             .iter()
             .any(|a| a.id == alert_ids::PERSISTENT_SHIFT)
+    }
+
+    pub(crate) fn can_act_on_selected_wearable(&self) -> bool {
+        self.daemon_connected && self.selected_wearable_idx < self.enrolled_wearables.len()
+    }
+
+    pub(crate) fn can_act_on_selected_session(&self) -> bool {
+        self.daemon_connected
+            && self
+                .history_sessions
+                .get(self.selected_session_idx)
+                .is_some_and(|s| s.status != crate::storage::SessionStatus::Active)
+    }
+
+    pub(crate) fn has_active_calibration_boundary(&self) -> bool {
+        self.storage_stats
+            .as_ref()
+            .and_then(|s| s.active_calibration_boundary.as_ref())
+            .is_some()
+    }
+
+    pub(crate) fn open_help_modal(&mut self) {
+        self.modal = ModalState::Help;
+        self.help_scroll_offset = 0;
+        self.help_max_scroll = 0;
+    }
+
+    pub(crate) fn close_modal(&mut self) {
+        self.modal = ModalState::None;
+        self.help_scroll_offset = 0;
+        self.help_max_scroll = 0;
     }
 
     pub fn open_enrollment_modal(&mut self) -> TuiCommand {
@@ -709,11 +746,13 @@ impl TuiApp {
             Tab::Settings => render_settings(self, content_area, buf),
         }
 
-        render_footer(self, footer_area, buf);
-
         if self.modal == ModalState::Help {
-            render_help(self, area, buf);
+            let max_scroll = render_help(self, area, buf, &mut hit_map);
+            self.help_max_scroll = max_scroll;
+            self.help_scroll_offset = self.help_scroll_offset.min(max_scroll);
         }
+
+        render_footer(self, footer_area, buf, &mut hit_map);
 
         self.hit_map = hit_map;
     }
