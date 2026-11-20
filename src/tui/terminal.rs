@@ -108,10 +108,6 @@ pub async fn run_tui<WOut: io::Write, WErr: io::Write>(
         }
     };
 
-    if let Ok(size) = terminal.size() {
-        app.last_viewport_width = size.width;
-    }
-
     // IPC client setup
     let (event_tx, mut event_rx) = mpsc::channel::<TuiEvent>(256);
     let (cmd_tx, cmd_rx) = mpsc::channel::<TuiCommand>(64);

@@ -4,9 +4,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Row, Table, Widget};
 
 use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
+use super::super::hit_map::{HitMap, ScrollTarget};
 use super::centered_rect;
 
-pub fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.height < 5 || area.width < 10 {
         return;
     }
@@ -19,7 +20,7 @@ pub fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let table_area = chunks[0];
     let action_area = chunks[1];
 
-    render_wearables_table(app, table_area, buf);
+    render_wearables_table(app, table_area, buf, hit_map);
     render_wearables_actions(app, action_area, buf);
 
     match app.modal {
@@ -30,7 +31,8 @@ pub fn render_wearables(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 }
 
-fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_wearables_table(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+    hit_map.push_scroll(area, ScrollTarget::WearablesTable);
     let block = app.theme.card_block(" Enrolled Wearables ");
     let header = Row::new(vec![
         "Alias / Name",

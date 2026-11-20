@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::event::{IpcEvent, TUI_TICK_MS, TuiCommand, TuiEvent};
+use super::hit_map::HitMap;
 use super::sparkline::HrSparklineData;
 use super::theme::Theme;
 use super::views::centered_rect;
@@ -171,7 +172,6 @@ pub struct TuiApp {
     pub modal: ModalState,
     pub should_quit: bool,
     pub daemon_connected: bool,
-    pub last_viewport_width: u16,
 
     // Live daemon status
     pub daemon_status: Option<DaemonStatus>,
@@ -218,6 +218,9 @@ pub struct TuiApp {
 
     // systemd --user service detection
     pub systemd_service_installed: bool,
+
+    // Render-emitted mouse hit-testing map (ADR-0010)
+    pub(crate) hit_map: HitMap,
 }
 
 impl TuiApp {
@@ -233,7 +236,6 @@ impl TuiApp {
             modal: ModalState::None,
             should_quit: false,
             daemon_connected: false,
-            last_viewport_width: 80,
             daemon_status: None,
             monitoring_state: MonitoringState::Idle,
             armed: true,
@@ -262,6 +264,7 @@ impl TuiApp {
             storage_stats: None,
             offline_paths: None,
             systemd_service_installed,
+            hit_map: HitMap::default(),
         }
     }
 
@@ -408,10 +411,7 @@ impl TuiApp {
             }
             TuiEvent::Tick => self.tick(),
             TuiEvent::Ipc(ipc) => self.handle_ipc(*ipc),
-            TuiEvent::Resize(width, _) => {
-                self.last_viewport_width = width;
-                None
-            }
+            TuiEvent::Resize(_, _) => None,
         }
     }
 
@@ -663,7 +663,9 @@ impl TuiApp {
         None
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        self.hit_map.clear();
+
         if area.width < 10 || area.height < 5 {
             return;
         }
@@ -692,15 +694,18 @@ impl TuiApp {
         let content_area = chunks[2];
         let footer_area = chunks[3];
 
-        render_header(self, header_area, buf);
+        let mut hit_map = HitMap::default();
+        hit_map.set_modal_active(self.modal != ModalState::None);
+
+        render_header(self, header_area, buf, &mut hit_map);
         if has_banner {
-            render_global_banner(self, banner_area, buf);
+            render_global_banner(self, banner_area, buf, &mut hit_map);
         }
 
         match self.active_tab {
             Tab::Dashboard => render_dashboard(self, content_area, buf),
             Tab::History => render_history(self, content_area, buf),
-            Tab::Wearables => render_wearables(self, content_area, buf),
+            Tab::Wearables => render_wearables(self, content_area, buf, &mut hit_map),
             Tab::Settings => render_settings(self, content_area, buf),
         }
 
@@ -709,6 +714,8 @@ impl TuiApp {
         if self.modal == ModalState::Help {
             render_help(self, area, buf);
         }
+
+        self.hit_map = hit_map;
     }
 }
 

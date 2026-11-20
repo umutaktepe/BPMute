@@ -35,7 +35,6 @@ use bpmute::sleep_engine::{
     SessionEndReason, SessionSummary, StreamState, StreamStatus,
 };
 use bpmute::storage::EnrolledWearable;
-use bpmute::tui::views::header::{GraceBannerLayout, tab_hit_ranges};
 use bpmute::tui::{
     GraceState, IpcEvent, ModalState, PairingPromptModalState, Tab, Theme, TuiApp, TuiCommand,
     TuiEvent, TuiIpcBridge, UnenrollButton, detect_systemd_service_installed,
@@ -50,6 +49,51 @@ fn buffer_to_string(buf: &Buffer) -> String {
         out.push('\n');
     }
     out
+}
+
+fn find_text_coords(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
+    for y in 0..buf.area.height {
+        let mut row_str = String::new();
+        let mut col_starts = Vec::new();
+        for x in 0..buf.area.width {
+            let sym = buf[(x, y)].symbol();
+            col_starts.push((row_str.len(), x));
+            row_str.push_str(sym);
+        }
+        if let Some(byte_idx) = row_str.find(needle)
+            && let Some(&(_, col)) = col_starts.iter().find(|&&(b, _)| b == byte_idx)
+        {
+            return Some((col, y));
+        }
+    }
+    None
+}
+
+fn mouse_left_click(col: u16, row: u16) -> TuiEvent {
+    TuiEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })
+}
+
+fn mouse_scroll_down(col: u16, row: u16) -> TuiEvent {
+    TuiEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })
+}
+
+fn mouse_scroll_up(col: u16, row: u16) -> TuiEvent {
+    TuiEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -263,7 +307,6 @@ async fn test_cli_tui_flags_are_scoped_and_80x24_baseline_renders_cleanly() {
 fn test_mouse_tab_clicks_grace_banner_buttons_and_no_mouse() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
-    app.last_viewport_width = 80;
     app.grace_state = Some(GraceState {
         session_id: "s-1".into(),
         remaining_sec: 45,
@@ -272,49 +315,239 @@ fn test_mouse_tab_clicks_grace_banner_buttons_and_no_mouse() {
         dry_run: false,
     });
 
-    // Click each tab using exact rendered hit ranges
-    for (expected_tab, start_col, _) in tab_hit_ranges() {
-        app.handle_event(TuiEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: start_col + 2,
-            row: 0,
-            modifiers: KeyModifiers::empty(),
-        }));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // Click each tab using visually rendered coordinates from TestBackend's buffer
+    for (expected_tab, label) in [
+        (Tab::Dashboard, "[1:Dashboard]"),
+        (Tab::History, "[2:History]"),
+        (Tab::Wearables, "[3:Wearables]"),
+        (Tab::Settings, "[4:Settings]"),
+    ] {
+        let (col, row) = find_text_coords(terminal.backend().buffer(), label)
+            .unwrap_or_else(|| panic!("rendered buffer missing tab {label}"));
+        app.handle_event(mouse_left_click(col + 1, row));
         assert_eq!(app.active_tab, expected_tab);
     }
 
-    // Click [c] Cancel and [s] Snooze on the Grace banner (row 1) at 80 cols
-    let layout = GraceBannerLayout::compute(app.grace_state.as_ref().unwrap(), 80);
-    let cancel_cmd = app.handle_event(TuiEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: layout.cancel_cols.0 + 1,
-        row: 1,
-        modifiers: KeyModifiers::empty(),
-    }));
+    // Rendering below 60x18 clears the interactive HitMap so stale tab clicks cannot fire
+    let (settings_col, settings_row) =
+        find_text_coords(terminal.backend().buffer(), "[4:Settings]").unwrap();
+    let (dash_col, dash_row) =
+        find_text_coords(terminal.backend().buffer(), "[1:Dashboard]").unwrap();
+    let mut terminal_small = Terminal::new(TestBackend::new(55, 15)).unwrap();
+    terminal_small
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    app.handle_event(mouse_left_click(dash_col + 1, dash_row));
+    assert_eq!(
+        app.active_tab,
+        Tab::Settings,
+        "Clicks while below 60x18 resize notice must not hit stale background tabs"
+    );
+
+    // Resizing back to >= 60x18 and re-rendering restores accurate tab hit targets
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    app.handle_event(mouse_left_click(dash_col + 1, dash_row));
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    app.handle_event(mouse_left_click(settings_col + 1, settings_row));
+    assert_eq!(app.active_tab, Tab::Settings);
+
+    // Click [c] Cancel and [s] Snooze on the Grace banner (row 1) at 80 cols (< 96)
+    let buf_80 = terminal.backend().buffer();
+    let (cancel_col, cancel_row) = find_text_coords(buf_80, "[c] Cancel").unwrap();
+    let (snooze_col, snooze_row) = find_text_coords(buf_80, "[s] Snooze").unwrap();
+    let cancel_cmd = app.handle_event(mouse_left_click(cancel_col + 1, cancel_row));
     assert_eq!(cancel_cmd, Some(TuiCommand::CancelGrace));
 
-    let snooze_cmd = app.handle_event(TuiEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: layout.snooze_cols.0 + 1,
-        row: 1,
-        modifiers: KeyModifiers::empty(),
-    }));
+    let snooze_cmd = app.handle_event(mouse_left_click(snooze_col + 1, snooze_row));
     assert_eq!(
         snooze_cmd,
         Some(TuiCommand::SnoozeGrace(None)),
         "Clicking [s] Snooze on the 80-col banner must dispatch SnoozeGrace"
     );
 
-    // --no-mouse suppresses all mouse events
+    // Click [c] Cancel (I'm Awake) and [s] Snooze on the Grace banner at 104 cols (>= 96)
+    let mut terminal_wide = Terminal::new(TestBackend::new(104, 24)).unwrap();
+    terminal_wide
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_wide = terminal_wide.backend().buffer();
+    let (wide_cancel_col, wide_cancel_row) =
+        find_text_coords(buf_wide, "[c] Cancel (I'm Awake)").unwrap();
+    let (wide_snooze_col, wide_snooze_row) = find_text_coords(buf_wide, "[s] Snooze").unwrap();
+    // Click near the end of "(I'm Awake)" to verify the full rendered label is hit-tested
+    assert_eq!(
+        app.handle_event(mouse_left_click(wide_cancel_col + 18, wide_cancel_row)),
+        Some(TuiCommand::CancelGrace)
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(wide_snooze_col + 2, wide_snooze_row)),
+        Some(TuiCommand::SnoozeGrace(None))
+    );
+
+    // Disconnected offline banner must not expose Grace Period controls
+    app.daemon_connected = false;
+    terminal_wide
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(wide_cancel_col + 1, wide_cancel_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(wide_snooze_col + 1, wide_snooze_row)),
+        None
+    );
+    app.daemon_connected = true;
+
+    let sample_wearables = vec![
+        make_wearable(
+            "w-1",
+            "AA:BB:CC:11:22:01",
+            Some("Strap 1"),
+            StreamStatus::Streaming,
+            Some(90),
+            None,
+        ),
+        make_wearable(
+            "w-2",
+            "AA:BB:CC:11:22:02",
+            Some("Strap 2"),
+            StreamStatus::Disconnected,
+            Some(70),
+            None,
+        ),
+    ];
+
+    // --no-mouse suppresses all mouse events (clicks and wheel)
     let mut app_no_mouse = TuiApp::new(true, false, false);
     app_no_mouse.daemon_connected = true;
-    app_no_mouse.handle_event(TuiEvent::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: tab_hit_ranges()[2].1 + 2,
-        row: 0,
-        modifiers: KeyModifiers::empty(),
-    }));
+    app_no_mouse.grace_state = app.grace_state.clone();
+    app_no_mouse.enrolled_wearables = sample_wearables.clone();
+    let mut terminal_no_mouse = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal_no_mouse
+        .draw(|f| app_no_mouse.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let nm_buf = terminal_no_mouse.backend().buffer();
+    let (wear_col, wear_row) = find_text_coords(nm_buf, "[3:Wearables]").unwrap();
+    let (nm_cancel_col, nm_cancel_row) = find_text_coords(nm_buf, "[c] Cancel").unwrap();
+    app_no_mouse.handle_event(mouse_left_click(wear_col + 1, wear_row));
     assert_eq!(app_no_mouse.active_tab, Tab::Dashboard);
+    assert_eq!(
+        app_no_mouse.handle_event(mouse_left_click(nm_cancel_col + 1, nm_cancel_row)),
+        None
+    );
+    app_no_mouse.active_tab = Tab::Wearables;
+    terminal_no_mouse
+        .draw(|f| app_no_mouse.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (table_col, table_row) =
+        find_text_coords(terminal_no_mouse.backend().buffer(), "Strap 1").unwrap();
+    app_no_mouse.handle_event(mouse_scroll_down(table_col, table_row));
+    assert_eq!(app_no_mouse.selected_wearable_idx, 0);
+
+    // Wearables scroll containment + modal shadowing across clicks and wheel events
+    app.enrolled_wearables = sample_wearables;
+    let (wear_tab_col, wear_tab_row) =
+        find_text_coords(terminal.backend().buffer(), "[3:Wearables]").unwrap();
+    app.handle_event(mouse_left_click(wear_tab_col + 1, wear_tab_row));
+    assert_eq!(app.active_tab, Tab::Wearables);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (w_table_col, w_table_row) =
+        find_text_coords(terminal.backend().buffer(), "Strap 1").unwrap();
+    // Scrolling outside the table (on the header row) must not scroll Wearables
+    app.handle_event(mouse_scroll_down(wear_tab_col, wear_tab_row));
+    assert_eq!(
+        app.selected_wearable_idx, 0,
+        "Wheel events outside the Wearables table must not move selection"
+    );
+
+    // Scrolling inside the rendered table moves selection
+    app.handle_event(mouse_scroll_down(w_table_col, w_table_row));
+    assert_eq!(app.selected_wearable_idx, 1);
+    app.handle_event(mouse_scroll_up(w_table_col, w_table_row));
+    assert_eq!(app.selected_wearable_idx, 0);
+
+    // Active modal (Help) shadows all background header, banner, and scroll targets
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('?'))));
+    assert_eq!(app.modal, ModalState::Help);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(dash_col + 1, dash_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert_eq!(
+        app.handle_event(mouse_left_click(cancel_col + 1, cancel_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(snooze_col + 1, snooze_row)),
+        None
+    );
+    app.handle_event(mouse_scroll_down(w_table_col, w_table_row));
+    assert_eq!(
+        app.selected_wearable_idx, 0,
+        "Active Help modal must shadow background Wearables wheel scroll"
+    );
+
+    // Close Help modal, redraw, and verify background targets recover
+    app.handle_event(TuiEvent::Key(key(KeyCode::Esc)));
+    assert_eq!(app.modal, ModalState::None);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // Active in-tab modal (EnrollmentModal) also shadows background tabs, banner, and scroll
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('e'))));
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(dash_col + 1, dash_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert_eq!(
+        app.handle_event(mouse_left_click(cancel_col + 1, cancel_row)),
+        None
+    );
+    app.handle_event(mouse_scroll_down(w_table_col, w_table_row));
+    assert_eq!(
+        app.selected_wearable_idx, 0,
+        "Active EnrollmentModal must shadow background Wearables wheel scroll"
+    );
+    app.handle_event(TuiEvent::Key(key(KeyCode::Esc)));
+    assert_eq!(app.modal, ModalState::None);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(cancel_col + 1, cancel_row)),
+        Some(TuiCommand::CancelGrace)
+    );
+
+    // Resize below 60x18 clears Wearables scroll hit region as well
+    terminal_small
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    app.handle_event(mouse_scroll_down(w_table_col, w_table_row));
+    assert_eq!(
+        app.selected_wearable_idx, 0,
+        "Wheel events below 60x18 resize notice must not scroll stale Wearables table"
+    );
 }
 
 #[test]

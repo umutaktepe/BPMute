@@ -1,58 +1,52 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-use super::super::app::{ModalState, Tab, TuiApp};
+use super::super::app::TuiApp;
 use super::super::event::TuiCommand;
-use super::super::views::header::{GraceBannerLayout, tab_hit_ranges};
+use super::super::hit_map::{ClickTarget, ScrollTarget};
 
 impl TuiApp {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<TuiCommand> {
-        if self.modal != ModalState::None {
-            return None;
-        }
-
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if mouse.row == 0 {
-                    for (tab, start, end) in tab_hit_ranges() {
-                        if mouse.column >= start && mouse.column < end {
-                            self.active_tab = tab;
-                            break;
-                        }
+                match self.hit_map.click_at(mouse.column, mouse.row)? {
+                    ClickTarget::SelectTab(tab) => {
+                        self.active_tab = tab;
+                        None
                     }
-                    return None;
-                }
-
-                if mouse.row == 1
-                    && self.daemon_connected
-                    && let Some(ref grace) = self.grace_state
-                {
-                    let layout = GraceBannerLayout::compute(grace, self.last_viewport_width);
-                    if mouse.column >= layout.cancel_cols.0 && mouse.column < layout.cancel_cols.1 {
-                        return Some(TuiCommand::CancelGrace);
-                    } else if mouse.column >= layout.snooze_cols.0
-                        && mouse.column < layout.snooze_cols.1
+                    ClickTarget::CancelGrace | ClickTarget::SnoozeGrace
+                        if !self.daemon_connected || self.grace_state.is_none() =>
                     {
-                        return Some(TuiCommand::SnoozeGrace(None));
+                        None
                     }
+                    ClickTarget::CancelGrace => Some(TuiCommand::CancelGrace),
+                    ClickTarget::SnoozeGrace => Some(TuiCommand::SnoozeGrace(None)),
                 }
-
-                None
             }
-            MouseEventKind::ScrollDown => {
-                if self.active_tab == Tab::Wearables
-                    && self.selected_wearable_idx + 1 < self.enrolled_wearables.len()
-                {
-                    self.selected_wearable_idx += 1;
-                }
-                None
-            }
-            MouseEventKind::ScrollUp => {
-                if self.active_tab == Tab::Wearables {
-                    self.selected_wearable_idx = self.selected_wearable_idx.saturating_sub(1);
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let target = self.hit_map.scroll_at(mouse.column, mouse.row)?;
+                let delta: isize = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                    1
+                } else {
+                    -1
+                };
+                match target {
+                    ScrollTarget::WearablesTable => {
+                        self.scroll_wearables_selection(delta);
+                    }
                 }
                 None
             }
             _ => None,
         }
+    }
+
+    fn scroll_wearables_selection(&mut self, delta: isize) {
+        let len = self.enrolled_wearables.len();
+        if len == 0 {
+            return;
+        }
+        let max_idx = len.saturating_sub(1) as isize;
+        let next = (self.selected_wearable_idx as isize + delta).clamp(0, max_idx);
+        self.selected_wearable_idx = next as usize;
     }
 }

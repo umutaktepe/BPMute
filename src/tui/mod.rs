@@ -12,6 +12,7 @@
 pub mod app;
 pub mod client;
 pub mod event;
+pub(crate) mod hit_map;
 pub mod input;
 pub mod sparkline;
 pub mod terminal;
