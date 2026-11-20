@@ -8,7 +8,7 @@ use bpmute::paths::{EnvSource, ProcessEnv};
 use bpmute::sleep_engine::ppg::quantile;
 use bpmute::sleep_engine::{
     CalibrationMaturity, CalibrationPriors, DetectorState, EngineConfig, EngineEvent, EngineOutput,
-    GraceOutcome, GraceResult, SleepEngine, WearableFloor,
+    Epoch, GraceOutcome, GraceResult, SleepEngine, WearableFloor,
 };
 use common::synthetic::{
     Phenotype, StageKind, generate_paired_trace, inject_flatline, inject_gt5_optical_lock_ramp,
@@ -90,6 +90,8 @@ struct SessionFailureRecord {
     rhr_bpm: f64,
     drop_bpm: f64,
     outcome: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trace_window: Vec<String>,
 }
 
 struct ModeStatsAccum {
@@ -305,7 +307,12 @@ fn apply_stochastic_noise(
     events
 }
 
-fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> Vec<i64> {
+struct EngineTrace {
+    confirmed_ts: Vec<i64>,
+    epochs: Vec<Epoch>,
+}
+
+fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> EngineTrace {
     let mut engine = SleepEngine::new(EngineConfig {
         detection: DetectionConfig {
             sensitivity: Sensitivity::Balanced,
@@ -315,18 +322,22 @@ fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> Vec<i64> {
         wearable_floor: WearableFloor::default(),
     });
     let mut confirmed_ts = Vec::new();
+    let mut epochs = Vec::new();
     for ev in events {
         let outputs = engine.handle_event(ev.clone());
         let mut expire_at = None;
-        for out in &outputs {
-            if let EngineOutput::StateChanged {
-                ts_ms,
-                to: DetectorState::Confirmed,
-                ..
-            } = out
-            {
-                confirmed_ts.push(*ts_ms);
-                expire_at = Some(*ts_ms);
+        for out in outputs {
+            match out {
+                EngineOutput::EpochEmitted(epoch) => epochs.push(epoch),
+                EngineOutput::StateChanged {
+                    ts_ms,
+                    to: DetectorState::Confirmed,
+                    ..
+                } => {
+                    confirmed_ts.push(ts_ms);
+                    expire_at = Some(ts_ms);
+                }
+                _ => {}
             }
         }
         if let Some(ts_ms) = expire_at {
@@ -336,7 +347,54 @@ fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> Vec<i64> {
             }));
         }
     }
-    confirmed_ts
+    EngineTrace {
+        confirmed_ts,
+        epochs,
+    }
+}
+
+fn format_epoch_window(epochs: &[Epoch], target_ts_ms: i64) -> Vec<String> {
+    if epochs.is_empty() {
+        return Vec::new();
+    }
+    let center = epochs
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, ep)| (ep.ts_ms - target_ts_ms).abs())
+        .map_or(0, |(idx, _)| idx);
+    let start = center.saturating_sub(5);
+    let end = (center + 5).min(epochs.len() - 1);
+    epochs[start..=end]
+        .iter()
+        .map(|ep| {
+            format!(
+                "t=+{}s st={:?} hr={:.1} mu={:.1} sig={:.2} z={:.2} slp={:.2} r_var={:.2} p_slp={:.3} frz={}",
+                ep.ts_ms / 1000,
+                ep.state,
+                ep.features.hr_bpm_60s,
+                ep.baseline_mu_hr,
+                ep.baseline_sigma_hr,
+                ep.features.z_hr,
+                ep.features.hr_slope_4m,
+                ep.features.r_var_120s,
+                ep.p_sleep,
+                ep.baseline_frozen,
+            )
+        })
+        .collect()
+}
+
+fn matches_filter(
+    filter: Option<&str>,
+    session_index: usize,
+    arch_name: &str,
+    mode_name: &str,
+) -> bool {
+    let Some(needle) = filter else {
+        return true;
+    };
+    let haystack = format!("#{session_index} {arch_name} {mode_name}").to_ascii_lowercase();
+    haystack.contains(needle)
 }
 
 fn build_sleep_stages(rng: &mut ChaCha8Rng, arch: SleepArchetype) -> (Vec<StageKind>, i64) {
@@ -505,7 +563,7 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
 
     if !report.failures.is_empty() {
         md.push_str("\n## Notable Failures / Misses\n\n");
-        for f in report.failures.iter().take(20) {
+        for (idx, f) in report.failures.iter().take(20).enumerate() {
             md.push_str(&format!(
                 "- Session #{} (`{}`, `{}`, `{}`, `{}`): RHR {:.1} bpm, drop {:.1} bpm — {}\n",
                 f.session_index,
@@ -517,6 +575,11 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
                 f.drop_bpm,
                 f.outcome
             ));
+            if idx < 5 {
+                for line in &f.trace_window {
+                    md.push_str(&format!("  - `{line}`\n"));
+                }
+            }
         }
     }
     md
@@ -525,6 +588,13 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
 #[test]
 #[ignore = "Tier 2 seeded Monte Carlo sweep (~200 Monitoring Sessions); run with cargo test --release --test monte_carlo -- --ignored --nocapture"]
 fn tier2_seeded_monte_carlo_sweep() {
+    let filter = ProcessEnv
+        .get("BPMUTE_MONTE_CARLO_FILTER")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let trace_failures = ProcessEnv
+        .get("BPMUTE_MONTE_CARLO_TRACE_FAILURES")
+        .is_some_and(|v| v == "1");
     let mut rng = ChaCha8Rng::seed_from_u64(ROOT_SEED);
     let mut bpm_rr_stats = ModeStatsAccum::new("BPM+RR");
     let mut bpm_only_stats = ModeStatsAccum::new("BPM-only");
@@ -582,11 +652,23 @@ fn tier2_seeded_monte_carlo_sweep() {
             ("BPM+RR", &rr_events, &mut bpm_rr_stats),
             ("BPM-only", &bpm_events, &mut bpm_only_stats),
         ] {
+            // RNG draws above already executed so filtered runs preserve exact session seeds.
+            if !matches_filter(filter.as_deref(), idx, arch_name, mode_name) {
+                continue;
+            }
             stats.sleep_total += 1;
-            let confirmed = run_engine(events, priors.clone());
-            let pre_onset = confirmed.iter().any(|&t| t < onset_ms);
-            if pre_onset {
+            let trace = run_engine(events, priors.clone());
+            let confirmed = &trace.confirmed_ts;
+            let pre_onset = confirmed.iter().find(|&&t| t < onset_ms).copied();
+            if let Some(fp_ts) = pre_onset {
                 stats.pre_onset_false_positives += 1;
+                let window = format_epoch_window(&trace.epochs, fp_ts);
+                if trace_failures {
+                    eprintln!(
+                        "[TRACE] Session #{idx} sleep {mode_name} {arch_name} pre-onset FP:\n  {}",
+                        window.join("\n  ")
+                    );
+                }
                 failures.push(SessionFailureRecord {
                     session_index: idx,
                     kind: "sleep".to_string(),
@@ -596,6 +678,7 @@ fn tier2_seeded_monte_carlo_sweep() {
                     rhr_bpm: pheno.quiet_wake_hr,
                     drop_bpm: pheno.sleep_drop_bpm,
                     outcome: format!("pre-onset FP confirm at {:?}", confirmed),
+                    trace_window: window,
                 });
             } else if let Some(&first_conf) = confirmed.iter().find(|&&t| t >= onset_ms) {
                 stats.sleep_true_positives += 1;
@@ -603,6 +686,13 @@ fn tier2_seeded_monte_carlo_sweep() {
                     .latencies_min
                     .push((first_conf - onset_ms) as f64 / 60_000.0);
             } else {
+                let window = format_epoch_window(&trace.epochs, onset_ms + 600_000);
+                if trace_failures {
+                    eprintln!(
+                        "[TRACE] Session #{idx} sleep {mode_name} {arch_name} missed onset:\n  {}",
+                        window.join("\n  ")
+                    );
+                }
                 failures.push(SessionFailureRecord {
                     session_index: idx,
                     kind: "sleep".to_string(),
@@ -612,6 +702,7 @@ fn tier2_seeded_monte_carlo_sweep() {
                     rhr_bpm: pheno.quiet_wake_hr,
                     drop_bpm: pheno.sleep_drop_bpm,
                     outcome: "missed sleep onset".to_string(),
+                    trace_window: window,
                 });
             }
         }
@@ -639,12 +730,24 @@ fn tier2_seeded_monte_carlo_sweep() {
             ("BPM+RR", &rr_events, &mut bpm_rr_stats),
             ("BPM-only", &bpm_events, &mut bpm_only_stats),
         ] {
+            let session_index = NUM_SLEEP_SESSIONS + idx;
+            if !matches_filter(filter.as_deref(), session_index, arch_name, mode_name) {
+                continue;
+            }
             stats.wake_negatives_total += 1;
-            let confirmed = run_engine(events, priors.clone());
-            if !confirmed.is_empty() {
+            let trace = run_engine(events, priors.clone());
+            let confirmed = &trace.confirmed_ts;
+            if let Some(&first_fp) = confirmed.first() {
                 stats.wake_false_positives += 1;
+                let window = format_epoch_window(&trace.epochs, first_fp);
+                if trace_failures {
+                    eprintln!(
+                        "[TRACE] Session #{session_index} wake_negative {mode_name} {arch_name} FP:\n  {}",
+                        window.join("\n  ")
+                    );
+                }
                 failures.push(SessionFailureRecord {
-                    session_index: NUM_SLEEP_SESSIONS + idx,
+                    session_index,
                     kind: "wake_negative".to_string(),
                     mode: mode_name.to_string(),
                     archetype: arch_name.to_string(),
@@ -652,6 +755,7 @@ fn tier2_seeded_monte_carlo_sweep() {
                     rhr_bpm: pheno.quiet_wake_hr,
                     drop_bpm: pheno.sleep_drop_bpm,
                     outcome: format!("false positive confirm at {:?}", confirmed),
+                    trace_window: window,
                 });
             }
         }
@@ -663,9 +767,15 @@ fn tier2_seeded_monte_carlo_sweep() {
 
     let report = MonteCarloReport {
         seed: ROOT_SEED,
-        total_sessions: NUM_SLEEP_SESSIONS + NUM_WAKE_SESSIONS,
-        sleep_sessions: NUM_SLEEP_SESSIONS,
-        wake_sessions: NUM_WAKE_SESSIONS,
+        total_sessions: bpm_rr_report
+            .total_sessions
+            .max(bpm_only_report.total_sessions),
+        sleep_sessions: bpm_rr_report
+            .sleep_sessions
+            .max(bpm_only_report.sleep_sessions),
+        wake_sessions: bpm_rr_report
+            .wake_sessions
+            .max(bpm_only_report.wake_sessions),
         rhr_range_bpm: [min_rhr, max_rhr],
         drop_range_bpm: [min_drop, max_drop],
         bpm_rr: bpm_rr_report,
@@ -676,6 +786,17 @@ fn tier2_seeded_monte_carlo_sweep() {
 
     let markdown = render_markdown_report(&report);
     println!("{markdown}");
+
+    if let Some(ref active_filter) = filter {
+        assert!(
+            report.total_sessions > 0,
+            "BPMUTE_MONTE_CARLO_FILTER={active_filter:?} matched 0 Monitoring Sessions"
+        );
+        println!(
+            "Filtered debug run (`{active_filter}`): skipping full 200-session report writes and aggregate gates."
+        );
+        return;
+    }
 
     let out_dir = ProcessEnv
         .get("BPMUTE_MONTE_CARLO_OUT_DIR")

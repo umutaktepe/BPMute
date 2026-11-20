@@ -20,11 +20,12 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 ## Protocol & CLI Serde Conventions
 
 - **`PatchField` serialization**: `PatchField::Unchanged` serializes to JSON `null`, but receiving `null` deserializes as `PatchField::Clear`. When constructing JSON payloads for partial mutation ops (like `session.set_feedback`), omit unchanged keys from the JSON map entirely.
-- **`clap` `ValueEnum` naming**: Annotate enum types parsed by `clap` with `#[value(rename_all = "snake_case")]` and provide kebab-case aliases (`alias = "..."`) so that both CLI arguments (`--verdict missed-sleep` / `--verdict missed_sleep`) and IPC payloads parse consistently.
+- **`clap` `ValueEnum` naming**: Annotate enum types shared with serialized IPC or config fields with `#[value(rename_all = "snake_case")]` and provide kebab-case aliases (`alias = "..."`) so CLI flags and JSON/TOML payloads match. Pure CLI-only option enums (such as `--target graphical-session`) follow idiomatic `kebab-case` with optional `snake_case` aliases when specified by the CLI contract.
 
 ## D-Bus Hermeticism & Test Doubles
 
 - **Host D-Bus isolation**: Test processes must never connect to the developer's live system or session D-Bus. `./scripts/test.sh` and `./scripts/check.sh` enforce `DBUS_SESSION_BUS_ADDRESS="unix:path=/dev/null"` and `DBUS_SYSTEM_BUS_ADDRESS="unix:path=/dev/null"`. Any test requiring OS or notification interactions must use in-memory doubles (`FakeActionExecutor`, `FakeNotifier`).
+- **Fake binary scripts under stripped `PATH`**: Write fake executable test scripts with POSIX `#!/bin/sh` (`./scripts/check.sh` rejects `#!/usr/bin/env`), because hermetic `MapEnv` tests replace `PATH` with only the temporary script directory.
 - **Daemon options in tests**: Use `DaemonOptions::for_testing(...)` rather than constructing raw struct literals. This defaults OS-touching handles (`action_executor`, `notifier`, `wearable_source`) safely to in-memory test doubles and insulates tests from future struct field additions.
 
 ## TUI Rendering & Interactive IPC

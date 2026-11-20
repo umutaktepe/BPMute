@@ -58,7 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: tier2-monte-carlo
-      - name: Run Tier 2 seeded Monte Carlo sweep (~200 nights)
+      - name: Run Tier 2 seeded Monte Carlo sweep (~200 Monitoring Sessions)
         env:
           BPMUTE_MONTE_CARLO_OUT_DIR: target/tier2-report
         run: cargo test --release --test monte_carlo -- --ignored --nocapture

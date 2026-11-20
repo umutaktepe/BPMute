@@ -28,11 +28,44 @@ if grep -Eq 'DaemonOptions\s*\{' tests/*.rs; then
   exit 1
 fi
 
+if grep -En '#!/usr/bin/env[[:space:]]' tests/*.rs; then
+  echo "error: #!/usr/bin/env shebang forbidden in fake test scripts (stripped MapEnv PATH omits /usr/bin); use POSIX #!/bin/sh" >&2
+  exit 1
+fi
+
+for script in scripts/*.sh .githooks/*; do
+  [ -f "$script" ] || continue
+  if [ ! -x "$script" ]; then
+    echo "error: script is not executable: $script" >&2
+    exit 1
+  fi
+  bash -n "$script"
+  if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck "$script"
+  fi
+done
+
+python3 -c '
+import glob, sys, yaml
+for path in sorted(glob.glob(".github/**/*.yml", recursive=True) + glob.glob(".github/**/*.yaml", recursive=True)):
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if path == ".github/build-setup.yml" and not isinstance(data, list):
+        sys.exit(f"error: {path} must be a top-level YAML sequence of steps for cargo-dist")
+'
+if command -v actionlint >/dev/null 2>&1; then
+  actionlint
+fi
+if command -v dist >/dev/null 2>&1; then
+  dist plan --output-format=json >/dev/null
+  dist generate --check
+fi
+
 while IFS= read -r -d '' file; do
   lines=$(wc -l < "$file")
   limit=1000
   case "$file" in
-    ./src/storage/store/mod.rs) limit=1065 ;;
+    ./src/storage/store/mod.rs) limit=1061 ;;
     ./src/sleep_engine/state_machine.rs) limit=1041 ;;
   esac
   if [ "$lines" -gt "$limit" ]; then
