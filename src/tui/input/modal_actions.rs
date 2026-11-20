@@ -1,8 +1,8 @@
 use chrono::TimeZone;
 
 use super::super::app::{
-    ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState, TuiApp,
-    UnenrollButton,
+    ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState, SoftRebaselineField,
+    TuiApp, UnenrollButton,
 };
 use super::super::event::TuiCommand;
 use super::super::hit_map::UnenrollCheckbox;
@@ -89,6 +89,15 @@ impl TuiApp {
             Some(TuiCommand::EnrollStart(Some(30)))
         } else {
             None
+        }
+    }
+
+    pub(super) fn focus_modal_input(&mut self) {
+        match self.modal {
+            ModalState::EnrollmentModal { .. } => self.set_enrollment_alias_focus(true),
+            // RenameModal and HardWipeModal keep their text input focused while open.
+            ModalState::RenameModal { .. } | ModalState::HardWipeModal { .. } => {}
+            _ => {}
         }
     }
 
@@ -460,6 +469,28 @@ impl TuiApp {
         let sid = session_id.clone();
         self.modal = ModalState::None;
         (!require_confirmed || confirmed).then_some(TuiCommand::SessionDelete { id: sid })
+    }
+
+    pub(super) fn focus_soft_rebaseline_field(&mut self, field: SoftRebaselineField) {
+        if let ModalState::SoftRebaselineModal {
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *active_field = field;
+        }
+    }
+
+    pub(super) fn toggle_soft_rebaseline_reset_floors(&mut self) {
+        if let ModalState::SoftRebaselineModal {
+            ref mut reset_floors,
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *reset_floors = !*reset_floors;
+            *active_field = SoftRebaselineField::ResetFloors;
+        }
     }
 
     pub(super) fn submit_soft_rebaseline_modal(&mut self) -> Option<TuiCommand> {

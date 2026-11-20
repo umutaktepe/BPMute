@@ -3,7 +3,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use super::super::app::TuiApp;
 use super::super::event::TuiCommand;
 use super::super::hit_map::{ClickTarget, ScrollTarget};
-use super::step_index;
+use super::{SETTINGS_PREFERENCE_COUNT, step_index};
 
 impl TuiApp {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<TuiCommand> {
@@ -47,10 +47,14 @@ impl TuiApp {
                     ClickTarget::HistoryFeedback => self.open_history_feedback_modal(),
                     ClickTarget::HistoryExport => self.open_history_export_modal(),
                     ClickTarget::HistoryDelete => self.open_history_delete_modal(),
-                    ClickTarget::SettingsToggleSelected => {
-                        if self.daemon_connected {
+                    ClickTarget::SettingsToggleSelected => self.toggle_selected_setting(),
+                    ClickTarget::SettingsSelectOrToggle(idx) => {
+                        if idx >= SETTINGS_PREFERENCE_COUNT {
+                            None
+                        } else if self.selected_setting_idx == idx {
                             self.toggle_selected_setting()
                         } else {
+                            self.selected_setting_idx = idx;
                             None
                         }
                     }
@@ -78,7 +82,7 @@ impl TuiApp {
                     }
                     ClickTarget::EnrollmentSelectRow(idx) => self.click_enrollment_row(idx),
                     ClickTarget::FocusModalInput => {
-                        self.set_enrollment_alias_focus(true);
+                        self.focus_modal_input();
                         None
                     }
                     ClickTarget::PairingConfirm(confirmed) => {
@@ -110,6 +114,14 @@ impl TuiApp {
                         None
                     }
                     ClickTarget::DeleteSessionConfirm => self.delete_session_modal(false),
+                    ClickTarget::SoftRebaselineFocusField(field) => {
+                        self.focus_soft_rebaseline_field(field);
+                        None
+                    }
+                    ClickTarget::SoftRebaselineToggleResetFloors => {
+                        self.toggle_soft_rebaseline_reset_floors();
+                        None
+                    }
                     ClickTarget::PauseOption(idx) => self.click_pause_option(idx),
                     ClickTarget::Consume => None,
                 }
@@ -127,6 +139,11 @@ impl TuiApp {
                         None
                     }
                     ScrollTarget::HistorySessions => self.scroll_history_selection(delta),
+                    ScrollTarget::SettingsPreferences => {
+                        self.selected_setting_idx =
+                            step_index(self.selected_setting_idx, SETTINGS_PREFERENCE_COUNT, delta);
+                        None
+                    }
                     ScrollTarget::EnrollmentList => {
                         self.scroll_enrollment_list(delta);
                         None

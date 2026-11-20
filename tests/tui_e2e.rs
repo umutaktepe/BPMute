@@ -5478,3 +5478,487 @@ fn test_mouse_history_delete_session_modal_and_backdrop() {
     );
     assert_eq!(app.modal, ModalState::None);
 }
+
+#[test]
+fn test_mouse_settings_preferences_two_click_and_wheel() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+
+    let mut cfg = bpmute::config::Config::default();
+    cfg.detection.sensitivity = Sensitivity::Balanced;
+    cfg.actions.pause_media = true;
+    cfg.actions.lock_screen = false;
+    cfg.actions.power_action = PowerAction::Suspend;
+    cfg.actions.grace_period_sec = Some(30);
+    cfg.actions.dry_run = false;
+    app.active_config = Some(cfg);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    assert_eq!(app.selected_setting_idx, 0);
+
+    // 1. Clicking an unselected preference row (idx 1: Pause Media) selects it without mutating config
+    let (pm_col, pm_row) = find_text_coords(buf, "Pause Media").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(pm_col + 2, pm_row)), None);
+    assert_eq!(app.selected_setting_idx, 1);
+
+    // 2. Clicking the already-selected row (idx 1) when connected emits ConfigUpdate
+    assert_eq!(
+        app.handle_event(mouse_left_click(pm_col + 2, pm_row)),
+        Some(TuiCommand::ConfigUpdate(bpmute::config::ConfigPatch {
+            actions: Some(bpmute::config::ActionsPatch {
+                pause_media: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    );
+    assert_eq!(app.selected_setting_idx, 1);
+
+    // 3. Clicking another unselected row (idx 5: Dry Run) selects it without mutating config, then second click toggles
+    let (dr_col, dr_row) = find_text_coords(buf, "Dry Run").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(dr_col + 2, dr_row)), None);
+    assert_eq!(app.selected_setting_idx, 5);
+    assert_eq!(
+        app.handle_event(mouse_left_click(dr_col + 2, dr_row)),
+        Some(TuiCommand::ConfigUpdate(bpmute::config::ConfigPatch {
+            actions: Some(bpmute::config::ActionsPatch {
+                dry_run: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    );
+
+    // 4. Offline guard: clicking unselected row selects it, clicking already-selected row is a no-op
+    app.daemon_connected = false;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_off = terminal.backend().buffer();
+    let (ls_col, ls_row) = find_text_coords(buf_off, "Lock Screen").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(ls_col + 2, ls_row)), None);
+    assert_eq!(app.selected_setting_idx, 2);
+    assert_eq!(app.handle_event(mouse_left_click(ls_col + 2, ls_row)), None);
+    assert_eq!(app.selected_setting_idx, 2);
+
+    // 5. Mouse-wheel ScrollUp / ScrollDown over Core Preferences moves selected_setting_idx between 0..=5
+    assert_eq!(app.handle_event(mouse_scroll_up(ls_col, ls_row)), None);
+    assert_eq!(app.selected_setting_idx, 1);
+    assert_eq!(app.handle_event(mouse_scroll_up(ls_col, ls_row)), None);
+    assert_eq!(app.selected_setting_idx, 0);
+    // Clamps at 0
+    assert_eq!(app.handle_event(mouse_scroll_up(ls_col, ls_row)), None);
+    assert_eq!(app.selected_setting_idx, 0);
+
+    for expected in 1..=5 {
+        assert_eq!(app.handle_event(mouse_scroll_down(ls_col, ls_row)), None);
+        assert_eq!(app.selected_setting_idx, expected);
+    }
+    // Clamps at 5
+    assert_eq!(app.handle_event(mouse_scroll_down(ls_col, ls_row)), None);
+    assert_eq!(app.selected_setting_idx, 5);
+
+    // Scrolling outside Core Preferences (e.g. over System Settings & Storage) does not move selection
+    let (stor_col, stor_row) = find_text_coords(buf_off, "System Settings & Storage").unwrap();
+    assert_eq!(app.handle_event(mouse_scroll_up(stor_col, stor_row)), None);
+    assert_eq!(app.selected_setting_idx, 5);
+}
+
+#[test]
+fn test_mouse_settings_controls_and_guards() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+    app.active_config = Some(bpmute::config::Config::default());
+    app.storage_stats = Some(bpmute::storage::StorageStats {
+        db_size_bytes: 145_408,
+        db_size_formatted: "142 KB".into(),
+        sessions_count: 12,
+        session_epochs_count: 1420,
+        raw_samples_count: 8500,
+        session_feedback_count: 4,
+        calibration_boundaries_count: 1,
+        wearables_count: 2,
+        raw_samples_retention: "14 days".into(),
+        session_epochs_retention: "indefinite".into(),
+        calibration_maturity: CalibrationMaturity::Calibrated,
+        active_calibration_boundary: Some(CalibrationBoundaryRecord {
+            id: "bnd-001".into(),
+            effective_ts_ms: 1_700_000_000_000,
+            reason: BoundaryReason::ManualRebaseline,
+            seed_sleep_hr: Some(56.0),
+            reset_floors: false,
+            created_at_ms: 1_700_000_000_000,
+            reverted_at_ms: None,
+        }),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Online: [E] Edit in $EDITOR, [U] Undo Boundary, [B] Re-baseline, [P] Purge Raw, [W] Hard Wipe
+    let (ed_col, ed_row) =
+        find_text_coords(terminal.backend().buffer(), "[E] Edit in $EDITOR").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(ed_col + 2, ed_row)),
+        Some(TuiCommand::EditorHandoff)
+    );
+
+    let (undo_col, undo_row) =
+        find_text_coords(terminal.backend().buffer(), "[U] Undo Boundary").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(undo_col + 2, undo_row)),
+        Some(TuiCommand::CalibrationUndoBoundary)
+    );
+
+    let (reb_col, reb_row) =
+        find_text_coords(terminal.backend().buffer(), "[B] Re-baseline").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(reb_col + 2, reb_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (purge_col, purge_row) =
+        find_text_coords(terminal.backend().buffer(), "[P] Purge Raw").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(purge_col + 2, purge_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::PurgeRawModal { .. }));
+    app.modal = ModalState::None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (wipe_col, wipe_row) =
+        find_text_coords(terminal.backend().buffer(), "[W] Hard Wipe").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(wipe_col + 2, wipe_row)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::HardWipeModal { .. }));
+    app.modal = ModalState::None;
+
+    // 2. Active boundary guard: when active_calibration_boundary is None, [U] Undo Boundary is hidden
+    app.storage_stats
+        .as_mut()
+        .unwrap()
+        .active_calibration_boundary = None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "[U] Undo Boundary").is_none());
+
+    // 3. Offline guard: [E] Edit in $EDITOR still emits EditorHandoff, while [U]/[B]/[P]/[W] are no-ops
+    app.storage_stats
+        .as_mut()
+        .unwrap()
+        .active_calibration_boundary = Some(CalibrationBoundaryRecord {
+        id: "bnd-002".into(),
+        effective_ts_ms: 1_700_000_000_000,
+        reason: BoundaryReason::ManualRebaseline,
+        seed_sleep_hr: None,
+        reset_floors: false,
+        created_at_ms: 1_700_000_000_000,
+        reverted_at_ms: None,
+    });
+    app.daemon_connected = false;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let off_buf = terminal.backend().buffer();
+
+    let (ed_off_col, ed_off_row) = find_text_coords(off_buf, "[E] Edit in $EDITOR").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(ed_off_col + 2, ed_off_row)),
+        Some(TuiCommand::EditorHandoff)
+    );
+
+    let (undo_off_col, undo_off_row) = find_text_coords(off_buf, "[U] Undo Boundary").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(undo_off_col + 2, undo_off_row)),
+        None
+    );
+
+    let (reb_off_col, reb_off_row) = find_text_coords(off_buf, "[B] Re-baseline").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(reb_off_col + 2, reb_off_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    let (purge_off_col, purge_off_row) = find_text_coords(off_buf, "[P] Purge Raw").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(purge_off_col + 2, purge_off_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    let (wipe_off_col, wipe_off_row) = find_text_coords(off_buf, "[W] Hard Wipe").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(wipe_off_col + 2, wipe_off_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_mouse_settings_soft_rebaseline_modal_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+    app.active_config = Some(bpmute::config::Config::default());
+
+    // Open SoftRebaselineModal via [B]
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('B'))));
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Backdrop clicks outside modal box do not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+
+    // 2. Clicking `[ ] Force cold-start floors` toggles reset_floors and focuses it (unfocusing text input)
+    assert!(app.is_input_focused());
+    let (chk_col, chk_row) =
+        find_text_coords(terminal.backend().buffer(), "[ ] Force cold-start floors").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(chk_col + 1, chk_row)),
+        None
+    );
+    assert!(!app.is_input_focused());
+    assert!(matches!(
+        app.modal,
+        ModalState::SoftRebaselineModal {
+            reset_floors: true,
+            active_field: bpmute::tui::app::SoftRebaselineField::ResetFloors,
+            ..
+        }
+    ));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("[x] Force cold-start floors"));
+
+    // 3. Clicking `Seed Sleep HR` input focuses text entry, type invalid BPM "20"
+    let (seed_col, seed_row) =
+        find_text_coords(terminal.backend().buffer(), "[ e.g. 54.0  ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(seed_col + 2, seed_row)),
+        None
+    );
+    assert!(app.is_input_focused());
+    for c in "20".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+
+    // 4. Clicking [ Submit ] with out-of-range BPM displays validation error and keeps modal open
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (sub_col, sub_row) = find_text_coords(terminal.backend().buffer(), "[ Submit ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(sub_col + 2, sub_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::SoftRebaselineModal {
+            error_message: Some(_),
+            ..
+        }
+    ));
+
+    // Re-focus Seed Sleep HR, fix to "54.5", and click [ Submit ] -> dispatches CalibrationSetBoundary
+    let (seed_err_col, seed_err_row) =
+        find_text_coords(terminal.backend().buffer(), "[ 20         ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(seed_err_col + 2, seed_err_row)),
+        None
+    );
+    for _ in 0..2 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in "54.5".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (sub_col2, sub_row2) = find_text_coords(terminal.backend().buffer(), "[ Submit ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(sub_col2 + 2, sub_row2)),
+        Some(TuiCommand::CalibrationSetBoundary {
+            effective_ts_ms: None,
+            seed_sleep_hr: Some(54.5),
+            reset_floors: true,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 5. Reopen and click in-modal [ Cancel ] -> closes without command
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('B'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (canc_col, canc_row) = find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_mouse_settings_purge_raw_modal_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+    app.active_config = Some(bpmute::config::Config::default());
+
+    // Open PurgeRawModal via [P]
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('P'))));
+    assert!(matches!(app.modal, ModalState::PurgeRawModal { .. }));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Backdrop clicks do not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::PurgeRawModal { .. }));
+
+    // 2. Clicking in-modal [Enter] Confirm Purge dispatches DataPurgeRaw and closes modal
+    let (confirm_col, confirm_row) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] Confirm Purge").unwrap();
+    assert!(confirm_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(confirm_col + 2, confirm_row)),
+        Some(TuiCommand::DataPurgeRaw)
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 3. Reopen and click in-modal [Esc] Cancel -> closes without command
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('P'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (esc_col, esc_row) = find_text_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert!(esc_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(esc_col + 2, esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}
+
+#[test]
+fn test_mouse_settings_hard_wipe_modal_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+    app.active_config = Some(bpmute::config::Config::default());
+
+    // Open HardWipeModal via [W]
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('W'))));
+    assert!(matches!(app.modal, ModalState::HardWipeModal { .. }));
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Backdrop clicks do not dismiss
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 12)), None);
+    assert!(matches!(app.modal, ModalState::HardWipeModal { .. }));
+
+    // 2. Clicking 'WIPE' confirmation input focuses it; typing wrong text + clicking [Enter] Confirm Wipe shows mismatch error
+    let (in_col, in_row) =
+        find_text_coords(terminal.backend().buffer(), "Type 'WIPE' to confirm:").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(in_col + 24, in_row)),
+        None
+    );
+    assert!(app.is_input_focused());
+    for c in "NOPE".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (confirm_col, confirm_row) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] Confirm Wipe").unwrap();
+    assert!(confirm_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(confirm_col + 2, confirm_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::HardWipeModal {
+            error_message: Some(_),
+            ..
+        }
+    ));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("Confirmation mismatch"));
+
+    // 3. Replace with "WIPE" and click in-modal [Enter] Confirm Wipe -> dispatches DataHardWipe
+    for _ in 0..4 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in "WIPE".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (confirm_col2, confirm_row2) =
+        find_text_coords(terminal.backend().buffer(), "[Enter] Confirm Wipe").unwrap();
+    assert!(confirm_row2 < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(confirm_col2 + 2, confirm_row2)),
+        Some(TuiCommand::DataHardWipe {
+            confirm: "WIPE".into(),
+            wipe_all: false,
+        })
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // 4. Reopen and click in-modal [Esc] Cancel -> closes without command
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('W'))));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (esc_col, esc_row) = find_text_coords(terminal.backend().buffer(), "[Esc] Cancel").unwrap();
+    assert!(esc_row < 23);
+    assert_eq!(
+        app.handle_event(mouse_left_click(esc_col + 2, esc_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+}

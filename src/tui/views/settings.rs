@@ -1,13 +1,15 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::super::app::{ModalState, SoftRebaselineField, TuiApp};
-use super::centered_rect;
+use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
+use super::{build_clickable_row_line, build_modal_clickable_row_line, centered_rect};
 use crate::config::{PowerAction, Sensitivity};
 
-pub fn render_settings(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_settings(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.width < 10 || area.height < 5 {
         return;
     }
@@ -33,14 +35,16 @@ pub fn render_settings(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         .constraints([Constraint::Length(11), Constraint::Min(6)])
         .split(col_chunks[0]);
 
-    render_core_preferences(app, left_chunks[0], buf);
-    render_advanced_settings(app, left_chunks[1], buf);
-    render_calibration_storage(app, col_chunks[1], buf);
+    render_core_preferences(app, left_chunks[0], buf, hit_map);
+    render_advanced_settings(app, left_chunks[1], buf, hit_map);
+    render_calibration_storage(app, col_chunks[1], buf, hit_map);
 
     match app.modal {
-        ModalState::SoftRebaselineModal { .. } => render_soft_rebaseline_modal(app, area, buf),
-        ModalState::PurgeRawModal { .. } => render_purge_raw_modal(app, area, buf),
-        ModalState::HardWipeModal { .. } => render_hard_wipe_modal(app, area, buf),
+        ModalState::SoftRebaselineModal { .. } => {
+            render_soft_rebaseline_modal(app, area, buf, hit_map)
+        }
+        ModalState::PurgeRawModal { .. } => render_purge_raw_modal(app, area, buf, hit_map),
+        ModalState::HardWipeModal { .. } => render_hard_wipe_modal(app, area, buf, hit_map),
         _ => {}
     }
 }
@@ -66,7 +70,8 @@ fn render_config_error_banner(app: &TuiApp, err: &str, area: Rect, buf: &mut Buf
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+    hit_map.push_scroll(area, ScrollTarget::SettingsPreferences);
     let block = app.theme.card_block(" Core Preferences ");
     let inner = block.inner(area);
     block.render(area, buf);
@@ -116,6 +121,15 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let mut lines = Vec::new();
     for (idx, (label, val)) in items.iter().enumerate() {
+        let row_y = inner.y.saturating_add(idx as u16);
+        hit_map.push_clipped_row_click(
+            inner,
+            inner.x,
+            row_y,
+            inner.width,
+            ClickTarget::SettingsSelectOrToggle(idx),
+        );
+
         let is_sel = app.selected_setting_idx == idx;
         let prefix = if is_sel { "> " } else { "  " };
         let prefix_style = if is_sel {
@@ -157,7 +171,7 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_advanced_settings(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_advanced_settings(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let block = app.theme.card_block(" Advanced Settings (Read-Only) ");
     let inner = block.inner(area);
     block.render(area, buf);
@@ -180,7 +194,7 @@ fn render_advanced_settings(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     let adapter_str = cfg.bluetooth.adapter.as_deref().unwrap_or("default");
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("  custom_command : ", app.theme.key_hint()),
             Span::styled(cmd_str, app.theme.base()),
@@ -194,16 +208,26 @@ fn render_advanced_settings(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             Span::styled(adapter_str, app.theme.base()),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  [E] Edit in $EDITOR", app.theme.key_hint()),
-            Span::styled(" (config.toml)", app.theme.muted()),
-        ]),
     ];
+    let editor_y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_clickable_row_line(
+        inner,
+        editor_y,
+        vec![
+            (Span::styled("  ", app.theme.base()), None),
+            (
+                Span::styled("[E] Edit in $EDITOR", app.theme.key_hint()),
+                Some(ClickTarget::SettingsEditorHandoff),
+            ),
+            (Span::styled(" (config.toml)", app.theme.muted()), None),
+        ],
+        hit_map,
+    ));
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_calibration_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_calibration_storage(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let block = app.theme.card_block(" System Settings & Storage ");
     let inner = block.inner(area);
     block.render(area, buf);
@@ -273,17 +297,31 @@ fn render_calibration_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 app.theme.base(),
             ),
         ]));
-        if app.daemon_connected {
-            lines.push(Line::from(vec![
-                Span::styled("    [U] Undo Boundary", app.theme.key_hint()),
-                Span::styled(" (revert to previous baseline)", app.theme.muted()),
-            ]));
+        let undo_y = inner.y.saturating_add(lines.len() as u16);
+        let undo_style = if app.daemon_connected {
+            app.theme.key_hint()
         } else {
-            lines.push(Line::from(vec![
-                Span::styled("    [U] Undo Boundary", app.theme.muted()),
-                Span::styled(" (disabled: daemon offline)", app.theme.muted()),
-            ]));
-        }
+            app.theme.muted()
+        };
+        let undo_suffix = if app.daemon_connected {
+            " (revert to previous baseline)"
+        } else {
+            " (disabled: daemon offline)"
+        };
+        lines.push(build_clickable_row_line(
+            inner,
+            undo_y,
+            vec![
+                (Span::styled("    ", app.theme.base()), None),
+                (
+                    Span::styled("[U] Undo Boundary", undo_style),
+                    app.daemon_connected
+                        .then_some(ClickTarget::SettingsUndoBoundary),
+                ),
+                (Span::styled(undo_suffix, app.theme.muted()), None),
+            ],
+            hit_map,
+        ));
     } else {
         lines.push(Line::from(vec![
             Span::styled("  Active Boundary     : ", app.theme.key_hint()),
@@ -292,25 +330,111 @@ fn render_calibration_storage(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 
     lines.push(Line::from(""));
-    if app.daemon_connected {
-        lines.push(Line::from(vec![
-            Span::styled("  [B] Re-baseline  ", app.theme.key_hint()),
-            Span::styled("[P] Purge Raw  ", app.theme.key_hint()),
-            Span::styled("[W] Hard Wipe", app.theme.key_hint()),
-        ]));
+    let btn_style = if app.daemon_connected {
+        app.theme.key_hint()
     } else {
-        lines.push(Line::from(vec![
-            Span::styled("  [B] Re-baseline  ", app.theme.muted()),
-            Span::styled("[P] Purge Raw  ", app.theme.muted()),
-            Span::styled("[W] Hard Wipe  ", app.theme.muted()),
-            Span::styled("(disabled: daemon offline)", app.theme.muted()),
-        ]));
+        app.theme.muted()
+    };
+    let buttons = [
+        ("[B] Re-baseline", ClickTarget::SettingsOpenRebase),
+        ("[P] Purge Raw", ClickTarget::SettingsOpenPurge),
+        ("[W] Hard Wipe", ClickTarget::SettingsOpenWipe),
+    ];
+    let max_w = usize::from(inner.width);
+    let mut row_items: Vec<(Span<'_>, Option<ClickTarget>)> = Vec::new();
+    let mut row_w = 0usize;
+    for (label, target) in buttons {
+        let gap = "  ";
+        let needed = gap.len() + label.len();
+        if row_w + needed > max_w {
+            flush_wrapped_row(&mut lines, &mut row_items, &mut row_w, inner, hit_map);
+        }
+        row_items.push((Span::styled(gap, app.theme.base()), None));
+        row_items.push((
+            Span::styled(label, btn_style),
+            app.daemon_connected.then_some(target),
+        ));
+        row_w += needed;
     }
+    if !app.daemon_connected {
+        let offline_note = "  (disabled: daemon offline)";
+        if row_w + offline_note.len() > max_w {
+            flush_wrapped_row(&mut lines, &mut row_items, &mut row_w, inner, hit_map);
+        }
+        row_items.push((Span::styled(offline_note, app.theme.muted()), None));
+    }
+    flush_wrapped_row(&mut lines, &mut row_items, &mut row_w, inner, hit_map);
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn flush_wrapped_row<'a>(
+    lines: &mut Vec<Line<'a>>,
+    items: &mut Vec<(Span<'a>, Option<ClickTarget>)>,
+    width: &mut usize,
+    inner: Rect,
+    hit_map: &mut HitMap,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_clickable_row_line(
+        inner,
+        y,
+        std::mem::take(items),
+        hit_map,
+    ));
+    *width = 0;
+}
+
+fn push_modal_error_line<'a>(lines: &mut Vec<Line<'a>>, err: Option<&'a str>, app: &TuiApp) {
+    if let Some(err) = err {
+        lines.push(Line::from(vec![
+            Span::styled(" ⚠ ", app.theme.danger()),
+            Span::styled(err, app.theme.danger()),
+        ]));
+    } else {
+        lines.push(Line::from(""));
+    }
+}
+
+struct ModalButtons<'a> {
+    leading_pad: &'a str,
+    confirm_label: &'a str,
+    confirm_style: Style,
+    between_pad: &'a str,
+    cancel_label: &'a str,
+    cancel_style: Style,
+}
+
+fn push_modal_button_row<'a>(
+    lines: &mut Vec<Line<'a>>,
+    inner: Rect,
+    spec: ModalButtons<'a>,
+    hit_map: &mut HitMap,
+) {
+    let y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_modal_clickable_row_line(
+        inner,
+        y,
+        vec![
+            (Span::styled(spec.leading_pad, Style::default()), None),
+            (
+                Span::styled(spec.confirm_label, spec.confirm_style),
+                Some(ClickTarget::ModalConfirm),
+            ),
+            (Span::styled(spec.between_pad, Style::default()), None),
+            (
+                Span::styled(spec.cancel_label, spec.cancel_style),
+                Some(ClickTarget::CloseModal),
+            ),
+        ],
+        hit_map,
+    ));
+}
+
+fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let ModalState::SoftRebaselineModal {
         ref seed_sleep_hr_input,
         reset_floors,
@@ -322,6 +446,7 @@ fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
 
     let modal_area = centered_rect(area, 56, 12);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
     Clear.render(modal_area, buf);
 
     let block = app
@@ -365,45 +490,74 @@ fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         app.theme.base()
     };
 
+    let seed_target = Some(ClickTarget::SoftRebaselineFocusField(
+        SoftRebaselineField::SeedSleepHr,
+    ));
     let mut lines = vec![
         Line::from(vec![Span::styled(
             " Insert calibration boundary to reset baseline filters.",
             app.theme.muted(),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(" Seed Sleep HR (BPM): ", app.theme.key_hint()),
-            Span::styled(format!("[ {seed_disp:<10} ]"), seed_style),
-        ]),
-        Line::from(vec![
-            Span::styled(" Reset Floors       : ", app.theme.key_hint()),
-            Span::styled(
-                format!("{reset_check} Force cold-start floors"),
-                reset_style,
-            ),
-        ]),
-        Line::from(""),
     ];
+    let seed_y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_modal_clickable_row_line(
+        inner,
+        seed_y,
+        vec![
+            (
+                Span::styled(" Seed Sleep HR (BPM): ", app.theme.key_hint()),
+                seed_target,
+            ),
+            (
+                Span::styled(format!("[ {seed_disp:<10} ]"), seed_style),
+                seed_target,
+            ),
+        ],
+        hit_map,
+    ));
+    let reset_y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_modal_clickable_row_line(
+        inner,
+        reset_y,
+        vec![
+            (
+                Span::styled(" Reset Floors       : ", app.theme.key_hint()),
+                None,
+            ),
+            (
+                Span::styled(
+                    format!("{reset_check} Force cold-start floors"),
+                    reset_style,
+                ),
+                Some(ClickTarget::SoftRebaselineToggleResetFloors),
+            ),
+        ],
+        hit_map,
+    ));
+    lines.push(Line::from(""));
 
-    if let Some(err) = error_message {
-        lines.push(Line::from(vec![
-            Span::styled(" ⚠ ", app.theme.danger()),
-            Span::styled(err, app.theme.danger()),
-        ]));
-    } else {
-        lines.push(Line::from(""));
-    }
-
-    lines.push(Line::from(vec![
-        Span::styled("     [ Submit ]", submit_style),
-        Span::styled("     [ Cancel ]", cancel_style),
-    ]));
+    push_modal_error_line(&mut lines, error_message.as_deref(), app);
+    push_modal_button_row(
+        &mut lines,
+        inner,
+        ModalButtons {
+            leading_pad: "     ",
+            confirm_label: "[ Submit ]",
+            confirm_style: submit_style,
+            between_pad: "     ",
+            cancel_label: "[ Cancel ]",
+            cancel_style,
+        },
+        hit_map,
+    );
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_purge_raw_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_purge_raw_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let modal_area = centered_rect(area, 52, 8);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
     Clear.render(modal_area, buf);
 
     let block = app
@@ -413,7 +567,7 @@ fn render_purge_raw_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let inner = block.inner(modal_area);
     block.render(modal_area, buf);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
             " Purge all raw biometrics older than retention window?",
@@ -424,16 +578,25 @@ fn render_purge_raw_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             app.theme.muted(),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  [Enter] Confirm Purge  ", app.theme.warning()),
-            Span::styled("  [Esc] Cancel", app.theme.base()),
-        ]),
     ];
+    push_modal_button_row(
+        &mut lines,
+        inner,
+        ModalButtons {
+            leading_pad: "  ",
+            confirm_label: "[Enter] Confirm Purge",
+            confirm_style: app.theme.warning(),
+            between_pad: "    ",
+            cancel_label: "[Esc] Cancel",
+            cancel_style: app.theme.base(),
+        },
+        hit_map,
+    );
 
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_hard_wipe_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_hard_wipe_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let ModalState::HardWipeModal {
         ref typed_input,
         ref error_message,
@@ -443,6 +606,7 @@ fn render_hard_wipe_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     };
 
     let modal_area = centered_rect(area, 58, 10);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
     Clear.render(modal_area, buf);
 
     let block = app
@@ -458,26 +622,39 @@ fn render_hard_wipe_modal(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             app.theme.danger(),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled(" Type 'WIPE' to confirm: ", app.theme.key_hint()),
-            Span::styled(format!("[ {:<8} ]", typed_input), app.theme.highlight()),
-        ]),
     ];
+    let wipe_y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_modal_clickable_row_line(
+        inner,
+        wipe_y,
+        vec![
+            (
+                Span::styled(" Type 'WIPE' to confirm: ", app.theme.key_hint()),
+                Some(ClickTarget::FocusModalInput),
+            ),
+            (
+                Span::styled(format!("[ {:<8} ]", typed_input), app.theme.highlight()),
+                Some(ClickTarget::FocusModalInput),
+            ),
+        ],
+        hit_map,
+    ));
 
-    if let Some(err) = error_message {
-        lines.push(Line::from(vec![
-            Span::styled(" ⚠ ", app.theme.danger()),
-            Span::styled(err, app.theme.danger()),
-        ]));
-    } else {
-        lines.push(Line::from(""));
-    }
-
+    push_modal_error_line(&mut lines, error_message.as_deref(), app);
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  [Enter] Confirm Wipe  ", app.theme.danger()),
-        Span::styled("  [Esc] Cancel", app.theme.base()),
-    ]));
+    push_modal_button_row(
+        &mut lines,
+        inner,
+        ModalButtons {
+            leading_pad: "  ",
+            confirm_label: "[Enter] Confirm Wipe",
+            confirm_style: app.theme.danger(),
+            between_pad: "    ",
+            cancel_label: "[Esc] Cancel",
+            cancel_style: app.theme.base(),
+        },
+        hit_map,
+    );
 
     Paragraph::new(lines).render(inner, buf);
 }

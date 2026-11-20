@@ -753,7 +753,7 @@ impl TuiApp {
                 self.wearables_scroll_offset = scroll.table;
                 self.enrollment_scroll_offset = scroll.enrollment;
             }
-            Tab::Settings => render_settings(self, content_area, buf),
+            Tab::Settings => render_settings(self, content_area, buf, &mut hit_map),
         }
 
         if self.modal == ModalState::Help {

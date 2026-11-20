@@ -12,6 +12,8 @@ mod modal;
 mod modal_actions;
 mod mouse;
 
+pub(super) const SETTINGS_PREFERENCE_COUNT: usize = 6;
+
 pub(super) fn step_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -75,7 +77,9 @@ impl TuiApp {
                     && self.selected_session_idx + 1 < self.history_sessions.len()
                 {
                     return self.select_history_session(self.selected_session_idx + 1);
-                } else if self.active_tab == Tab::Settings && self.selected_setting_idx + 1 < 6 {
+                } else if self.active_tab == Tab::Settings
+                    && self.selected_setting_idx + 1 < SETTINGS_PREFERENCE_COUNT
+                {
                     self.selected_setting_idx += 1;
                 }
                 None
@@ -365,7 +369,10 @@ impl TuiApp {
         None
     }
 
-    fn toggle_selected_setting(&mut self) -> Option<TuiCommand> {
+    pub(super) fn toggle_selected_setting(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
         let cfg = self.active_config.as_ref()?;
         match self.selected_setting_idx {
             0 => {
