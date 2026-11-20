@@ -20,7 +20,7 @@ impl GattProfileHrs {
     }
 
     /// List of 128-bit UUID strings matching the profile.
-    #[zbus(property)]
+    #[zbus(property, name = "UUIDs")]
     fn uuids(&self) -> Vec<String> {
         vec![HRS_UUID.to_string()]
     }

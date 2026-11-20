@@ -7,12 +7,11 @@ use crate::config::ConfigPatch;
 use crate::ipc::protocol::{
     CalibrationSetBoundaryParams, DataBackupSqliteParams, DataExportBundleParams,
     DataHardWipeParams, DataImportBundleParams, EnrollAuthResponseParams, EnrollSelectParams,
-    EnrollStartParams, EnrolledWearableStatus, ErrorPayload, PROTOCOL_VERSION, PauseParams,
-    SessionDeleteParams, SessionExportTraceParams, SessionGetParams, SessionListParams,
-    SetDryRunParams, SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableRenameParams,
+    EnrollStartParams, ErrorPayload, PROTOCOL_VERSION, PauseParams, SessionDeleteParams,
+    SessionExportTraceParams, SessionGetParams, SessionListParams, SetDryRunParams,
+    SetFeedbackParams, SetSeedParams, WearableConnectParams, WearableRenameParams,
     WearableUnenrollParams, error_codes,
 };
-use crate::sleep_engine::StreamStatus;
 use crate::storage::{ImportMode, SetFeedbackRequest, WearableDescriptor};
 
 use super::enrollment::try_system_conn;
@@ -312,6 +311,10 @@ impl DaemonCore {
                 if parsed.all && self.paths.config_file.try_exists().unwrap_or(false) {
                     let _ = std::fs::remove_file(&self.paths.config_file);
                 }
+                if parsed.all {
+                    self.wearable_source.notify_allowlist_changed();
+                    self.publish_wearables_updated().await;
+                }
                 self.apply_calibration_update(CalibrationState::default());
                 Ok(json!({ "wiped": true }))
             }
@@ -364,34 +367,15 @@ impl DaemonCore {
                     .await
                     .map_err(storage_to_ipc_err)?;
                 self.apply_calibration_update(cal_state.clone());
+                self.wearable_source.notify_allowlist_changed();
+                self.publish_wearables_updated().await;
                 Ok(json!({ "summary": summary, "calibration": cal_state }))
             }
             "wearable.list" => {
-                let enrolled = self
-                    .persistence
-                    .list_wearables()
+                let statuses = self
+                    .build_wearable_statuses()
                     .await
                     .map_err(storage_to_ipc_err)?;
-                let guard = self.inner.lock().expect("daemon state mutex poisoned");
-                let statuses: Vec<EnrolledWearableStatus> = enrolled
-                    .into_iter()
-                    .map(|w| {
-                        let norm = w.mac.to_ascii_uppercase();
-                        let status = guard
-                            .wearable_statuses
-                            .get(&norm)
-                            .copied()
-                            .unwrap_or(StreamStatus::Disconnected);
-                        let battery = guard.wearable_batteries.get(&norm).copied();
-                        let body_location = guard.wearable_body_locations.get(&norm).cloned();
-                        EnrolledWearableStatus {
-                            wearable: w,
-                            status,
-                            battery,
-                            body_location,
-                        }
-                    })
-                    .collect();
                 Ok(json!({ "wearables": statuses }))
             }
             "wearable.rename" => {
@@ -406,6 +390,8 @@ impl DaemonCore {
                     .rename_wearable(parsed.id, parsed.alias)
                     .await
                     .map_err(storage_to_ipc_err)?;
+                self.wearable_source.notify_allowlist_changed();
+                self.publish_wearables_updated().await;
                 Ok(json!({ "wearable": updated }))
             }
             "wearable.connect" => {
@@ -465,6 +451,8 @@ impl DaemonCore {
                     )
                     .await;
                 }
+                self.wearable_source.notify_allowlist_changed();
+                self.publish_wearables_updated().await;
                 Ok(json!({ "wearable": unenrolled }))
             }
             "wearable.enroll_start" => {
@@ -600,6 +588,8 @@ impl DaemonCore {
                     .upsert_wearable(desc, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
+                self.wearable_source.notify_allowlist_changed();
+                self.publish_wearables_updated().await;
                 let list = self
                     .persistence
                     .list_wearables()

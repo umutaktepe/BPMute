@@ -128,11 +128,24 @@ impl StreamTracker {
     pub fn remove_enrolled(&mut self, mac: &str) {
         let norm = mac.to_ascii_uppercase();
         self.enrolled.remove(&norm);
+        self.connected.remove(&norm);
         self.standby_macs.retain(|m| m != &norm);
+        if matches!(self.pending_rf_disconnect, Some(ref pending) if pending.mac == norm) {
+            self.pending_rf_disconnect = None;
+        }
         if self.active_mac.as_deref() == Some(&norm) {
             self.active_mac = None;
             self.active_status = None;
+            self.acquiring_started_ts_ms = None;
+            self.last_valid_packet_ts_ms = None;
+            self.last_any_packet_ts_ms = None;
+            self.notifying_checked = false;
         }
+    }
+
+    /// Returns whether a Wearable MAC is currently marked connected.
+    pub fn is_connected(&self, mac: &str) -> bool {
+        self.connected.contains(&mac.to_ascii_uppercase())
     }
 
     /// Returns the currently active Wearable MAC address.
@@ -167,6 +180,7 @@ impl StreamTracker {
 
                 if self.active_mac.is_none() {
                     self.transition_status(&norm, StreamStatus::Connecting, ts_ms, &mut actions);
+                    actions.push(LifecycleAction::StartNotify { mac: norm });
                 } else if self.active_mac.as_ref() != Some(&norm)
                     && !self.standby_macs.contains(&norm)
                 {

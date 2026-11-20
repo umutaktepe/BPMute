@@ -58,7 +58,7 @@ pub trait Device1 {
     fn connected(&self) -> zbus::Result<bool>;
     #[zbus(property)]
     fn services_resolved(&self) -> zbus::Result<bool>;
-    #[zbus(property)]
+    #[zbus(property, name = "UUIDs")]
     fn uuids(&self) -> zbus::Result<Vec<String>>;
     #[zbus(property)]
     fn adapter(&self) -> zbus::Result<ObjectPath<'_>>;
@@ -76,13 +76,6 @@ pub trait GattManager1 {
         options: HashMap<&str, Value<'_>>,
     ) -> zbus::Result<()>;
     fn unregister_application(&self, application: ObjectPath<'_>) -> zbus::Result<()>;
-    fn register_profile(
-        &self,
-        profile: ObjectPath<'_>,
-        uuids: &[&str],
-        options: HashMap<&str, Value<'_>>,
-    ) -> zbus::Result<()>;
-    fn unregister_profile(&self, profile: ObjectPath<'_>) -> zbus::Result<()>;
 }
 
 #[proxy(
@@ -94,7 +87,7 @@ pub trait GattCharacteristic1 {
     fn stop_notify(&self) -> zbus::Result<()>;
     fn read_value(&self, flags: HashMap<&str, Value<'_>>) -> zbus::Result<Vec<u8>>;
 
-    #[zbus(property)]
+    #[zbus(property, name = "UUID")]
     fn uuid(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn value(&self) -> zbus::Result<Vec<u8>>;

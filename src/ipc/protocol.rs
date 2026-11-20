@@ -479,6 +479,12 @@ pub struct CalibrationUpdatedEvent {
     pub calibration: CalibrationState,
 }
 
+/// Control event payload pushed as `WearablesUpdated` when wearable status or allowlist changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WearablesUpdatedEvent {
+    pub wearables: Vec<EnrolledWearableStatus>,
+}
+
 /// Discovered Bluetooth LE wearable observed during enrollment discovery scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredWearable {

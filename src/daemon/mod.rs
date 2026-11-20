@@ -184,6 +184,9 @@ impl DaemonHandle {
         let enrollment_driver = opts
             .enrollment_driver
             .unwrap_or_else(|| Arc::new(NoopEnrollmentDriver));
+        let wearable_source = opts
+            .wearable_source
+            .unwrap_or_else(|| Arc::new(NullWearableSource));
 
         let core = Arc::new(DaemonCore::new(DaemonCoreInit {
             paths: opts.paths,
@@ -199,12 +202,10 @@ impl DaemonHandle {
             notifier,
             idle_probe,
             enrollment_driver,
+            wearable_source: Arc::clone(&wearable_source),
             engine_ctrl_tx: ctrl_tx.clone(),
         }));
 
-        let wearable_source = opts
-            .wearable_source
-            .unwrap_or_else(|| Arc::new(NullWearableSource));
         let wearable_rx = wearable_source.subscribe(shutdown_rx.clone());
 
         let monitor_task = tokio::spawn(run_monitoring_loop(
@@ -384,6 +385,7 @@ impl MonitoringContext {
         match ev {
             WearableEvent::StreamState { wearable, state } => {
                 self.core.set_wearable_status(&wearable.mac, state.status);
+                self.core.publish_wearables_updated().await;
                 if state.status == StreamStatus::PassiveStandby {
                     return;
                 }
@@ -408,6 +410,7 @@ impl MonitoringContext {
             } => {
                 self.core
                     .set_wearable_metadata(&wearable.mac, battery, body_location);
+                self.core.publish_wearables_updated().await;
             }
             WearableEvent::HrPacket { wearable, packet } => {
                 self.last_event_ts_ms = Some(packet.ts_ms);

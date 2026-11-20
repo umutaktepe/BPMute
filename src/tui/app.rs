@@ -533,9 +533,20 @@ impl TuiApp {
                 self.sparkline_data.sleeping_hr = cal.mu_sleep;
             }
             IpcEvent::WearablesUpdated(wearables) => {
+                let prev_status = self.active_wearable().map(|w| w.status);
                 self.enrolled_wearables = wearables;
                 if self.selected_wearable_idx >= self.enrolled_wearables.len() {
                     self.selected_wearable_idx = self.enrolled_wearables.len().saturating_sub(1);
+                }
+                let next_status = self.active_wearable().map(|w| w.status);
+                if matches!(
+                    next_status,
+                    None | Some(crate::sleep_engine::StreamStatus::Disconnected)
+                        | Some(crate::sleep_engine::StreamStatus::SignalLost)
+                ) && prev_status != next_status
+                {
+                    self.latest_bpm = None;
+                    self.contact_ok = false;
                 }
             }
             IpcEvent::EnrollmentDiscovered(discovered) => {

@@ -28,6 +28,9 @@ pub enum WearableEvent {
 pub trait WearableSource: Send + Sync {
     /// Subscribes to the Wearable stream until `shutdown_rx` signals `true` or the source stops.
     fn subscribe(&self, shutdown_rx: watch::Receiver<bool>) -> mpsc::Receiver<WearableEvent>;
+
+    /// Notifies the source that the persisted enrolled Wearable allowlist changed.
+    fn notify_allowlist_changed(&self) {}
 }
 
 /// Default no-op [`WearableSource`] used when BLE streaming is inactive (until `#18`).

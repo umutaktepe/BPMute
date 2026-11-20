@@ -180,7 +180,7 @@ async fn run_daemon<WErr: Write>(
     let wearable_source = Arc::new(BluezWearableSource::new(
         db_path,
         loaded.config.notifications.connection_lifecycle,
-        None,
+        loaded.config.bluetooth.adapter.clone(),
         Arc::clone(&clock) as Arc<dyn crate::daemon::DaemonClock>,
     ));
 

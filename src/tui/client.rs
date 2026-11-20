@@ -16,7 +16,7 @@ use crate::ipc::framing::{read_bounded_line, write_ndjson_line};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, EnrollmentUpdateEvent,
     EpochUpdateEvent, GraceTickEvent, HrSampleEvent, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    PushEventEnvelope, RequestEnvelope, ResponseEnvelope,
+    PushEventEnvelope, RequestEnvelope, ResponseEnvelope, WearablesUpdatedEvent,
 };
 use crate::replay::TraceFormat;
 use crate::storage::{SessionFullDetail, SessionListPage, StorageStats};
@@ -282,6 +282,13 @@ async fn handle_incoming_push(push: PushEventEnvelope, event_tx: &mpsc::Sender<T
             {
                 let _ = event_tx
                     .send(TuiEvent::ipc(IpcEvent::CalibrationUpdated(cal)))
+                    .await;
+            }
+        }
+        "WearablesUpdated" => {
+            if let Ok(ev) = serde_json::from_value::<WearablesUpdatedEvent>(push.data) {
+                let _ = event_tx
+                    .send(TuiEvent::ipc(IpcEvent::WearablesUpdated(ev.wearables)))
                     .await;
             }
         }

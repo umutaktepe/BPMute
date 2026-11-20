@@ -21,6 +21,7 @@ use bpmute::cli::execute_cli;
 use bpmute::config::{ActionsConfig, CliOverrides, LoadedConfig, PowerAction, ScheduleConfig};
 use bpmute::daemon::{
     DaemonCore, DaemonHandle, DaemonOptions, EnrollmentPairingHook, VirtualClock,
+    WearableDescriptor, WearableEvent, WearableSource,
 };
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
@@ -30,8 +31,8 @@ use bpmute::ipc::protocol::{
 };
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
-    CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, SessionEndReason,
-    SessionSummary, StreamStatus,
+    CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket,
+    SessionEndReason, SessionSummary, StreamState, StreamStatus,
 };
 use bpmute::storage::EnrolledWearable;
 use bpmute::tui::views::header::{GraceBannerLayout, tab_hit_ranges};
@@ -1934,4 +1935,166 @@ custom_command = ["notify-send", "sleepy"]
         None
     );
     assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+}
+
+struct LiveStreamTestSource {
+    event_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<WearableEvent>>>,
+}
+
+impl WearableSource for LiveStreamTestSource {
+    fn subscribe(&self, mut shutdown_rx: watch::Receiver<bool>) -> mpsc::Receiver<WearableEvent> {
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let rx_arc = Arc::clone(&self.event_rx);
+        tokio::spawn(async move {
+            let mut guard = rx_arc.lock().await;
+            loop {
+                tokio::select! {
+                    ev = guard.recv() => {
+                        match ev {
+                            Some(event) => {
+                                if out_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        out_rx
+    }
+}
+
+#[tokio::test]
+async fn test_real_socket_wearable_stream_status_and_disconnect_updates_live_tui() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 20, 18, 0, 0).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+
+    let (w_tx, w_rx) = mpsc::channel(32);
+    let source = Arc::new(LiveStreamTestSource {
+        event_rx: Arc::new(tokio::sync::Mutex::new(w_rx)),
+    });
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(source),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "EC:09:86:B0:EC:05".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Watch".to_string()),
+        advertised_name: Some("HUAWEI WATCH HR-C05".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), start_utc.timestamp_millis())
+        .await
+        .unwrap();
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+
+    let mut app = TuiApp::new(false, false, false);
+    wait_for_app_state(&mut app, &mut event_rx, |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+    assert_eq!(
+        app.active_wearable().map(|w| w.status),
+        Some(StreamStatus::Disconnected)
+    );
+
+    let t0 = start_utc.timestamp_millis();
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0 + 1_000,
+        },
+    })
+    .await
+    .unwrap();
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t0 + 1_000,
+            bpm: 65.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    let reached_streaming = tokio::time::timeout(Duration::from_secs(1), async {
+        while !app
+            .active_wearable()
+            .is_some_and(|w| w.status == StreamStatus::Streaming && app.latest_bpm == Some(65.0))
+        {
+            let Some(ev) = event_rx.recv().await else {
+                return false;
+            };
+            let _ = app.handle_event(ev);
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        reached_streaming,
+        "TUI must update active wearable status to Streaming and latest_bpm to 65.0"
+    );
+
+    // Watch stops HR broadcast -> daemon emits Disconnected
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc,
+        state: StreamState {
+            status: StreamStatus::Disconnected,
+            ts_ms: t0 + 5_000,
+        },
+    })
+    .await
+    .unwrap();
+
+    let reached_disconnected = tokio::time::timeout(Duration::from_secs(1), async {
+        while !app
+            .active_wearable()
+            .is_some_and(|w| w.status == StreamStatus::Disconnected)
+        {
+            let Some(ev) = event_rx.recv().await else {
+                return false;
+            };
+            let _ = app.handle_event(ev);
+        }
+        true
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        reached_disconnected,
+        "TUI must update active wearable status back to Disconnected when watch stops HR broadcast"
+    );
+    assert_eq!(app.latest_bpm, None);
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
 }

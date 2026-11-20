@@ -7,8 +7,78 @@ use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 use crate::ipc::protocol::DiscoveredWearable;
 
-use super::dbus::{Adapter1Proxy, Battery1Proxy, Device1Proxy, GattCharacteristic1Proxy, HRS_UUID};
+use super::dbus::{
+    Adapter1Proxy, Battery1Proxy, Device1Proxy, GattCharacteristic1Proxy, HRM_CHAR_UUID, HRS_UUID,
+};
 use super::packet::{BodySensorLocation, parse_body_sensor_location};
+
+/// Live BlueZ adapter and device state snapshot queried from `ObjectManager`.
+#[derive(Debug, Default)]
+pub(crate) struct BluezSnapshot {
+    pub adapters: Vec<String>,
+    pub devices: HashMap<String, BluezDeviceSnapshot>,
+}
+
+/// Snapshot of a single BlueZ `Device1` and its optional `0x2A37` characteristic path.
+#[derive(Debug, Default)]
+pub(crate) struct BluezDeviceSnapshot {
+    pub connected: bool,
+    pub hrm_char_path: Option<String>,
+    pub battery_pct: Option<u8>,
+}
+
+/// Inspects current BlueZ adapters, connected devices, `0x2A37` characteristics, and battery levels.
+pub(crate) async fn inspect_bluez_state(conn: &zbus::Connection) -> zbus::Result<BluezSnapshot> {
+    let obj_mgr = ObjectManagerProxy::builder(conn)
+        .destination("org.bluez")?
+        .path("/")?
+        .build()
+        .await?;
+    let managed = obj_mgr.get_managed_objects().await?;
+
+    let mut snap = BluezSnapshot::default();
+    for (path, ifaces) in &managed {
+        if ifaces.contains_key("org.bluez.Adapter1") {
+            snap.adapters.push(path.as_str().to_string());
+        }
+        if let Some(dev_props) = ifaces.get("org.bluez.Device1")
+            && let Some(addr) = extract_string(dev_props.get("Address"))
+        {
+            let mac = addr.to_ascii_uppercase();
+            let entry = snap.devices.entry(mac).or_default();
+            entry.connected = extract_bool(dev_props.get("Connected")).unwrap_or(false);
+        }
+        if let Some(bat_props) = ifaces.get("org.bluez.Battery1")
+            && let Some(mac) = extract_mac_from_path(path.as_str())
+        {
+            let entry = snap.devices.entry(mac).or_default();
+            entry.battery_pct = extract_u8(bat_props.get("Percentage"));
+        }
+        if let Some(char_props) = ifaces.get("org.bluez.GattCharacteristic1")
+            && let Some(uuid) = extract_string(char_props.get("UUID"))
+            && uuid.eq_ignore_ascii_case(HRM_CHAR_UUID)
+            && let Some(mac) = extract_mac_from_path(path.as_str())
+        {
+            let entry = snap.devices.entry(mac).or_default();
+            entry.hrm_char_path = Some(path.as_str().to_string());
+        }
+    }
+
+    Ok(snap)
+}
+
+/// Extracts a normalized uppercase `AA:BB:CC:DD:EE:FF` MAC address from a BlueZ object path.
+pub(crate) fn extract_mac_from_path(path: &str) -> Option<String> {
+    let pos = path.find("/dev_")?;
+    let rest = &path[pos + 5..];
+    let dev_seg = rest.split('/').next().unwrap_or(rest);
+    let mac = dev_seg.replace('_', ":").to_ascii_uppercase();
+    if mac.len() == 17 && mac.bytes().filter(|&b| b == b':').count() == 5 {
+        Some(mac)
+    } else {
+        None
+    }
+}
 
 /// Finds the BlueZ D-Bus object path corresponding to a normalized MAC address.
 pub async fn find_device_object_path(
@@ -92,10 +162,11 @@ pub async fn start_le_discovery(conn: &zbus::Connection, adapter_path: &str) -> 
     let mut filter = HashMap::new();
     filter.insert("Transport", Value::from("le"));
     filter.insert("DuplicateData", Value::from(false));
-    let uuids = vec![Value::from(HRS_UUID)];
-    filter.insert("UUIDs", Value::from(uuids));
+    filter.insert("UUIDs", Value::from(vec![HRS_UUID]));
 
-    let _ = adapter.set_discovery_filter(filter).await;
+    if let Err(err) = adapter.set_discovery_filter(filter).await {
+        tracing::warn!(adapter = %adapter_path, error = %err, "BlueZ Adapter1.SetDiscoveryFilter failed");
+    }
     adapter.start_discovery().await
 }
 
@@ -132,7 +203,9 @@ pub async fn bond_and_trust_device(
         )));
     };
     let device = Device1Proxy::builder(conn).path(path)?.build().await?;
-    let _ = device.set_trusted(true).await;
+    if let Err(err) = device.set_trusted(true).await {
+        tracing::warn!(error = %err, "BlueZ Device1.Trusted=true failed");
+    }
     if pair {
         let is_paired = device.paired().await.unwrap_or(false);
         if !is_paired {
@@ -220,7 +293,7 @@ pub async fn read_battery_percentage(
     battery.percentage().await.map(Some)
 }
 
-fn extract_string(val: Option<&OwnedValue>) -> Option<String> {
+pub(crate) fn extract_string(val: Option<&OwnedValue>) -> Option<String> {
     val.and_then(|v| {
         if let Ok(s) = <&str>::try_from(v) {
             Some(s.to_string())
@@ -234,8 +307,25 @@ fn extract_i16(val: Option<&OwnedValue>) -> Option<i16> {
     val.and_then(|v| i16::try_from(v).ok())
 }
 
-fn extract_bool(val: Option<&OwnedValue>) -> Option<bool> {
+pub(crate) fn extract_u8(val: Option<&OwnedValue>) -> Option<u8> {
+    val.and_then(|v| u8::try_from(v).ok())
+}
+
+pub(crate) fn extract_bool(val: Option<&OwnedValue>) -> Option<bool> {
     val.and_then(|v| bool::try_from(v).ok())
+}
+
+pub(crate) fn extract_byte_array(val: Option<&OwnedValue>) -> Option<Vec<u8>> {
+    let v: &Value<'_> = val?;
+    let Value::Array(arr) = v else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for i in 0..arr.len() {
+        let byte = arr.get::<u8>(i).ok().flatten()?;
+        out.push(byte);
+    }
+    Some(out)
 }
 
 fn extract_string_list(val: Option<&OwnedValue>) -> Vec<String> {

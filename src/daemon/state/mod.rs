@@ -25,9 +25,9 @@ use crate::daemon::EngineControlEvent;
 use crate::idle::{IdleBackendKind, IdleProbe};
 use crate::ipc::protocol::{
     AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
-    DiscoveredWearable, EnrollAuthResponseParams, EpochUpdateEvent, ErrorPayload, HrSampleEvent,
-    MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams, PushEventEnvelope,
-    SessionClosedEvent, alert_ids, error_codes,
+    DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus, EpochUpdateEvent,
+    ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams,
+    PushEventEnvelope, SessionClosedEvent, WearablesUpdatedEvent, alert_ids, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -67,6 +67,7 @@ pub struct DaemonCore {
     pub notifier: Arc<dyn Notifier>,
     pub idle_probe: Arc<dyn IdleProbe>,
     pub enrollment_driver: Arc<dyn EnrollmentPairingHook>,
+    pub wearable_source: Arc<dyn crate::daemon::wearable::WearableSource>,
     pub pipeline: Arc<SleepActionPipeline>,
     pub coordinator: Arc<GraceCoordinator>,
     pub engine_ctrl_tx: mpsc::Sender<EngineControlEvent>,
@@ -124,6 +125,7 @@ pub struct DaemonCoreInit {
     pub notifier: Arc<dyn Notifier>,
     pub idle_probe: Arc<dyn IdleProbe>,
     pub enrollment_driver: Arc<dyn EnrollmentPairingHook>,
+    pub wearable_source: Arc<dyn crate::daemon::wearable::WearableSource>,
     pub engine_ctrl_tx: mpsc::Sender<EngineControlEvent>,
 }
 
@@ -144,6 +146,7 @@ impl DaemonCore {
             notifier,
             idle_probe,
             enrollment_driver,
+            wearable_source,
             engine_ctrl_tx,
         } = init;
         let dry_run = loaded_config.config.actions.dry_run;
@@ -185,6 +188,7 @@ impl DaemonCore {
             notifier,
             idle_probe,
             enrollment_driver,
+            wearable_source,
             pipeline,
             coordinator,
             engine_ctrl_tx,
@@ -328,6 +332,43 @@ impl DaemonCore {
         }
         if let Some(loc) = body_location {
             guard.wearable_body_locations.insert(norm, loc);
+        }
+    }
+
+    /// Builds current enrolled wearable status snapshots by combining SQLite allowlist with runtime status/metadata.
+    pub async fn build_wearable_statuses(
+        &self,
+    ) -> Result<Vec<EnrolledWearableStatus>, StorageError> {
+        let enrolled = self.persistence.list_wearables().await?;
+        let guard = self.inner.lock().expect("daemon state mutex poisoned");
+        Ok(enrolled
+            .into_iter()
+            .map(|w| {
+                let norm = w.mac.to_ascii_uppercase();
+                let status = guard
+                    .wearable_statuses
+                    .get(&norm)
+                    .copied()
+                    .unwrap_or(StreamStatus::Disconnected);
+                let battery = guard.wearable_batteries.get(&norm).copied();
+                let body_location = guard.wearable_body_locations.get(&norm).cloned();
+                EnrolledWearableStatus {
+                    wearable: w,
+                    status,
+                    battery,
+                    body_location,
+                }
+            })
+            .collect())
+    }
+
+    /// Publishes `WearablesUpdated` to all subscribed IPC clients.
+    pub async fn publish_wearables_updated(&self) {
+        let Ok(wearables) = self.build_wearable_statuses().await else {
+            return;
+        };
+        if let Ok(val) = serde_json::to_value(WearablesUpdatedEvent { wearables }) {
+            self.broker.publish_control("WearablesUpdated", val);
         }
     }
 
