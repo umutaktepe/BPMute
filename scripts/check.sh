@@ -18,7 +18,8 @@ if cargo tree --depth 1 -e normal --prefix none | grep -Eq '^(rand|rand_chacha|r
   exit 1
 fi
 
-if find src/sleep_engine src/calibration -name '*.rs' -print0 | xargs -0 awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rusqlite|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }'; then
+mapfile -d '' sync_files < <(find src/sleep_engine src/calibration -name '*.rs' -print0)
+if [ "${#sync_files[@]}" -gt 0 ] && awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rusqlite|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }' "${sync_files[@]}"; then
   echo "error: forbidden async, wall-clock, I/O, SQLite, or RNG usage inside pure-sync core (ADR-0007)" >&2
   exit 1
 fi
@@ -45,14 +46,28 @@ for script in scripts/*.sh .githooks/*; do
   fi
 done
 
-python3 -c '
-import glob, sys, yaml
-for path in sorted(glob.glob(".github/**/*.yml", recursive=True) + glob.glob(".github/**/*.yaml", recursive=True)):
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    if path == ".github/build-setup.yml" and not isinstance(data, list):
-        sys.exit(f"error: {path} must be a top-level YAML sequence of steps for cargo-dist")
-'
+python3 - <<'PY'
+import glob, sys
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+if yaml is not None:
+    for path in sorted(glob.glob(".github/**/*.yml", recursive=True) + glob.glob(".github/**/*.yaml", recursive=True)):
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if path == ".github/build-setup.yml" and not isinstance(data, list):
+            sys.exit(f"error: {path} must be a top-level YAML sequence of steps for cargo-dist")
+else:
+    with open(".github/build-setup.yml", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                if not stripped.startswith("- "):
+                    sys.exit("error: .github/build-setup.yml must be a top-level YAML sequence of steps for cargo-dist")
+                break
+PY
 if command -v actionlint >/dev/null 2>&1; then
   actionlint
 fi
