@@ -430,11 +430,11 @@ impl PpgPipeline {
 
         let hr_slope_4m = self.compute_hr_slope_4m();
 
-        let vals_120s: Vec<(i64, f64)> = self
+        let vals_120s: Vec<TimedValue> = self
             .filtered_bpm_240s
             .iter()
+            .copied()
             .filter(|v| ts_ms - v.ts_ms <= HR_VAR_WINDOW_MS)
-            .map(|v| (v.ts_ms, v.val))
             .collect();
         let local_mad_120s = detrended_scaled_mad(&vals_120s).unwrap_or(SIGMA_MIN_BPM);
 
@@ -507,47 +507,55 @@ impl PpgPipeline {
         if last_ts - first_ts < 60_000 {
             return 0.0;
         }
-        let points: Vec<(i64, f64)> = self
-            .filtered_bpm_240s
-            .iter()
-            .map(|s| (s.ts_ms, s.val))
-            .collect();
-        ols_trend(&points).map_or(0.0, |(_, _, _, slope)| slope)
+        let points: Vec<TimedValue> = self.filtered_bpm_240s.iter().copied().collect();
+        ols_trend(&points).map_or(0.0, |trend| trend.slope)
     }
 }
 
-fn ols_trend(series: &[(i64, f64)]) -> Option<(i64, f64, f64, f64)> {
-    let first_ts = series.first()?.0;
+struct OlsTrend {
+    first_ts: i64,
+    t_mean: f64,
+    y_mean: f64,
+    slope: f64,
+}
+
+fn ols_trend(series: &[TimedValue]) -> Option<OlsTrend> {
+    let first_ts = series.first()?.ts_ms;
     let n = series.len() as f64;
     let mut t_sum = 0.0;
     let mut y_sum = 0.0;
-    for &(ts, val) in series {
-        t_sum += (ts - first_ts) as f64 / 60_000.0;
-        y_sum += val;
+    for sample in series {
+        t_sum += (sample.ts_ms - first_ts) as f64 / 60_000.0;
+        y_sum += sample.val;
     }
     let t_mean = t_sum / n;
     let y_mean = y_sum / n;
 
     let mut num = 0.0;
     let mut den = 0.0;
-    for &(ts, val) in series {
-        let dt = (ts - first_ts) as f64 / 60_000.0 - t_mean;
-        let dy = val - y_mean;
+    for sample in series {
+        let dt = (sample.ts_ms - first_ts) as f64 / 60_000.0 - t_mean;
+        let dy = sample.val - y_mean;
         num += dt * dy;
         den += dt * dt;
     }
     let slope = if den <= 1e-12 { 0.0 } else { num / den };
-    Some((first_ts, t_mean, y_mean, slope))
+    Some(OlsTrend {
+        first_ts,
+        t_mean,
+        y_mean,
+        slope,
+    })
 }
 
-fn detrended_scaled_mad(points: &[(i64, f64)]) -> Option<f64> {
+fn detrended_scaled_mad(points: &[TimedValue]) -> Option<f64> {
     let smoothed;
-    let series: &[(i64, f64)] = if points.len() >= 5 {
+    let series: &[TimedValue] = if points.len() >= 5 {
         smoothed = points
             .windows(5)
-            .map(|w| {
-                let avg = w.iter().map(|p| p.1).sum::<f64>() * 0.2;
-                (w[2].0, avg)
+            .map(|w| TimedValue {
+                ts_ms: w[2].ts_ms,
+                val: w.iter().map(|p| p.val).sum::<f64>() * 0.2,
             })
             .collect::<Vec<_>>();
         &smoothed
@@ -556,12 +564,12 @@ fn detrended_scaled_mad(points: &[(i64, f64)]) -> Option<f64> {
     } else {
         return None;
     };
-    let (first_ts, t_mean, y_mean, slope) = ols_trend(series)?;
+    let trend = ols_trend(series)?;
     let residuals: Vec<f64> = series
         .iter()
-        .map(|&(ts, val)| {
-            let t = (ts - first_ts) as f64 / 60_000.0;
-            val - (y_mean + slope * (t - t_mean))
+        .map(|sample| {
+            let t = (sample.ts_ms - trend.first_ts) as f64 / 60_000.0;
+            sample.val - (trend.y_mean + trend.slope * (t - trend.t_mean))
         })
         .collect();
     scaled_mad(&residuals)

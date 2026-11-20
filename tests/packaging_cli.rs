@@ -404,8 +404,15 @@ fn service_lifecycle_status_logs_and_missing_backend_mapping() {
     ] {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code =
-            run_service_with_runner(cmd, &paths, &env, exec_path, &runner, &mut out, &mut err);
+        let code = run_service_with_runner(
+            cmd,
+            Some(paths.config_file.as_path()),
+            &env,
+            exec_path,
+            &runner,
+            &mut out,
+            &mut err,
+        );
         assert_eq!(code, ExitCode::Success);
         let calls = runner.calls.lock().unwrap();
         assert_eq!(
@@ -448,7 +455,7 @@ fn service_lifecycle_status_logs_and_missing_backend_mapping() {
         let mut err = Vec::new();
         let code = run_service_with_runner(
             ServiceCommand::Status,
-            &paths,
+            Some(paths.config_file.as_path()),
             &env,
             exec_path,
             &status_runner,
@@ -476,7 +483,7 @@ fn service_lifecycle_status_logs_and_missing_backend_mapping() {
     let mut err = Vec::new();
     let code = run_service_with_runner(
         ServiceCommand::Logs { follow: false },
-        &paths,
+        Some(paths.config_file.as_path()),
         &env,
         exec_path,
         &logs_runner,
@@ -486,7 +493,7 @@ fn service_lifecycle_status_logs_and_missing_backend_mapping() {
     assert_eq!(code, ExitCode::Success);
     let code = run_service_with_runner(
         ServiceCommand::Logs { follow: true },
-        &paths,
+        Some(paths.config_file.as_path()),
         &env,
         exec_path,
         &logs_runner,
@@ -534,7 +541,7 @@ fn service_lifecycle_status_logs_and_missing_backend_mapping() {
         ServiceCommand::Install {
             target: ServiceTargetArg::Default,
         },
-        &paths,
+        Some(paths.config_file.as_path()),
         &env,
         exec_path,
         &missing_runner,
@@ -542,6 +549,36 @@ fn service_lifecycle_status_logs_and_missing_backend_mapping() {
         &mut err,
     );
     assert_eq!(code, ExitCode::PermissionOrBackendRefusal);
+}
+
+#[tokio::test]
+async fn service_commands_work_with_xdg_config_only_without_home_or_data_dir() {
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    write_executable_script(&bin_dir, "systemctl", "#!/bin/sh\nexit 0\n");
+
+    let xdg_only_env = MapEnv::new()
+        .with(
+            "XDG_CONFIG_HOME",
+            temp.path().join("cfg").to_string_lossy().into_owned(),
+        )
+        .with("PATH", bin_dir.to_string_lossy().into_owned());
+
+    let (code, _, err) = run_inproc_cli(&["bpmute", "service", "status"], &xdg_only_env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, _, err) = run_inproc_cli(
+        &["bpmute", "service", "install", "--target", "default"],
+        &xdg_only_env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(
+        temp.path()
+            .join("cfg/systemd/user/bpmute.service")
+            .try_exists()
+            .unwrap()
+    );
 }
 
 #[test]

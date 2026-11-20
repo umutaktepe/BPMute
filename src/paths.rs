@@ -146,7 +146,8 @@ fn non_empty_env(env: &dyn EnvSource, key: &str) -> Option<String> {
     env.get(key).filter(|val| !val.is_empty())
 }
 
-fn resolve_config_file(
+/// Resolves the configuration file path using `CLI flag > BPMUTE_CONFIG > XDG_CONFIG_HOME > HOME`.
+pub fn resolve_config_file(
     cli_config: Option<&Path>,
     env: &dyn EnvSource,
 ) -> Result<PathBuf, PathResolutionError> {
@@ -235,12 +236,26 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 
 /// Atomically writes `content` to `path` with `0700` parent directory and `0600` file mode.
 pub fn write_private_file_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
+    write_file_atomic_inner(path, content, true)
+}
+
+/// Atomically writes a `0600` file without altering permissions on a shared parent directory
+/// (such as `~/.config/systemd/user`).
+pub fn write_private_file_atomic_preserve_parent(path: &Path, content: &[u8]) -> io::Result<()> {
+    write_file_atomic_inner(path, content, false)
+}
+
+fn write_file_atomic_inner(path: &Path, content: &[u8], lock_parent_0700: bool) -> io::Result<()> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
     if parent != Path::new(".") {
-        ensure_private_dir(parent)?;
+        if lock_parent_0700 {
+            ensure_private_dir(parent)?;
+        } else {
+            fs::create_dir_all(parent)?;
+        }
     }
 
     let file_name = path

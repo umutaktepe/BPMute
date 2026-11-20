@@ -2,14 +2,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::cli::commands::system_exec::{
-    OsSystemRunner, SystemRunner, classify_systemd_io_error, classify_systemd_stderr,
-    is_executable_file, resolve_program_in_env,
+    OsSystemRunner, SYSTEMD_SERVICE_NAME, SystemRunner, classify_systemd_io_error,
+    classify_systemd_stderr, command_failure_detail, io_error_exit_code, is_executable_file,
+    resolve_program_in_env,
 };
 use crate::exit_code::ExitCode;
 use crate::paths::EnvSource;
 
 const UPDATER_BINARY: &str = "bpmute-update";
-const SERVICE_NAME: &str = "bpmute.service";
 const INSTALLER_URL: &str =
     "https://github.com/umutaktepe/BPMute/releases/latest/download/bpmute-installer.sh";
 
@@ -64,11 +64,7 @@ pub fn run_update_with_runner<WOut: Write, WErr: Write>(
                 "error: failed to launch {}: {err}",
                 updater_path.display()
             );
-            if err.kind() == std::io::ErrorKind::PermissionDenied {
-                ExitCode::PermissionOrBackendRefusal
-            } else {
-                ExitCode::RuntimeError
-            }
+            io_error_exit_code(&err)
         }
     }
 }
@@ -82,7 +78,7 @@ fn maybe_restart_service<WOut: Write, WErr: Write>(
     let active = matches!(
         runner.run_capture(
             "systemctl",
-            &["--user", "is-active", "--quiet", SERVICE_NAME],
+            &["--user", "is-active", "--quiet", SYSTEMD_SERVICE_NAME],
             env,
         ),
         Ok(ref out) if out.status_code == Some(0)
@@ -91,29 +87,36 @@ fn maybe_restart_service<WOut: Write, WErr: Write>(
     if !active {
         let _ = writeln!(
             stdout,
-            "Updated BPMute ({SERVICE_NAME} is not active; skipped service restart)."
+            "Updated BPMute ({SYSTEMD_SERVICE_NAME} is not active; skipped service restart)."
         );
         return ExitCode::Success;
     }
 
-    match runner.run_capture("systemctl", &["--user", "try-restart", SERVICE_NAME], env) {
+    match runner.run_capture(
+        "systemctl",
+        &["--user", "try-restart", SYSTEMD_SERVICE_NAME],
+        env,
+    ) {
         Ok(out) if out.status_code == Some(0) => {
-            let _ = writeln!(stdout, "Updated BPMute and restarted {SERVICE_NAME}.");
+            let _ = writeln!(
+                stdout,
+                "Updated BPMute and restarted {SYSTEMD_SERVICE_NAME}."
+            );
             ExitCode::Success
         }
         Ok(out) => {
-            let detail = if !out.stderr.trim().is_empty() {
-                out.stderr.trim()
-            } else if !out.stdout.trim().is_empty() {
-                out.stdout.trim()
-            } else {
-                "systemctl try-restart failed"
-            };
-            let _ = writeln!(stderr, "error: failed to restart {SERVICE_NAME}: {detail}");
+            let _ = writeln!(
+                stderr,
+                "error: failed to restart {SYSTEMD_SERVICE_NAME}: {}",
+                command_failure_detail(&out)
+            );
             classify_systemd_stderr(&out.stderr)
         }
         Err(err) => {
-            let _ = writeln!(stderr, "error: failed to restart {SERVICE_NAME}: {err}");
+            let _ = writeln!(
+                stderr,
+                "error: failed to restart {SYSTEMD_SERVICE_NAME}: {err}"
+            );
             classify_systemd_io_error(&err)
         }
     }
@@ -127,6 +130,6 @@ fn write_missing_updater_instructions<WErr: Write>(stderr: &mut WErr) {
            - cargo binstall bpmute\n  \
            - curl --proto '=https' --tlsv1.2 -LsSf {INSTALLER_URL} | sh\n\n\
          If the background daemon is running, restart it afterwards with:\n  \
-           systemctl --user try-restart {SERVICE_NAME}"
+           systemctl --user try-restart {SYSTEMD_SERVICE_NAME}"
     );
 }

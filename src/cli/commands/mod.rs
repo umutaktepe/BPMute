@@ -13,7 +13,7 @@ use crate::exit_code::ExitCode;
 use crate::ipc::protocol::ConfigSnapshotPayload;
 use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus};
 use crate::logging::init_logging;
-use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
+use crate::paths::{EnvSource, ResolvedPaths, resolve_config_file, split_shell_words};
 use crate::storage::{LedgerStore, StorageError, db_exists, db_path_in_data_dir};
 
 pub mod completions;
@@ -27,7 +27,6 @@ pub mod wearables;
 
 use data::run_data;
 use monitor::{run_cancel, run_snooze, run_test_trigger};
-use service::run_service;
 use sessions::{run_calibration, run_replay, run_sessions};
 use wearables::{run_enroll, run_wearables};
 
@@ -54,6 +53,21 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
             return completions::run_completions(shell, stdout);
         }
         Some(Command::Update) => return update::run_update(env, stdout, stderr),
+        Some(Command::Service { action }) => {
+            let config_file = match action {
+                crate::cli::args::ServiceCommand::Uninstall { purge_config: true } => {
+                    match resolve_config_file(cli.config.as_deref(), env) {
+                        Ok(p) => Some(p),
+                        Err(err) => {
+                            let _ = writeln!(stderr, "error: {err}");
+                            return ExitCode::UsageOrConfigError;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            return service::run_service(action, config_file.as_deref(), env, stdout, stderr);
+        }
         _ => {}
     }
 
@@ -124,8 +138,9 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
         Some(Command::Config { action }) => {
             run_config(action, &paths, env, &cli_overrides, stdout, stderr).await
         }
-        Some(Command::Service { action }) => run_service(action, &paths, env, stdout, stderr),
-        Some(Command::Completions { .. }) | Some(Command::Update) => {
+        Some(Command::Service { .. })
+        | Some(Command::Completions { .. })
+        | Some(Command::Update) => {
             unreachable!("handled before path resolution")
         }
     }

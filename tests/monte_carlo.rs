@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use bpmute::config::{DetectionConfig, Sensitivity};
 use bpmute::paths::{EnvSource, ProcessEnv};
+use bpmute::sleep_engine::ppg::quantile;
 use bpmute::sleep_engine::{
     CalibrationMaturity, CalibrationPriors, DetectorState, EngineConfig, EngineEvent, EngineOutput,
     GraceOutcome, GraceResult, SleepEngine, WearableFloor,
@@ -19,8 +20,8 @@ use rand_chacha::rand_core::SeedableRng;
 use serde::Serialize;
 
 const ROOT_SEED: u64 = 0x5EED_B907_E024;
-const NUM_SLEEP_NIGHTS: usize = 100;
-const NUM_WAKE_NIGHTS: usize = 100;
+const NUM_SLEEP_SESSIONS: usize = 100;
+const NUM_WAKE_SESSIONS: usize = 100;
 
 const MIN_WAKE_SPECIFICITY: f64 = 0.98;
 const MIN_SLEEP_RECALL: f64 = 0.95;
@@ -47,9 +48,9 @@ enum WakeArchetype {
 #[derive(Debug, Serialize)]
 struct ModeMetricsReport {
     mode: String,
-    total_nights: usize,
-    sleep_nights: usize,
-    wake_nights: usize,
+    total_sessions: usize,
+    sleep_sessions: usize,
+    wake_sessions: usize,
     wake_negatives_total: usize,
     wake_false_positives: usize,
     pre_onset_false_positives: usize,
@@ -68,20 +69,20 @@ struct ModeMetricsReport {
 #[derive(Debug, Serialize)]
 struct MonteCarloReport {
     seed: u64,
-    total_nights: usize,
-    sleep_nights: usize,
-    wake_nights: usize,
+    total_sessions: usize,
+    sleep_sessions: usize,
+    wake_sessions: usize,
     rhr_range_bpm: [f64; 2],
     drop_range_bpm: [f64; 2],
     bpm_rr: ModeMetricsReport,
     bpm_only: ModeMetricsReport,
     all_gates_passed: bool,
-    failures: Vec<NightFailureRecord>,
+    failures: Vec<SessionFailureRecord>,
 }
 
 #[derive(Debug, Serialize)]
-struct NightFailureRecord {
-    night_index: usize,
+struct SessionFailureRecord {
+    session_index: usize,
     kind: String,
     mode: String,
     archetype: String,
@@ -115,39 +116,40 @@ impl ModeStatsAccum {
     }
 
     fn finalize(&self, max_median_min: f64) -> ModeMetricsReport {
-        // Specificity evaluated across all wake-only negatives plus pre-onset windows on sleep nights,
-        // or wake-negatives alone; report strict combined FP count while checking specificity >= 98%.
+        let total_sessions = self.sleep_total + self.wake_negatives_total;
         let total_fp = self.wake_false_positives + self.pre_onset_false_positives;
-        let denom_spec = self.wake_negatives_total;
-        let wake_specificity = if denom_spec > 0 {
-            1.0 - (total_fp as f64 / denom_spec as f64)
+        let wake_specificity = if self.wake_negatives_total > 0 {
+            1.0 - (self.wake_false_positives as f64 / self.wake_negatives_total as f64)
         } else {
             1.0
         };
-        let false_positive_rate = 1.0 - wake_specificity;
+        let false_positive_rate = if total_sessions > 0 {
+            total_fp as f64 / total_sessions as f64
+        } else {
+            0.0
+        };
         let sleep_recall = if self.sleep_total > 0 {
             self.sleep_true_positives as f64 / self.sleep_total as f64
         } else {
             1.0
         };
 
-        let mut sorted = self.latencies_min.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        let median_latency_min = percentile(&sorted, 0.50);
-        let p95_latency_min = percentile(&sorted, 0.95);
-        let max_latency_min = sorted.last().copied().unwrap_or(0.0);
+        let median_latency_min = quantile(&self.latencies_min, 0.50).unwrap_or(f64::NAN);
+        let p95_latency_min = quantile(&self.latencies_min, 0.95).unwrap_or(f64::NAN);
+        let max_latency_min = self.latencies_min.iter().copied().fold(0.0_f64, f64::max);
 
         let gates_passed = wake_specificity >= MIN_WAKE_SPECIFICITY
+            && false_positive_rate <= (1.0 - MIN_WAKE_SPECIFICITY)
             && sleep_recall >= MIN_SLEEP_RECALL
-            && !sorted.is_empty()
+            && !self.latencies_min.is_empty()
             && median_latency_min <= max_median_min
             && p95_latency_min <= MAX_P95_LATENCY_MIN;
 
         ModeMetricsReport {
             mode: self.mode.to_string(),
-            total_nights: self.sleep_total + self.wake_negatives_total,
-            sleep_nights: self.sleep_total,
-            wake_nights: self.wake_negatives_total,
+            total_sessions,
+            sleep_sessions: self.sleep_total,
+            wake_sessions: self.wake_negatives_total,
             wake_negatives_total: self.wake_negatives_total,
             wake_false_positives: self.wake_false_positives,
             pre_onset_false_positives: self.pre_onset_false_positives,
@@ -162,24 +164,6 @@ impl ModeStatsAccum {
             max_latency_min,
             gates_passed,
         }
-    }
-}
-
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return f64::NAN;
-    }
-    if sorted.len() == 1 {
-        return sorted[0];
-    }
-    let pos = p.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    if lo == hi {
-        sorted[lo]
-    } else {
-        let frac = pos - lo as f64;
-        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
     }
 }
 
@@ -477,11 +461,11 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
     let mut md = String::new();
     md.push_str("# BPMute Tier 2 Seeded Monte Carlo Report\n\n");
     md.push_str(&format!(
-        "- **Seed:** `0x{:X}`\n- **Total Nights:** `{}` (`{}` sleep-onset + `{}` hard wake-negative, paired `BPM+RR` & `BPM-only`)\n- **Phenotype Sweep:** RHR `{:.0}–{:.0} bpm`, sleep drop `{:.0}–{:.0} bpm`, noisy PPG (`GT5 ramp`, `Hampel spikes`, `short gaps`, `>5% RR corruption`, `N2 plateaus`)\n- **Overall Status:** **{}**\n\n",
+        "- **Seed:** `0x{:X}`\n- **Total Monitoring Sessions:** `{}` (`{}` sleep-onset + `{}` hard wake-negative, paired `BPM+RR` & `BPM-only`)\n- **Phenotype Sweep:** RHR `{:.1}–{:.1} bpm`, sleep drop `{:.1}–{:.1} bpm`, noisy PPG (`GT5 ramp`, `Hampel spikes`, `short gaps`, `>5% RR corruption`, `N2 plateaus`)\n- **Overall Status:** **{}**\n\n",
         report.seed,
-        report.total_nights,
-        report.sleep_nights,
-        report.wake_nights,
+        report.total_sessions,
+        report.sleep_sessions,
+        report.wake_sessions,
         report.rhr_range_bpm[0],
         report.rhr_range_bpm[1],
         report.drop_range_bpm[0],
@@ -499,15 +483,17 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
         (&report.bpm_only, MAX_MEDIAN_LATENCY_BPM_ONLY_MIN),
     ] {
         md.push_str(&format!(
-            "| `{}` | {:.2}% ({} FP / {}) | {:.2}% | {:.2}% ({}/{}) | {:.2} min (<= {:.1}) | {:.2} min (<= {:.1}) | {:.2} min | {} |\n",
+            "| `{}` | {:.2}% ({} wake FP / {}) | {:.2}% ({} / {}) | {:.2}% ({}/{}) | {:.2} min (<= {:.1}) | {:.2} min (<= {:.1}) | {:.2} min | {} |\n",
             m.mode,
             m.wake_specificity * 100.0,
-            m.total_false_positives,
+            m.wake_false_positives,
             m.wake_negatives_total,
             m.false_positive_rate * 100.0,
+            m.total_false_positives,
+            m.total_sessions,
             m.sleep_recall * 100.0,
             m.sleep_true_positives,
-            m.sleep_nights,
+            m.sleep_sessions,
             m.median_latency_min,
             med_limit,
             m.p95_latency_min,
@@ -521,8 +507,8 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
         md.push_str("\n## Notable Failures / Misses\n\n");
         for f in report.failures.iter().take(20) {
             md.push_str(&format!(
-                "- Night #{} (`{}`, `{}`, `{}`, `{}`): RHR {:.1} bpm, drop {:.1} bpm — {}\n",
-                f.night_index,
+                "- Session #{} (`{}`, `{}`, `{}`, `{}`): RHR {:.1} bpm, drop {:.1} bpm — {}\n",
+                f.session_index,
                 f.kind,
                 f.mode,
                 f.archetype,
@@ -537,12 +523,16 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
 }
 
 #[test]
-#[ignore = "Tier 2 seeded Monte Carlo sweep (~200 nights); run with cargo test --release --test monte_carlo -- --ignored --nocapture"]
+#[ignore = "Tier 2 seeded Monte Carlo sweep (~200 Monitoring Sessions); run with cargo test --release --test monte_carlo -- --ignored --nocapture"]
 fn tier2_seeded_monte_carlo_sweep() {
     let mut rng = ChaCha8Rng::seed_from_u64(ROOT_SEED);
     let mut bpm_rr_stats = ModeStatsAccum::new("BPM+RR");
     let mut bpm_only_stats = ModeStatsAccum::new("BPM-only");
     let mut failures = Vec::new();
+    let mut min_rhr = f64::INFINITY;
+    let mut max_rhr = f64::NEG_INFINITY;
+    let mut min_drop = f64::INFINITY;
+    let mut max_drop = f64::NEG_INFINITY;
 
     let sleep_arches = [
         (SleepArchetype::StandardN1N2, "StandardN1N2"),
@@ -563,9 +553,14 @@ fn tier2_seeded_monte_carlo_sweep() {
         (WakeArchetype::ActiveDeskSpikes, "ActiveDeskSpikes"),
     ];
 
-    // 100 randomized sleep-onset nights
-    for idx in 0..NUM_SLEEP_NIGHTS {
+    // 100 randomized sleep-onset Monitoring Sessions
+    for idx in 0..NUM_SLEEP_SESSIONS {
         let pheno = random_phenotype(&mut rng);
+        min_rhr = min_rhr.min(pheno.quiet_wake_hr);
+        max_rhr = max_rhr.max(pheno.quiet_wake_hr);
+        min_drop = min_drop.min(pheno.sleep_drop_bpm);
+        max_drop = max_drop.max(pheno.sleep_drop_bpm);
+
         let (priors, maturity_label) = random_priors(&mut rng, pheno);
         let (arch, arch_name) = sleep_arches[idx % sleep_arches.len()];
         let (stages, total_sec) = build_sleep_stages(&mut rng, arch);
@@ -592,8 +587,8 @@ fn tier2_seeded_monte_carlo_sweep() {
             let pre_onset = confirmed.iter().any(|&t| t < onset_ms);
             if pre_onset {
                 stats.pre_onset_false_positives += 1;
-                failures.push(NightFailureRecord {
-                    night_index: idx,
+                failures.push(SessionFailureRecord {
+                    session_index: idx,
                     kind: "sleep".to_string(),
                     mode: mode_name.to_string(),
                     archetype: arch_name.to_string(),
@@ -608,8 +603,8 @@ fn tier2_seeded_monte_carlo_sweep() {
                     .latencies_min
                     .push((first_conf - onset_ms) as f64 / 60_000.0);
             } else {
-                failures.push(NightFailureRecord {
-                    night_index: idx,
+                failures.push(SessionFailureRecord {
+                    session_index: idx,
                     kind: "sleep".to_string(),
                     mode: mode_name.to_string(),
                     archetype: arch_name.to_string(),
@@ -622,9 +617,14 @@ fn tier2_seeded_monte_carlo_sweep() {
         }
     }
 
-    // 100 randomized hard wake-negative nights
-    for idx in 0..NUM_WAKE_NIGHTS {
+    // 100 randomized hard wake-negative Monitoring Sessions
+    for idx in 0..NUM_WAKE_SESSIONS {
         let pheno = random_phenotype(&mut rng);
+        min_rhr = min_rhr.min(pheno.quiet_wake_hr);
+        max_rhr = max_rhr.max(pheno.quiet_wake_hr);
+        min_drop = min_drop.min(pheno.sleep_drop_bpm);
+        max_drop = max_drop.max(pheno.sleep_drop_bpm);
+
         let (priors, maturity_label) = random_priors(&mut rng, pheno);
         let (arch, arch_name) = wake_arches[idx % wake_arches.len()];
         let (stages, total_sec) = build_wake_stages(&mut rng, arch);
@@ -643,8 +643,8 @@ fn tier2_seeded_monte_carlo_sweep() {
             let confirmed = run_engine(events, priors.clone());
             if !confirmed.is_empty() {
                 stats.wake_false_positives += 1;
-                failures.push(NightFailureRecord {
-                    night_index: NUM_SLEEP_NIGHTS + idx,
+                failures.push(SessionFailureRecord {
+                    session_index: NUM_SLEEP_SESSIONS + idx,
                     kind: "wake_negative".to_string(),
                     mode: mode_name.to_string(),
                     archetype: arch_name.to_string(),
@@ -663,11 +663,11 @@ fn tier2_seeded_monte_carlo_sweep() {
 
     let report = MonteCarloReport {
         seed: ROOT_SEED,
-        total_nights: NUM_SLEEP_NIGHTS + NUM_WAKE_NIGHTS,
-        sleep_nights: NUM_SLEEP_NIGHTS,
-        wake_nights: NUM_WAKE_NIGHTS,
-        rhr_range_bpm: [45.0, 85.0],
-        drop_range_bpm: [5.0, 15.0],
+        total_sessions: NUM_SLEEP_SESSIONS + NUM_WAKE_SESSIONS,
+        sleep_sessions: NUM_SLEEP_SESSIONS,
+        wake_sessions: NUM_WAKE_SESSIONS,
+        rhr_range_bpm: [min_rhr, max_rhr],
+        drop_range_bpm: [min_drop, max_drop],
         bpm_rr: bpm_rr_report,
         bpm_only: bpm_only_report,
         all_gates_passed,

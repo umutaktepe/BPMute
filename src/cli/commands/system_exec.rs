@@ -7,6 +7,8 @@ use std::process::Command as ProcessCommand;
 use crate::exit_code::ExitCode;
 use crate::paths::EnvSource;
 
+pub(crate) const SYSTEMD_SERVICE_NAME: &str = "bpmute.service";
+
 const PROPAGATED_ENV_KEYS: &[&str] = &[
     "PATH",
     "HOME",
@@ -145,5 +147,25 @@ pub fn classify_systemd_stderr(stderr: &str) -> ExitCode {
         ExitCode::PermissionOrBackendRefusal
     } else {
         ExitCode::RuntimeError
+    }
+}
+
+/// Maps a filesystem I/O error to a semantic CLI exit code.
+pub(crate) fn io_error_exit_code(err: &io::Error) -> ExitCode {
+    if err.kind() == io::ErrorKind::PermissionDenied {
+        ExitCode::PermissionOrBackendRefusal
+    } else {
+        ExitCode::RuntimeError
+    }
+}
+
+/// Extracts the most informative diagnostic line from a failed command's captured output.
+pub(crate) fn command_failure_detail(out: &CommandOutput) -> &str {
+    if !out.stderr.trim().is_empty() {
+        out.stderr.trim()
+    } else if !out.stdout.trim().is_empty() {
+        out.stdout.trim()
+    } else {
+        "command exited with non-zero status"
     }
 }
