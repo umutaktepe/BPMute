@@ -12,6 +12,7 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 - **Virtual-time sleeps**: Any async test exercising countdowns, settle delays, or timeouts must use `#[tokio::test(start_paused = true)]` (or explicit `tokio::time::pause()`). Never use unpaused `tokio::time::sleep(...)` with wall-clock durations; virtual time advances instantaneously, keeping the test suite runtime under target bounds (ADR-0007).
 - **OS thread I/O vs. virtual time**: In `#[tokio::test(start_paused = true)]`, do NOT wrap IPC or socket calls in `tokio::time::timeout(...)` when the daemon must communicate with an OS worker thread doing SQLite/disk I/O. Tokio will advance virtual time immediately past the timeout before the OS thread can finish. Call `client.next_event().await` without an outer timeout; Tokio will park the test task and wake it when the socket produces bytes.
 - **Stream event synchronization**: When feeding simulated wearable streams into `FakeWearableSource`, wait for the expected stream events (e.g., `EpochUpdate`) to arrive before issuing live reconfiguration calls (such as `config.update`). Otherwise, `tokio::select!` in the monitoring loop can interleave the config change before the epoch features are processed and stored.
+- **In-process mock servers with child processes**: Tests hosting an in-process async server (such as a mock `org.bluez` D-Bus server) while spawning child CLI processes that call it must use `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]` and `tokio::process::Command`; blocking `std::process::Command::output()` on a `current_thread` runtime deadlocks the shared executor.
 
 ## Process Boundaries & Logging
 
@@ -37,3 +38,4 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 ## Test Execution
 
 - **Canonical runner**: Run iterative test subsets with `./scripts/test.sh <args>` (enforces the `timeout 30` bound and hermetic `DBUS_*` isolation) so hung tests fail fast without touching host D-Bus.
+- **Foreground diagnostics under desktop sessions**: Desktop environments (such as KDE Plasma Wayland) set `JOURNAL_STREAM`, causing `bpmute daemon` with default `--log-format auto` to log to `journald` instead of terminal stderr; pass `--log-format pretty --log-level bpmute=trace` when inspecting live terminal output.

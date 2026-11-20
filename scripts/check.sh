@@ -34,6 +34,21 @@ if grep -En '#!/usr/bin/env[[:space:]]' tests/*.rs; then
   exit 1
 fi
 
+if grep -En 'let[[:space:]]+_[[:space:]]*=[[:space:]]*(adapter|device|mgr|proxy)\.' src/bluetooth/*.rs; then
+  echo "error: silent let _ = on BlueZ D-Bus proxy calls is forbidden in src/bluetooth/; log or propagate errors" >&2
+  exit 1
+fi
+
+if ! grep -Eq 'parse_hr_measurement\(' src/bluetooth/service.rs; then
+  echo "error: parse_hr_measurement must be wired into production src/bluetooth/service.rs" >&2
+  exit 1
+fi
+
+if ! grep -Eq '"WearablesUpdated"' src/daemon/state/mod.rs || ! grep -Eq '"WearablesUpdated"' src/tui/client.rs; then
+  echo "error: WearablesUpdated IPC control event must stay wired between daemon and TUI" >&2
+  exit 1
+fi
+
 for script in scripts/*.sh .githooks/*; do
   [ -f "$script" ] || continue
   if [ ! -x "$script" ]; then
