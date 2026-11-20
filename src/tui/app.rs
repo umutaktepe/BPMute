@@ -717,6 +717,10 @@ impl TuiApp {
                         if matches!(self.modal, ModalState::EnrollmentModal { .. }) {
                             self.close_modal();
                         }
+                        self.op_feedback = message.map(|msg| OpFeedback {
+                            is_error: false,
+                            message: msg,
+                        });
                     } else if let ModalState::EnrollmentModal {
                         ref mut enrolling,
                         ref mut pairing_prompt,

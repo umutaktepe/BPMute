@@ -20,6 +20,18 @@ const ADAPTER_PATH: &str = "/org/bluez/hci0";
 const DEVICE_MAC: &str = "AA:BB:CC:DD:EE:FF";
 const DEVICE_PATH: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF";
 const HRM_CHAR_PATH: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0010/char0011";
+const DEVICE2_MAC: &str = "11:22:33:44:55:66";
+const DEVICE2_PATH: &str = "/org/bluez/hci0/dev_11_22_33_44_55_66";
+const HRM_CHAR2_PATH: &str = "/org/bluez/hci0/dev_11_22_33_44_55_66/service0010/char0011";
+
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.bluez.Error")]
+enum MockBluezError {
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    AlreadyConnected(String),
+    Failed(String),
+}
 
 struct ChildGuard(Child);
 
@@ -78,6 +90,10 @@ struct MockBluezState {
     app_registered: Arc<AtomicBool>,
     discovering: Arc<AtomicBool>,
     fail_start_discovery: Arc<AtomicBool>,
+    fail_connect: Arc<AtomicBool>,
+    expose_second_wearable: Arc<AtomicBool>,
+    second_connected: Arc<AtomicBool>,
+    second_notify_started: Arc<AtomicBool>,
 }
 
 struct MockBluezOptions<'a> {
@@ -88,6 +104,8 @@ struct MockBluezOptions<'a> {
     initial_connected: bool,
     initial_gatt: bool,
     fail_start_discovery: bool,
+    fail_connect: bool,
+    expose_second_wearable: bool,
 }
 
 impl Default for MockBluezOptions<'_> {
@@ -100,6 +118,8 @@ impl Default for MockBluezOptions<'_> {
             initial_connected: false,
             initial_gatt: false,
             fail_start_discovery: false,
+            fail_connect: false,
+            expose_second_wearable: false,
         }
     }
 }
@@ -170,6 +190,41 @@ impl MockObjectManager {
             objects.insert(
                 OwnedObjectPath::try_from(self.state.hrm_char_path.as_str()).unwrap(),
                 char_ifaces,
+            );
+        }
+
+        if self.state.expose_second_wearable.load(Ordering::SeqCst) {
+            let mut dev2_ifaces = HashMap::new();
+            let mut dev2_props = HashMap::new();
+            dev2_props.insert("Address".to_string(), owned(DEVICE2_MAC));
+            dev2_props.insert("AddressType".to_string(), owned("public"));
+            dev2_props.insert("Name".to_string(), owned("Polar H10 Secondary"));
+            dev2_props.insert("Paired".to_string(), owned(false));
+            dev2_props.insert("Trusted".to_string(), owned(false));
+            dev2_props.insert(
+                "Connected".to_string(),
+                owned(self.state.second_connected.load(Ordering::SeqCst)),
+            );
+            dev2_props.insert("RSSI".to_string(), owned(-60i16));
+            dev2_props.insert("UUIDs".to_string(), owned(vec![HRS_UUID]));
+            dev2_ifaces.insert("org.bluez.Device1".to_string(), dev2_props);
+            objects.insert(
+                OwnedObjectPath::try_from(DEVICE2_PATH).unwrap(),
+                dev2_ifaces,
+            );
+
+            let mut char2_ifaces = HashMap::new();
+            let mut char2_props = HashMap::new();
+            char2_props.insert("UUID".to_string(), owned(HRM_CHAR_UUID));
+            char2_props.insert(
+                "Notifying".to_string(),
+                owned(self.state.second_notify_started.load(Ordering::SeqCst)),
+            );
+            char2_props.insert("Value".to_string(), owned(vec![0x06u8, 65u8]));
+            char2_ifaces.insert("org.bluez.GattCharacteristic1".to_string(), char2_props);
+            objects.insert(
+                OwnedObjectPath::try_from(HRM_CHAR2_PATH).unwrap(),
+                char2_ifaces,
             );
         }
 
@@ -255,8 +310,30 @@ struct MockDevice {
 
 #[interface(name = "org.bluez.Device1")]
 impl MockDevice {
-    fn connect(&self) {
+    async fn connect(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> Result<(), MockBluezError> {
+        if self.state.fail_connect.load(Ordering::SeqCst) {
+            return Err(MockBluezError::Failed("Host is down".into()));
+        }
+        if self.state.connected.load(Ordering::SeqCst) {
+            return Err(MockBluezError::AlreadyConnected("Already Connected".into()));
+        }
         self.state.connected.store(true, Ordering::SeqCst);
+        let mut changed: HashMap<&str, Value<'_>> = HashMap::new();
+        changed.insert("Connected", Value::from(true));
+        let empty_inv: Vec<&str> = Vec::new();
+        let _ = conn
+            .emit_signal(
+                Option::<zbus::names::BusName>::None,
+                self.state.device_path.as_str(),
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &("org.bluez.Device1", changed, &empty_inv),
+            )
+            .await;
+        Ok(())
     }
     fn disconnect(&self) {
         self.state.connected.store(false, Ordering::SeqCst);
@@ -319,6 +396,93 @@ impl MockHrmCharacteristic {
     }
 }
 
+struct MockDevice2 {
+    state: MockBluezState,
+}
+
+#[interface(name = "org.bluez.Device1")]
+impl MockDevice2 {
+    async fn connect(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> Result<(), MockBluezError> {
+        self.state.second_connected.store(true, Ordering::SeqCst);
+        let mut changed: HashMap<&str, Value<'_>> = HashMap::new();
+        changed.insert("Connected", Value::from(true));
+        let empty_inv: Vec<&str> = Vec::new();
+        let _ = conn
+            .emit_signal(
+                Option::<zbus::names::BusName>::None,
+                DEVICE2_PATH,
+                "org.freedesktop.DBus.Properties",
+                "PropertiesChanged",
+                &("org.bluez.Device1", changed, &empty_inv),
+            )
+            .await;
+        Ok(())
+    }
+    fn disconnect(&self) {
+        self.state.second_connected.store(false, Ordering::SeqCst);
+    }
+
+    #[zbus(property)]
+    fn address(&self) -> String {
+        DEVICE2_MAC.to_string()
+    }
+
+    #[zbus(property)]
+    fn connected(&self) -> bool {
+        self.state.second_connected.load(Ordering::SeqCst)
+    }
+
+    #[zbus(property)]
+    fn paired(&self) -> bool {
+        false
+    }
+
+    #[zbus(property)]
+    fn trusted(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn set_trusted(&self, _value: bool) {}
+}
+
+struct MockHrmCharacteristic2 {
+    state: MockBluezState,
+}
+
+#[interface(name = "org.bluez.GattCharacteristic1")]
+impl MockHrmCharacteristic2 {
+    async fn start_notify(&self) {
+        self.state
+            .second_notify_started
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn stop_notify(&self) {
+        self.state
+            .second_notify_started
+            .store(false, Ordering::SeqCst);
+    }
+
+    #[zbus(property)]
+    fn uuid(&self) -> String {
+        HRM_CHAR_UUID.to_string()
+    }
+
+    #[zbus(property)]
+    fn notifying(&self) -> bool {
+        self.state.second_notify_started.load(Ordering::SeqCst)
+    }
+
+    #[zbus(property)]
+    fn value(&self) -> Vec<u8> {
+        vec![0x06, 65]
+    }
+}
+
 async fn start_mock_bluez(
     bus_addr: &str,
     expose_wearable: bool,
@@ -357,6 +521,10 @@ async fn start_mock_bluez_with_options(
         app_registered: Arc::new(AtomicBool::new(false)),
         discovering: Arc::new(AtomicBool::new(false)),
         fail_start_discovery: Arc::new(AtomicBool::new(opts.fail_start_discovery)),
+        fail_connect: Arc::new(AtomicBool::new(opts.fail_connect)),
+        expose_second_wearable: Arc::new(AtomicBool::new(opts.expose_second_wearable)),
+        second_connected: Arc::new(AtomicBool::new(false)),
+        second_notify_started: Arc::new(AtomicBool::new(false)),
     };
     let conn = zbus::connection::Builder::address(bus_addr)
         .expect("valid private dbus addr")
@@ -393,6 +561,20 @@ async fn start_mock_bluez_with_options(
         .serve_at(
             hrm_char_path.as_str(),
             MockHrmCharacteristic {
+                state: state.clone(),
+            },
+        )
+        .unwrap()
+        .serve_at(
+            DEVICE2_PATH,
+            MockDevice2 {
+                state: state.clone(),
+            },
+        )
+        .unwrap()
+        .serve_at(
+            HRM_CHAR2_PATH,
+            MockHrmCharacteristic2 {
                 state: state.clone(),
             },
         )
@@ -788,19 +970,18 @@ async fn emit_mock_wearable_interfaces_added(
         .unwrap();
 }
 
-async fn wait_for_tui_discovered_wearable(
+async fn wait_for_tui_app<F>(
     app: &mut bpmute::tui::TuiApp,
     event_rx: &mut tokio::sync::mpsc::Receiver<bpmute::tui::TuiEvent>,
     cmd_tx: &tokio::sync::mpsc::Sender<bpmute::tui::TuiCommand>,
-    mac: &str,
-) -> bool {
+    pred: F,
+) -> bool
+where
+    F: Fn(&bpmute::tui::TuiApp) -> bool,
+{
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if app
-                .discovered_wearables
-                .iter()
-                .any(|d| d.address.eq_ignore_ascii_case(mac))
-            {
+            if pred(app) {
                 return true;
             }
             match event_rx.recv().await {
@@ -815,6 +996,20 @@ async fn wait_for_tui_discovered_wearable(
     })
     .await
     .unwrap_or(false)
+}
+
+async fn wait_for_tui_discovered_wearable(
+    app: &mut bpmute::tui::TuiApp,
+    event_rx: &mut tokio::sync::mpsc::Receiver<bpmute::tui::TuiEvent>,
+    cmd_tx: &tokio::sync::mpsc::Sender<bpmute::tui::TuiCommand>,
+    mac: &str,
+) -> bool {
+    wait_for_tui_app(app, event_rx, cmd_tx, |a| {
+        a.discovered_wearables
+            .iter()
+            .any(|d| d.address.eq_ignore_ascii_case(mac))
+    })
+    .await
 }
 
 async fn wait_for_tui_enrollment_error(
@@ -1053,4 +1248,250 @@ async fn cli_enroll_scan_discovers_wearable_appearing_after_start_discovery() {
         stdout.contains(DEVICE_MAC),
         "CLI enroll stdout should list discovered wearable; stdout={stdout}"
     );
+}
+
+async fn wait_for_tui_enrolled_status(
+    app: &mut bpmute::tui::TuiApp,
+    event_rx: &mut tokio::sync::mpsc::Receiver<bpmute::tui::TuiEvent>,
+    cmd_tx: &tokio::sync::mpsc::Sender<bpmute::tui::TuiCommand>,
+    mac: &str,
+    expected_status: bpmute::sleep_engine::StreamStatus,
+) -> bool {
+    use bpmute::tui::ModalState;
+
+    wait_for_tui_app(app, event_rx, cmd_tx, |a| {
+        a.modal == ModalState::None
+            && a.enrolled_wearables
+                .iter()
+                .any(|w| w.wearable.mac == mac && w.status == expected_status)
+    })
+    .await
+}
+
+async fn scan_and_select_wearable_via_enter(
+    app: &mut bpmute::tui::TuiApp,
+    event_rx: &mut tokio::sync::mpsc::Receiver<bpmute::tui::TuiEvent>,
+    cmd_tx: &tokio::sync::mpsc::Sender<bpmute::tui::TuiCommand>,
+    bluez_conn: &zbus::Connection,
+    bluez_state: &MockBluezState,
+) {
+    use bpmute::tui::TuiEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    open_wearables_and_start_scan(app, cmd_tx).await;
+    wait_for_discovering_flag(bluez_state, true, app, event_rx).await;
+
+    emit_mock_wearable_interfaces_added(bluez_conn, bluez_state, DEVICE_PATH, true).await;
+    assert!(
+        wait_for_tui_discovered_wearable(app, event_rx, cmd_tx, DEVICE_MAC).await,
+        "wearable must be discovered before selection"
+    );
+
+    let select_cmd = app
+        .handle_event(TuiEvent::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .expect("pressing Enter in EnrollmentModal emits EnrollSelect");
+    cmd_tx.send(select_cmd).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_enroll_select_auto_connects_reachable_wearable_to_acquiring() {
+    use bpmute::sleep_engine::StreamStatus;
+
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    // Reachable wearable with 0x2A37 GATT ready once connected, initially disconnected
+    let (bluez_conn, bluez_state) = start_mock_bluez(&bus_addr, false, false, true).await;
+
+    let (_daemon_guard, _client, socket_path) = spawn_daemon_and_connect(&temp, &bus_addr).await;
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        connect_tui_app_to_daemon(socket_path).await;
+
+    scan_and_select_wearable_via_enter(&mut app, &mut event_rx, &cmd_tx, &bluez_conn, &bluez_state)
+        .await;
+
+    let reached_acquiring = wait_for_tui_enrolled_status(
+        &mut app,
+        &mut event_rx,
+        &cmd_tx,
+        DEVICE_MAC,
+        StreamStatus::Acquiring,
+    )
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+
+    assert!(
+        reached_acquiring,
+        "newly enrolled reachable wearable must auto-connect to Acquiring without manual reconnect; enrolled={:?}",
+        app.enrolled_wearables
+    );
+    assert!(bluez_state.connected.load(Ordering::SeqCst));
+    assert!(bluez_state.notify_started.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_enroll_select_succeeds_as_disconnected_and_surfaces_warning_when_connect_fails() {
+    use bpmute::sleep_engine::StreamStatus;
+
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    let (bluez_conn, bluez_state) = start_mock_bluez_with_options(
+        &bus_addr,
+        MockBluezOptions {
+            fail_connect: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (_daemon_guard, _client, socket_path) = spawn_daemon_and_connect(&temp, &bus_addr).await;
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        connect_tui_app_to_daemon(socket_path).await;
+
+    scan_and_select_wearable_via_enter(&mut app, &mut event_rx, &cmd_tx, &bluez_conn, &bluez_state)
+        .await;
+
+    let enrolled_with_warning = wait_for_tui_app(&mut app, &mut event_rx, &cmd_tx, |a| {
+        a.enrolled_wearables
+            .iter()
+            .any(|w| w.wearable.mac == DEVICE_MAC && w.status == StreamStatus::Disconnected)
+            && a.op_feedback
+                .as_ref()
+                .is_some_and(|fb| !fb.is_error && fb.message.contains("initial connection failed"))
+    })
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+
+    assert!(
+        enrolled_with_warning,
+        "enrollment must succeed as Disconnected and surface connection warning in TUI; enrolled={:?}, feedback={:?}",
+        app.enrolled_wearables, app.op_feedback
+    );
+    assert!(!bluez_state.connected.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enroll_select_on_already_connected_wearable_produces_no_connect_warning() {
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    // Wearable is already Connected=true before enroll_select runs
+    let (bluez_conn, _bluez_state) = start_mock_bluez(&bus_addr, true, true, true).await;
+
+    // Directly verify connect_device treats org.bluez.Error.AlreadyConnected as Ok(())
+    let mut mock_err = bpmute::bluetooth::operations::connect_device(&bluez_conn, DEVICE_MAC).await;
+    assert!(
+        mock_err.is_ok(),
+        "connect_device must treat Connected=true as Ok: {mock_err:?}"
+    );
+    let device_proxy = bpmute::bluetooth::dbus::Device1Proxy::builder(&bluez_conn)
+        .path(DEVICE_PATH)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    mock_err = device_proxy.connect().await;
+    assert!(
+        matches!(
+            mock_err,
+            Err(zbus::Error::MethodError(ref name, _, _))
+                if name.as_str() == "org.bluez.Error.AlreadyConnected"
+        ),
+        "MockDevice::connect must emit org.bluez.Error.AlreadyConnected, got: {mock_err:?}"
+    );
+
+    let (_daemon_guard, mut client, _socket_path) =
+        spawn_daemon_and_connect(&temp, &bus_addr).await;
+
+    let start_res = client
+        .request("wearable.enroll_start", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(start_res["wearables"].as_array().unwrap().len(), 1);
+
+    let select_res = client
+        .request("wearable.enroll_select", json!({ "address": DEVICE_MAC }))
+        .await
+        .unwrap();
+    assert!(
+        select_res["warnings"].as_array().unwrap().is_empty(),
+        "already-connected wearable must not trigger a connect warning; warnings={:?}",
+        select_res["warnings"]
+    );
+    assert!(wait_for_wearable_status(&mut client, "acquiring").await);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tui_enroll_select_second_reachable_wearable_enters_passive_standby() {
+    use bpmute::sleep_engine::StreamStatus;
+
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    let (_bluez_conn, bluez_state) = start_mock_bluez_with_options(
+        &bus_addr,
+        MockBluezOptions {
+            expose_wearable: true,
+            initial_connected: true,
+            initial_gatt: true,
+            expose_second_wearable: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (_daemon_guard, mut client, socket_path) = spawn_daemon_and_connect(&temp, &bus_addr).await;
+
+    // 1. Enroll first wearable so it becomes the active Acquiring stream
+    client
+        .request("wearable.enroll_start", json!({}))
+        .await
+        .unwrap();
+    client
+        .request("wearable.enroll_select", json!({ "address": DEVICE_MAC }))
+        .await
+        .unwrap();
+    assert!(wait_for_wearable_status(&mut client, "acquiring").await);
+
+    // 2. Enroll second reachable wearable via TUI -> connects and enters PassiveStandby
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        connect_tui_app_to_daemon(socket_path).await;
+    open_wearables_and_start_scan(&mut app, &cmd_tx).await;
+    assert!(
+        wait_for_tui_discovered_wearable(&mut app, &mut event_rx, &cmd_tx, DEVICE2_MAC).await,
+        "second wearable must be discovered"
+    );
+
+    // Select DEVICE2_MAC (rows are sorted by MAC: 11:22... is index 0)
+    let select_cmd = app
+        .handle_event(bpmute::tui::TuiEvent::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )))
+        .unwrap();
+    cmd_tx.send(select_cmd).await.unwrap();
+
+    let entered_standby = wait_for_tui_enrolled_status(
+        &mut app,
+        &mut event_rx,
+        &cmd_tx,
+        DEVICE2_MAC,
+        StreamStatus::PassiveStandby,
+    )
+    .await;
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+
+    assert!(
+        entered_standby,
+        "second reachable wearable enrolled while first is active must enter PassiveStandby; enrolled={:?}",
+        app.enrolled_wearables
+    );
+    assert!(bluez_state.second_connected.load(Ordering::SeqCst));
+    assert!(!bluez_state.second_notify_started.load(Ordering::SeqCst));
 }

@@ -17,7 +17,7 @@ use crate::ipc::protocol::{
 };
 use crate::storage::{ImportMode, SetFeedbackRequest, WearableDescriptor};
 
-use super::enrollment::try_system_conn;
+use super::enrollment::try_system_conn_for_env;
 use super::{DaemonCore, ipc_err, serialize_json, storage_to_ipc_err};
 
 impl DaemonCore {
@@ -451,7 +451,7 @@ impl DaemonCore {
                             format!("wearable '{}' not found", parsed.id),
                         )
                     })?;
-                if let Some(conn) = try_system_conn().await {
+                if let Some(conn) = try_system_conn_for_env(self.env.as_ref()).await {
                     let _ = crate::bluetooth::operations::connect_device(&conn, &w.mac).await;
                 }
                 serialize_json(WearableConnectResponse {
@@ -481,7 +481,7 @@ impl DaemonCore {
                     guard.wearable_body_locations.remove(&norm);
                 }
                 if parsed.forget_bluez
-                    && let Some(conn) = try_system_conn().await
+                    && let Some(conn) = try_system_conn_for_env(self.env.as_ref()).await
                 {
                     let fallback_adapter = {
                         let guard = self.inner.lock().expect("daemon state mutex poisoned");
@@ -535,8 +535,8 @@ impl DaemonCore {
                     )
                 })?;
                 let now_ms = self.clock.now_utc().timestamp_millis();
-                let norm_mac = parsed.address.trim().to_ascii_uppercase();
-                let (discovered, is_rpa, address_type, advertised_name) = {
+                let mut norm_mac = parsed.address.trim().to_ascii_uppercase();
+                let (discovered, is_rpa, mut address_type, advertised_name) = {
                     let guard = self.inner.lock().expect("daemon state mutex poisoned");
                     match guard.enrollment {
                         Some(ref lock) if lock.client_id == client_id => {}
@@ -582,7 +582,7 @@ impl DaemonCore {
                 self.stop_active_discovery().await;
 
                 let pair_result = Arc::clone(&self.enrollment_driver)
-                    .bond_and_pair(self, &norm_mac, is_rpa)
+                    .bond_pair_and_resolve(self, &norm_mac, is_rpa)
                     .await;
 
                 {
@@ -593,8 +593,13 @@ impl DaemonCore {
                     guard.active_auth_reply = None;
                 }
 
-                if let Err(err) = pair_result {
-                    return Err(ipc_err(error_codes::BACKEND_REFUSED, err));
+                let resolved_identity = match pair_result {
+                    Ok(identity) => identity,
+                    Err(err) => return Err(ipc_err(error_codes::BACKEND_REFUSED, err)),
+                };
+                if let Some((resolved_mac, resolved_type)) = resolved_identity {
+                    norm_mac = resolved_mac;
+                    address_type = resolved_type;
                 }
 
                 let mut warnings = Vec::new();
@@ -608,6 +613,7 @@ impl DaemonCore {
                     hints.push("Dual-mode BR/EDR wearable detected; classic profiles (A2DP/HFP) may share this adapter.".to_string());
                 }
 
+                let connect_mac = norm_mac.clone();
                 let desc = WearableDescriptor {
                     mac: norm_mac,
                     address_type,
@@ -622,6 +628,14 @@ impl DaemonCore {
                     .await
                     .map_err(storage_to_ipc_err)?;
                 self.wearable_source.notify_allowlist_changed();
+
+                if let Some(connect_warning) = Arc::clone(&self.enrollment_driver)
+                    .connect_after_enroll(self, &connect_mac)
+                    .await
+                {
+                    warnings.push(connect_warning);
+                }
+
                 self.publish_wearables_updated().await;
                 let list = self
                     .persistence

@@ -11,10 +11,10 @@ use crate::calibration::CalibrationState;
 use crate::config::{ClockTime, PatchField};
 use crate::ipc::protocol::{
     AlertDismissParams, CalibrationSetBoundaryParams, ConfigSnapshotPayload, DaemonStatus,
-    DataHardWipeParams, DiscoveredWearable, EnrollSelectParams, EnrollStartParams, RequestEnvelope,
-    SessionDeleteParams, SessionExportTraceParams, SessionGetParams, SessionListParams,
-    SetFeedbackParams, SetSeedParams, SnoozeGraceParams, WearableConnectParams,
-    WearableListResponse, WearableRenameParams, WearableUnenrollParams,
+    DataHardWipeParams, DiscoveredWearable, EnrollSelectParams, EnrollSelectResponse,
+    EnrollStartParams, RequestEnvelope, SessionDeleteParams, SessionExportTraceParams,
+    SessionGetParams, SessionListParams, SetFeedbackParams, SetSeedParams, SnoozeGraceParams,
+    WearableConnectParams, WearableListResponse, WearableRenameParams, WearableUnenrollParams,
 };
 use crate::storage::{SessionFullDetail, SessionListPage, StorageStats};
 
@@ -94,15 +94,25 @@ pub(super) async fn execute_command(
         }
         TuiCommand::EnrollSelect { address, alias } => {
             let params = EnrollSelectParams { address, alias };
-            let resp = send_typed_op_request(
-                req_tx,
-                pending,
-                next_id,
-                "wearable.enroll_select",
-                &params,
-                event_tx,
-            )
-            .await?;
+            let resp =
+                send_typed_request(req_tx, pending, next_id, "wearable.enroll_select", &params)
+                    .await?;
+            let message = if resp.ok {
+                resp.data
+                    .as_ref()
+                    .and_then(|d| serde_json::from_value::<EnrollSelectResponse>(d.clone()).ok())
+                    .filter(|r| !r.warnings.is_empty())
+                    .map(|r| r.warnings.join(" "))
+            } else {
+                resp.error.as_ref().map(|e| e.message.clone())
+            };
+            let _ = event_tx
+                .send(TuiEvent::ipc(IpcEvent::OpCompleted {
+                    op: "wearable.enroll_select".to_string(),
+                    success: resp.ok,
+                    message,
+                }))
+                .await;
             if resp.ok {
                 refresh_wearables(req_tx, pending, next_id, event_tx).await?;
             }

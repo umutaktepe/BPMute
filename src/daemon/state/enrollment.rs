@@ -9,19 +9,22 @@ use crate::actions::traits::BoxFuture;
 use crate::bluetooth::agent::{AgentAuthRequest, ENROLLMENT_AGENT_PATH, EnrollmentAgent};
 use crate::bluetooth::dbus::AgentManager1Proxy;
 use crate::bluetooth::operations::{
-    build_bluez_signal_stream, is_relevant_wearable_props_changed, is_wearable_interfaces_added,
-    list_heart_rate_devices_for_adapters, next_stream_msg, resolve_target_adapters,
-    start_le_discovery, stop_le_discovery,
+    build_bluez_signal_stream, connect_device, is_relevant_wearable_props_changed,
+    is_wearable_interfaces_added, list_heart_rate_devices_for_adapters, next_stream_msg,
+    resolve_target_adapters, start_le_discovery, stop_le_discovery,
 };
 use crate::ipc::protocol::{
     AlertSeverity, DaemonAlert, DiscoveredWearable, EnrollAuthResponseParams,
     EnrollmentUpdateEvent, ErrorPayload, PairingPrompt, alert_ids, error_codes,
 };
 use crate::logging::mask_mac;
+use crate::paths::EnvSource;
 
 use super::{DaemonCore, EnrollmentLock, InnerState, ipc_err, upsert_alert};
 
-/// Narrow async boundary for BLE bonding and interactive `Agent1` pairing during enrollment.
+const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Narrow async boundary for BLE bonding, interactive `Agent1` pairing, and initial post-enrollment connect.
 pub trait EnrollmentPairingHook: Send + Sync {
     /// Sets device trust and optionally executes BLE SMP pairing bridged through `DaemonCore`.
     fn bond_and_pair<'a>(
@@ -30,6 +33,28 @@ pub trait EnrollmentPairingHook: Send + Sync {
         mac: &'a str,
         pair: bool,
     ) -> BoxFuture<'a, Result<(), String>>;
+
+    /// Sets device trust, optionally pairs, and returns an updated `(mac, address_type)` if BlueZ resolved an RPA identity.
+    fn bond_pair_and_resolve<'a>(
+        &'a self,
+        core: &'a Arc<DaemonCore>,
+        mac: &'a str,
+        pair: bool,
+    ) -> BoxFuture<'a, Result<Option<(String, String)>, String>> {
+        Box::pin(async move {
+            self.bond_and_pair(core, mac, pair).await?;
+            Ok(None)
+        })
+    }
+
+    /// Best-effort initial connection after enrollment; returns an optional warning if connection fails or times out.
+    fn connect_after_enroll<'a>(
+        &'a self,
+        _core: &'a Arc<DaemonCore>,
+        _mac: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
 }
 
 /// No-op [`EnrollmentPairingHook`] used in hermetic tests that do not inject a pairing harness.
@@ -59,14 +84,29 @@ impl EnrollmentPairingHook for BluezEnrollmentDriver {
         pair: bool,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            let Some(conn) = try_system_conn().await else {
-                return Ok(());
+            let _ = self.bond_pair_and_resolve(core, mac, pair).await?;
+            Ok(())
+        })
+    }
+
+    fn bond_pair_and_resolve<'a>(
+        &'a self,
+        core: &'a Arc<DaemonCore>,
+        mac: &'a str,
+        pair: bool,
+    ) -> BoxFuture<'a, Result<Option<(String, String)>, String>> {
+        Box::pin(async move {
+            let Some(conn) = try_system_conn_for_env(core.env.as_ref()).await else {
+                return Ok(None);
             };
 
             if !pair {
-                let _ =
-                    crate::bluetooth::operations::bond_and_trust_device(&conn, mac, false).await;
-                return Ok(());
+                if let Err(err) =
+                    crate::bluetooth::operations::bond_and_trust_device(&conn, mac, false).await
+                {
+                    tracing::warn!(error = %err, "BlueZ Device1 trust setup failed");
+                }
+                return Ok(None);
             }
 
             let (auth_tx, mut auth_rx) = mpsc::channel::<AgentAuthRequest>(8);
@@ -116,9 +156,55 @@ impl EnrollmentPairingHook for BluezEnrollmentDriver {
             res
         })
     }
+
+    fn connect_after_enroll<'a>(
+        &'a self,
+        core: &'a Arc<DaemonCore>,
+        mac: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async move {
+            let conn = try_system_conn_for_env(core.env.as_ref()).await?;
+            connect_with_timeout(connect_device(&conn, mac), INITIAL_CONNECT_TIMEOUT).await
+        })
+    }
 }
 
-pub(super) async fn try_system_conn() -> Option<zbus::Connection> {
+async fn connect_with_timeout<F>(fut: F, timeout_dur: Duration) -> Option<String>
+where
+    F: std::future::Future<Output = zbus::Result<()>>,
+{
+    match tokio::time::timeout(timeout_dur, fut).await {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, "initial connection after enrollment failed; wearable remains enrolled");
+            Some(format!(
+                "Wearable enrolled, but initial connection failed ({err}); it will connect automatically when available."
+            ))
+        }
+        Err(_) => {
+            tracing::warn!(
+                "initial connection after enrollment timed out; wearable remains enrolled"
+            );
+            Some(
+                "Wearable enrolled, but initial connection timed out; it will connect automatically when available."
+                    .to_string(),
+            )
+        }
+    }
+}
+
+pub(super) async fn try_system_conn_for_env(env: &dyn EnvSource) -> Option<zbus::Connection> {
+    if let Some(addr) = env.get("DBUS_SYSTEM_BUS_ADDRESS") {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return zbus::connection::Builder::address(trimmed)
+            .ok()?
+            .build()
+            .await
+            .ok();
+    }
     zbus::connection::Builder::system().ok()?.build().await.ok()
 }
 
@@ -173,7 +259,7 @@ impl DaemonCore {
 
         self.stop_active_discovery().await;
 
-        let Some(conn) = try_system_conn().await else {
+        let Some(conn) = try_system_conn_for_env(self.env.as_ref()).await else {
             let guard = self.inner.lock().expect("daemon state mutex poisoned");
             return Ok(guard.discovered_wearables.clone());
         };
@@ -653,5 +739,21 @@ async fn refresh_and_publish_enrollment(
         if let Ok(val) = serde_json::to_value(event) {
             core.broker.publish_control("EnrollmentUpdate", val);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_with_timeout_returns_warning_on_expiry() {
+        let warning = connect_with_timeout(
+            std::future::pending::<zbus::Result<()>>(),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("timed-out initial connect should yield a diagnostic warning");
+        assert!(warning.contains("timed out"));
     }
 }

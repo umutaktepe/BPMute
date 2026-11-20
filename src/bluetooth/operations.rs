@@ -313,7 +313,7 @@ pub async fn stop_le_discovery(conn: &zbus::Connection, adapter_path: &str) -> z
     adapter.stop_discovery().await
 }
 
-/// Initiates connection to a BlueZ device by MAC address.
+/// Initiates connection to a BlueZ device by MAC address unless already connected.
 pub async fn connect_device(conn: &zbus::Connection, mac: &str) -> zbus::Result<()> {
     let Some(path) = find_device_object_path(conn, mac).await? else {
         return Err(zbus::Error::Failure(format!(
@@ -321,15 +321,27 @@ pub async fn connect_device(conn: &zbus::Connection, mac: &str) -> zbus::Result<
         )));
     };
     let device = Device1Proxy::builder(conn).path(path)?.build().await?;
-    device.connect().await
+    if device.connected().await.unwrap_or(false) {
+        return Ok(());
+    }
+    match device.connect().await {
+        Ok(()) => Ok(()),
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.bluez.Error.AlreadyConnected" =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
-/// Sets a device as trusted and optionally initiates pairing (adaptive bonding).
+/// Sets a device as trusted, optionally initiates pairing, and returns an updated
+/// `(mac, address_type)` if BlueZ resolved an RPA to a permanent Identity Address.
 pub async fn bond_and_trust_device(
     conn: &zbus::Connection,
     mac: &str,
     pair: bool,
-) -> zbus::Result<()> {
+) -> zbus::Result<Option<(String, String)>> {
     let Some(path) = find_device_object_path(conn, mac).await? else {
         return Err(zbus::Error::Failure(format!(
             "device {mac} not found in BlueZ"
@@ -344,8 +356,18 @@ pub async fn bond_and_trust_device(
         if !is_paired {
             device.pair().await?;
         }
+        if let Ok(resolved_addr) = device.address().await {
+            let resolved_norm = resolved_addr.trim().to_ascii_uppercase();
+            if !resolved_norm.is_empty() && !resolved_norm.eq_ignore_ascii_case(mac) {
+                let resolved_type = device
+                    .address_type()
+                    .await
+                    .unwrap_or_else(|_| "public".to_string());
+                return Ok(Some((resolved_norm, resolved_type)));
+            }
+        }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Removes a device from BlueZ adapter (forget pairing keys).
