@@ -467,6 +467,9 @@ impl TuiApp {
     }
 
     pub fn tick(&mut self) -> Option<TuiCommand> {
+        if self.daemon_connected {
+            self.sparkline_data.advance_tick(i64::from(TUI_TICK_MS));
+        }
         if let ModalState::EnrollmentModal {
             ref mut scanning_remaining_ms,
             enrolling: false,

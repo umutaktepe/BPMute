@@ -5,17 +5,30 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Widget;
 
 use super::theme::Theme;
+use super::trace::{
+    TracePoint, TraceSample, TraceSeriesSpec, build_segments, clip_segments, compute_hr_y_bounds,
+    is_valid_hr_bpm, render_horizontal_ref_lines, render_hr_y_labels, render_trace_series,
+    time_to_column,
+};
 use crate::ipc::protocol::HrSampleEvent;
+use crate::sleep_engine::ContactStatus;
 
 /// Maximum number of 1 Hz samples retained in the 30-minute rolling buffer.
 pub const MAX_SPARKLINE_SAMPLES: usize = 1800;
 
-/// Rolling 30-minute HR buffer for dashboard sparkline rendering.
+/// Fixed 30-minute Dashboard trace window duration in milliseconds.
+pub const DASHBOARD_WINDOW_MS: i64 = 30 * 60 * 1_000;
+
+/// Maximum interval between consecutive valid Dashboard readings before breaking the curve.
+pub const DASHBOARD_MAX_GAP_MS: i64 = 5_000;
+
+/// Rolling 30-minute HR buffer for dashboard trace rendering.
 #[derive(Debug, Clone)]
 pub struct HrSparklineData {
     pub samples: VecDeque<HrSampleEvent>,
     pub quiet_wake_baseline: Option<f64>,
     pub sleeping_hr: Option<f64>,
+    pub window_end_ms: Option<i64>,
 }
 
 impl Default for HrSparklineData {
@@ -30,10 +43,15 @@ impl HrSparklineData {
             samples: VecDeque::with_capacity(MAX_SPARKLINE_SAMPLES),
             quiet_wake_baseline: None,
             sleeping_hr: None,
+            window_end_ms: None,
         }
     }
 
     pub fn push_sample(&mut self, sample: HrSampleEvent) {
+        self.window_end_ms = Some(
+            self.window_end_ms
+                .map_or(sample.ts_ms, |cur| cur.max(sample.ts_ms)),
+        );
         if self.samples.len() >= MAX_SPARKLINE_SAMPLES {
             self.samples.pop_front();
         }
@@ -45,44 +63,57 @@ impl HrSparklineData {
         while self.samples.len() > MAX_SPARKLINE_SAMPLES {
             self.samples.pop_front();
         }
+        self.window_end_ms = self.samples.iter().map(|s| s.ts_ms).max();
+    }
+
+    pub fn advance_tick(&mut self, delta_ms: i64) {
+        if let Some(end) = self.effective_window_end_ms() {
+            self.window_end_ms = Some(end.saturating_add(delta_ms));
+        }
+    }
+
+    pub fn effective_window_end_ms(&self) -> Option<i64> {
+        self.window_end_ms
+            .or_else(|| self.samples.iter().map(|s| s.ts_ms).max())
     }
 
     pub fn latest_bpm(&self) -> Option<f64> {
         self.samples.back().map(|s| s.bpm)
     }
 
+    fn clipped_hr_segments(&self) -> Option<(i64, i64, Vec<Vec<TracePoint>>)> {
+        let end_ms = self.effective_window_end_ms()?;
+        let start_ms = end_ms.saturating_sub(DASHBOARD_WINDOW_MS);
+        let raw: Vec<TraceSample> = self
+            .samples
+            .iter()
+            .map(|s| {
+                let valid = s.contact_status != ContactStatus::NoContact && is_valid_hr_bpm(s.bpm);
+                TraceSample {
+                    ts_ms: s.ts_ms,
+                    value: valid.then_some(s.bpm),
+                }
+            })
+            .collect();
+        let segments = build_segments(&raw, DASHBOARD_MAX_GAP_MS);
+        let clipped = clip_segments(&segments, start_ms, end_ms);
+        Some((start_ms, end_ms, clipped))
+    }
+
+    fn y_bounds_for(&self, clipped: Option<&(i64, i64, Vec<Vec<TracePoint>>)>) -> (f64, f64) {
+        let iter = clipped
+            .iter()
+            .flat_map(|(_, _, segs)| segs.iter().flat_map(|s| s.iter().map(|p| p.value)));
+        compute_hr_y_bounds(iter, &[self.quiet_wake_baseline, self.sleeping_hr])
+    }
+
     pub fn min_max_bpm(&self) -> (f64, f64) {
-        let mut min = 50.0;
-        let mut max = 100.0;
-        for s in &self.samples {
-            if s.bpm < min {
-                min = s.bpm;
-            }
-            if s.bpm > max {
-                max = s.bpm;
-            }
-        }
-        if let Some(qw) = self.quiet_wake_baseline {
-            if qw < min {
-                min = qw;
-            }
-            if qw > max {
-                max = qw;
-            }
-        }
-        if let Some(sl) = self.sleeping_hr {
-            if sl < min {
-                min = sl;
-            }
-            if sl > max {
-                max = sl;
-            }
-        }
-        (min - 2.0, max + 2.0)
+        let clipped = self.clipped_hr_segments();
+        self.y_bounds_for(clipped.as_ref())
     }
 }
 
-/// Widget rendering a 30-minute HR sparkline overlaid with baseline reference lines.
+/// Widget rendering a 30-minute HR trace overlaid with baseline reference lines.
 pub struct HrSparklineWidget<'a> {
     pub data: &'a HrSparklineData,
     pub theme: Theme,
@@ -109,112 +140,65 @@ impl Widget for HrSparklineWidget<'_> {
             return;
         }
 
-        let (min_bpm, max_bpm) = self.data.min_max_bpm();
-        let bpm_range = (max_bpm - min_bpm).max(1.0);
+        let chart_y = area.y + 1;
+        let plot_area = Rect::new(chart_x, chart_y, chart_w, chart_h);
+        let clipped_data = self.data.clipped_hr_segments();
+        let (min_bpm, max_bpm) = self.data.y_bounds_for(clipped_data.as_ref());
 
         // Draw Y-axis labels
-        let top_label = format!("{:>3.0}bpm", max_bpm);
-        let bot_label = format!("{:>3.0}bpm", min_bpm);
-        buf.set_string(area.x, area.y + 1, &top_label, self.theme.muted());
-        buf.set_string(
+        render_hr_y_labels(
             area.x,
-            area.y + 1 + chart_h.saturating_sub(1),
-            &bot_label,
+            chart_y,
+            chart_h,
+            min_bpm,
+            max_bpm,
             self.theme.muted(),
+            buf,
         );
 
-        // Calculate reference line rows
-        let qw_row = self.data.quiet_wake_baseline.map(|qw| {
-            let norm = ((qw - min_bpm) / bpm_range).clamp(0.0, 1.0);
-            let row = ((1.0 - norm) * (chart_h.saturating_sub(1) as f64)).round() as u16;
-            area.y + 1 + row
-        });
-
-        let sleep_row = self.data.sleeping_hr.map(|sl| {
-            let norm = ((sl - min_bpm) / bpm_range).clamp(0.0, 1.0);
-            let row = ((1.0 - norm) * (chart_h.saturating_sub(1) as f64)).round() as u16;
-            area.y + 1 + row
-        });
+        // Render -15m midpoint vertical guide underneath horizontal refs and data curves
+        if chart_w > 4 {
+            let guide_offset = time_to_column(1, 0, 2, chart_w, self.theme.ascii);
+            let guide_x = chart_x + guide_offset;
+            let guide_char = if self.theme.ascii { '|' } else { '┆' };
+            for row in chart_y..chart_y + chart_h {
+                if let Some(c) = buf.cell_mut((guide_x, row)) {
+                    c.set_char(guide_char).set_style(self.theme.muted());
+                }
+            }
+        }
 
         let qw_style = self.theme.sparkline_qw_ref();
         let sleep_style = self.theme.sparkline_sleep_ref();
         let ref_char = if self.theme.ascii { '-' } else { '┄' };
 
-        // Render reference lines first
-        if let Some(row) = qw_row
-            && row < area.y + 1 + chart_h
-        {
-            for col in 0..chart_w {
-                if let Some(c) = buf.cell_mut((chart_x + col, row)) {
-                    c.set_char(ref_char).set_style(qw_style);
-                }
-            }
-        }
-        if let Some(row) = sleep_row
-            && row < area.y + 1 + chart_h
-        {
-            for col in 0..chart_w {
-                if let Some(c) = buf.cell_mut((chart_x + col, row)) {
-                    c.set_char(ref_char).set_style(sleep_style);
-                }
-            }
-        }
+        // Render horizontal reference lines underneath data curves
+        render_horizontal_ref_lines(
+            plot_area,
+            buf,
+            min_bpm,
+            max_bpm,
+            &[
+                (self.data.quiet_wake_baseline, qw_style),
+                (self.data.sleeping_hr, sleep_style),
+            ],
+            self.theme.ascii,
+        );
 
-        // Render sparkline columns
-        let total_samples = self.data.samples.len();
-        if total_samples > 0 {
-            let samples_vec: Vec<&HrSampleEvent> = self.data.samples.iter().collect();
-            let hr_style = self.theme.sparkline_curve();
-
-            for col in 0..chart_w {
-                let start_idx = (col as usize * total_samples) / chart_w as usize;
-                let end_idx = (((col + 1) as usize * total_samples) / chart_w as usize)
-                    .max(start_idx + 1)
-                    .min(total_samples);
-
-                let slice = &samples_vec[start_idx..end_idx];
-                if slice.is_empty() {
-                    continue;
-                }
-                let avg_bpm = slice.iter().map(|s| s.bpm).sum::<f64>() / (slice.len() as f64);
-                let norm = ((avg_bpm - min_bpm) / bpm_range).clamp(0.0, 1.0);
-                let row_offset = ((1.0 - norm) * (chart_h.saturating_sub(1) as f64)).round() as u16;
-                let target_y = area.y + 1 + row_offset;
-
-                let symbol = if self.theme.ascii {
-                    if norm > 0.8 {
-                        '#'
-                    } else if norm > 0.6 {
-                        '*'
-                    } else if norm > 0.4 {
-                        '='
-                    } else if norm > 0.2 {
-                        '-'
-                    } else {
-                        '.'
-                    }
-                } else if norm > 0.8 {
-                    '⣿'
-                } else if norm > 0.6 {
-                    '⣾'
-                } else if norm > 0.4 {
-                    '⠶'
-                } else if norm > 0.2 {
-                    '⠤'
-                } else {
-                    '⠄'
-                };
-
-                if target_y < area.y + 1 + chart_h
-                    && let Some(cell) = buf.cell_mut((chart_x + col, target_y))
-                {
-                    cell.set_char(symbol).set_style(hr_style);
-                }
-            }
+        // Render continuous HR trace on top of reference lines and -15m guide
+        if let Some((start_ms, end_ms, segments)) = clipped_data {
+            let spec = TraceSeriesSpec {
+                segments: &segments,
+                y_min: min_bpm,
+                y_max: max_bpm,
+                style: self.theme.sparkline_curve(),
+                ascii_point_char: '*',
+            };
+            render_trace_series(plot_area, buf, start_ms, end_ms, &[spec], self.theme.ascii);
         }
 
         // Render bottom time scale
-        let time_y = area.y + 1 + chart_h;
+        let time_y = chart_y + chart_h;
         if time_y < area.bottom() {
             buf.set_string(chart_x, time_y, "-30m", self.theme.muted());
             if chart_w > 20 {
@@ -232,7 +216,7 @@ impl Widget for HrSparklineWidget<'_> {
         } else {
             "● HR (live)"
         };
-        buf.set_string(legend_x, area.y, hr_legend, self.theme.success());
+        buf.set_string(legend_x, area.y, hr_legend, self.theme.sparkline_curve());
         legend_x += 13;
 
         if let Some(qw) = self.data.quiet_wake_baseline {

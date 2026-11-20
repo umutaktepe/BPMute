@@ -3645,7 +3645,7 @@ fn test_mouse_dashboard_system_card_diagnostics_and_readonly_cards() {
         "62",
         "Sleep State",
         "P(SleepNREM)",
-        "30-Minute Heart Rate Sparkline",
+        "30-Minute Heart Rate Trace",
     ] {
         let (col, row) = find_text_coords(terminal.backend().buffer(), needle).unwrap();
         let target_row = if needle.contains("Heart Rate") || needle == "Sleep State" {
@@ -6513,4 +6513,942 @@ async fn test_real_socket_settings_purge_rebaseline_and_repeated_wipe_db_size() 
     );
 
     h.shutdown().await;
+}
+
+fn is_non_blank_braille(ch: char) -> bool {
+    ('\u{2801}'..='\u{28FF}').contains(&ch)
+}
+
+#[test]
+fn test_dashboard_braille_trace_title_guide_and_empty_fallback() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        Some("Chest"),
+    )];
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let empty_buf = terminal.backend().buffer();
+    let empty_out = buffer_to_string(empty_buf);
+
+    assert!(empty_out.contains("30-Minute Heart Rate Trace"));
+    assert!(!empty_out.contains("30-Minute Heart Rate Sparkline"));
+    assert!(empty_out.contains("100bpm"));
+    assert!(empty_out.contains("50bpm"));
+
+    // Midpoint -15m vertical guide ('┆') must be rendered across plot rows in muted style
+    let (_, top_lbl_row) = find_text_coords(empty_buf, "100bpm").unwrap();
+    let (_, bot_lbl_row) = find_text_coords(empty_buf, "50bpm").unwrap();
+    let mut guide_rows = 0;
+    for y in top_lbl_row..=bot_lbl_row {
+        let has_guide = (0..empty_buf.area.width).any(|x| empty_buf[(x, y)].symbol() == "┆");
+        if has_guide {
+            guide_rows += 1;
+        }
+    }
+    assert_eq!(
+        guide_rows,
+        (bot_lbl_row - top_lbl_row + 1) as usize,
+        "Expected -15m vertical guide '┆' on every plot row:\n{empty_out}"
+    );
+
+    // Feed 30 minutes of 1 Hz readings declining from 72 bpm to 56 bpm
+    let t0 = 1_700_000_000_000i64;
+    for sec in 0..=1800 {
+        let bpm = 72.0 - (sec as f64 / 1800.0) * 16.0;
+        app.handle_event(TuiEvent::ipc(IpcEvent::HrSample(HrSampleEvent {
+            ts_ms: t0 + sec * 1_000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+            wearable_id: "w-1".into(),
+            session_id: Some("s-1".into()),
+        })));
+    }
+
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let out = buffer_to_string(buf);
+
+    let (_, top_row) = find_text_coords(buf, "74bpm").expect("auto-scaled top label 74bpm");
+    let (_, bot_row) = find_text_coords(buf, "54bpm").expect("auto-scaled bottom label 54bpm");
+
+    // Every chart column (from chart_x to chart_x + chart_w) should have at least one Braille cell
+    // for a continuous 30-minute 1 Hz trace.
+    let (now_col, _) = find_text_coords(buf, "Now").unwrap();
+    let (start_col, _) = find_text_coords(buf, "-30m").unwrap();
+    let chart_right = now_col + 2; // "Now" ends at chart_x + chart_w - 1
+    let mut cols_with_braille = 0usize;
+    let total_cols = (chart_right - start_col + 1) as usize;
+    for x in start_col..=chart_right {
+        let has_braille = (top_row..=bot_row).any(|y| {
+            buf[(x, y)]
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(is_non_blank_braille)
+        });
+        if has_braille {
+            cols_with_braille += 1;
+        }
+    }
+    assert_eq!(
+        cols_with_braille, total_cols,
+        "Expected continuous Braille trace across all {total_cols} columns, got {cols_with_braille}:\n{out}"
+    );
+}
+
+#[test]
+fn test_dashboard_fixed_30m_axis_tick_drift_and_equal_timestamps() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        Some("Chest"),
+    )];
+
+    // 1. Feed a 2-minute (120s) burst of 1 Hz readings
+    let t0 = 1_700_000_000_000i64;
+    for sec in 0..=120 {
+        let bpm = 60.0 + (sec as f64 / 120.0) * 6.0;
+        app.handle_event(TuiEvent::ipc(IpcEvent::HrSample(HrSampleEvent {
+            ts_ms: t0 + sec * 1_000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+            wearable_id: "w-1".into(),
+            session_id: Some("s-1".into()),
+        })));
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf1 = terminal.backend().buffer().clone();
+    let out1 = buffer_to_string(&buf1);
+
+    let (start_col, _) = find_text_coords(&buf1, "-30m").unwrap();
+    let (now_col, _) = find_text_coords(&buf1, "Now").unwrap();
+    let chart_right = now_col + 2;
+    let (_, top_row) = find_text_coords(&buf1, "69bpm").unwrap();
+    let (_, bot_row) = find_text_coords(&buf1, "57bpm").unwrap();
+
+    let braille_cols = |buf: &Buffer| -> Vec<u16> {
+        (start_col..=chart_right)
+            .filter(|&x| {
+                (top_row..=bot_row).any(|y| {
+                    buf[(x, y)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .is_some_and(is_non_blank_braille)
+                })
+            })
+            .collect()
+    };
+
+    let cols_initial = braille_cols(&buf1);
+    assert!(
+        !cols_initial.is_empty(),
+        "2-minute burst should render Braille trace:\n{out1}"
+    );
+    let burst_cutoff = chart_right.saturating_sub(8);
+    assert!(
+        cols_initial.iter().all(|&x| x >= burst_cutoff),
+        "2-minute burst must stay anchored near Now (>= {burst_cutoff}), got {cols_initial:?}:\n{out1}"
+    );
+
+    // 2. Advance 20 minutes (4800 ticks * 250ms) during Signal Lost while connected -> trace drifts leftward
+    app.enrolled_wearables[0].status = StreamStatus::SignalLost;
+    for _ in 0..4800 {
+        app.handle_event(TuiEvent::Tick);
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf2 = terminal.backend().buffer().clone();
+    let out2 = buffer_to_string(&buf2);
+    let cols_shifted = braille_cols(&buf2);
+    assert!(
+        !cols_shifted.is_empty(),
+        "Shifted 2-minute trace should still be visible at -22m..-20m:\n{out2}"
+    );
+    let mid_col = start_col + (chart_right - start_col) / 2;
+    assert!(
+        cols_shifted.iter().all(|&x| x < mid_col),
+        "After 20m of ticks, 2m trace must sit left of -15m (< {mid_col}), leaving trailing dropout at Now; got {cols_shifted:?}:\n{out2}"
+    );
+
+    // 3. While disconnected, ticks must NOT advance window_end_ms
+    app.daemon_connected = false;
+    for _ in 0..4800 {
+        app.handle_event(TuiEvent::Tick);
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf3 = terminal.backend().buffer().clone();
+    assert_eq!(
+        braille_cols(&buf3),
+        cols_shifted,
+        "Ticks while disconnected must not advance the window"
+    );
+
+    // 4. Equal-timestamp fixture renders safely at the right edge without panics
+    let mut eq_app = TuiApp::new(false, false, false);
+    eq_app.daemon_connected = true;
+    eq_app.enrolled_wearables = app.enrolled_wearables.clone();
+    for bpm in [70.0, 65.0, 60.0] {
+        eq_app.handle_event(TuiEvent::ipc(IpcEvent::HrSample(HrSampleEvent {
+            ts_ms: 1_700_000_000_000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+            wearable_id: "w-1".into(),
+            session_id: Some("s-1".into()),
+        })));
+    }
+    terminal
+        .draw(|f| eq_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let eq_buf = terminal.backend().buffer();
+    let eq_cols: Vec<u16> = (start_col..=chart_right)
+        .filter(|&x| {
+            (top_row..=bot_row).any(|y| {
+                eq_buf[(x, y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(is_non_blank_braille)
+            })
+        })
+        .collect();
+    assert_eq!(
+        eq_cols,
+        vec![chart_right],
+        "Equal-timestamp fixture must plot safely at the right edge"
+    );
+}
+
+#[test]
+fn test_dashboard_gap_breaking_and_dynamic_y_autoscaling() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        Some("Chest"),
+    )];
+
+    // 4 segments across 24 minutes separated by:
+    // - Gap 1: > 5s silent timestamp jump (minutes 3..6)
+    // - Gap 2: NoContact with bogus 140 bpm (minutes 9..12)
+    // - Gap 3: bpm <= 20.0 & NaN (minutes 15..18)
+    // Valid HRs stay strictly within 58.0..62.0 bpm -> padded 56..64 -> min span 12 -> 54..66 bpm
+    let t0 = 1_700_000_000_000i64;
+    let push = |app: &mut TuiApp, sec: i64, bpm: f64, contact: ContactStatus| {
+        app.handle_event(TuiEvent::ipc(IpcEvent::HrSample(HrSampleEvent {
+            ts_ms: t0 + sec * 1_000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: contact,
+            wearable_id: "w-1".into(),
+            session_id: Some("s-1".into()),
+        })));
+    };
+
+    // Segment 1: 0..180s
+    for sec in 0..=180 {
+        push(
+            &mut app,
+            sec,
+            58.0 + (sec as f64 / 180.0) * 4.0,
+            ContactStatus::Contact,
+        );
+    }
+    // Gap 1: silent jump 181..360s (180s > 5s)
+    // Segment 2: 360..540s
+    for sec in 360..=540 {
+        push(
+            &mut app,
+            sec,
+            62.0 - ((sec - 360) as f64 / 180.0) * 4.0,
+            ContactStatus::Contact,
+        );
+    }
+    // Gap 2: NoContact 541..720s (with bogus 140 bpm that must NOT skew Y-axis)
+    for sec in 541..720 {
+        push(&mut app, sec, 140.0, ContactStatus::NoContact);
+    }
+    // Segment 3: 720..900s
+    for sec in 720..=900 {
+        push(
+            &mut app,
+            sec,
+            58.0 + ((sec - 720) as f64 / 180.0) * 4.0,
+            ContactStatus::Contact,
+        );
+    }
+    // Gap 3: invalid bpm <= 20.0 and NaN 901..1080s
+    for sec in 901..1080 {
+        let bpm = if sec % 2 == 0 { 18.0 } else { f64::NAN };
+        push(&mut app, sec, bpm, ContactStatus::Contact);
+    }
+    // Segment 4: 1080..1260s
+    for sec in 1080..=1260 {
+        push(
+            &mut app,
+            sec,
+            62.0 - ((sec - 1080) as f64 / 180.0) * 4.0,
+            ContactStatus::Contact,
+        );
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let out = buffer_to_string(buf);
+
+    // Dynamic Y-axis auto-scaling: [58, 62] -> padded [56, 64] -> expanded to 12 bpm span [54, 66]
+    let (_, top_row) = find_text_coords(buf, "66bpm").expect("auto-scaled 66bpm label");
+    let (_, bot_row) = find_text_coords(buf, "54bpm").expect("auto-scaled 54bpm label");
+
+    let (start_col, _) = find_text_coords(buf, "-30m").unwrap();
+    let (now_col, _) = find_text_coords(buf, "Now").unwrap();
+    let chart_right = now_col + 2;
+
+    // Count distinct contiguous column runs of Braille glyphs across the chart.
+    // 4 valid segments separated by 3 outages must produce 4 separate runs with empty gap columns between them!
+    let mut runs = 0usize;
+    let mut in_run = false;
+    for x in start_col..=chart_right {
+        let has_braille = (top_row..=bot_row).any(|y| {
+            buf[(x, y)]
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(is_non_blank_braille)
+        });
+        if has_braille && !in_run {
+            runs += 1;
+            in_run = true;
+        } else if !has_braille {
+            in_run = false;
+        }
+    }
+    assert_eq!(
+        runs, 4,
+        "Expected 4 disconnected Braille segments separated by empty gap columns:\n{out}"
+    );
+}
+
+#[test]
+fn test_history_braille_trace_overlay_gaps_and_markers() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let start_ts = 1_700_100_000_000i64;
+    let end_ts = start_ts + 40 * 60_000; // 40 minutes
+    let onset_ts = start_ts + 10 * 60_000; // 25% across
+    let trigger_ts = start_ts + 30 * 60_000; // 75% across
+    let manual_ts = start_ts + 20 * 60_000; // 50% across (inside the gap so marker stands clear)
+
+    let entry = SessionListEntry {
+        id: "sess-hist-trace".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:33".into(),
+        status: SessionStatus::Closed,
+        start_ts_ms: start_ts,
+        end_ts_ms: end_ts,
+        end_reason: Some(SessionEndReason::HostSuspend),
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(64.0),
+        sleep_mu_hr: Some(56.0),
+        onset_confirmed_ts_ms: Some(onset_ts),
+        sleeping_ts_ms: Some(trigger_ts),
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 100,
+        raw_samples_count: 0,
+        feedback: None,
+    };
+
+    // Build epochs at 15s cadence:
+    // - 0..14m: HR drops 64 -> 56 (P(Sleep) rises 0.0 -> 0.8), crossing around midpoint
+    // - 14..26m: missing (> 30s gap) AND one invalid hr_bpm_60s <= 20.0 epoch at 20m
+    // - 26..40m: HR stays 56..58, P(Sleep) stays 0.9
+    let mut epochs = Vec::new();
+    let mut idx = 0u64;
+    for sec in (0..=14 * 60).step_by(15) {
+        let frac = sec as f64 / (14.0 * 60.0);
+        let hr = 64.0 - frac * 8.0;
+        let p_sleep = frac * 0.8;
+        epochs.push(Epoch {
+            session_index: idx,
+            ts_ms: start_ts + sec * 1_000,
+            features: EpochFeatures {
+                hr_bpm_60s: hr,
+                z_hr: -1.0,
+                hr_slope_4m: -0.2,
+                r_var_120s: 0.3,
+                ln_rmssd_60s: Some(3.0),
+                delta_ln_rmssd_60s: Some(0.1),
+                rmssd_sdnn_120s: Some(0.8),
+            },
+            hrv_valid: true,
+            rr_artifact_frac: 0.0,
+            coverage: 1.0,
+            flatline_stale: false,
+            accumulators_frozen: false,
+            baseline_mu_hr: 64.0,
+            baseline_sigma_hr: 2.0,
+            baseline_frozen: true,
+            p_active_wake: 0.1,
+            p_quiet_wake: 0.9 - p_sleep,
+            p_sleep,
+            state: DetectorState::Warmup,
+        });
+        idx += 1;
+    }
+    // Invalid HR epoch at 20m (hr <= 20.0) - must NOT plot HR or skew Y-axis
+    epochs.push(Epoch {
+        session_index: idx,
+        ts_ms: manual_ts,
+        features: EpochFeatures {
+            hr_bpm_60s: 10.0,
+            z_hr: 0.0,
+            hr_slope_4m: 0.0,
+            r_var_120s: 0.0,
+            ln_rmssd_60s: None,
+            delta_ln_rmssd_60s: None,
+            rmssd_sdnn_120s: None,
+        },
+        hrv_valid: false,
+        rr_artifact_frac: 1.0,
+        coverage: 0.0,
+        flatline_stale: true,
+        accumulators_frozen: true,
+        baseline_mu_hr: 64.0,
+        baseline_sigma_hr: 2.0,
+        baseline_frozen: true,
+        p_active_wake: 0.0,
+        p_quiet_wake: 0.5,
+        p_sleep: 0.5,
+        state: DetectorState::Candidate,
+    });
+    idx += 1;
+    for sec in (26 * 60..=40 * 60).step_by(15) {
+        epochs.push(Epoch {
+            session_index: idx,
+            ts_ms: start_ts + sec * 1_000,
+            features: EpochFeatures {
+                hr_bpm_60s: 57.0,
+                z_hr: -2.0,
+                hr_slope_4m: 0.0,
+                r_var_120s: 0.2,
+                ln_rmssd_60s: Some(3.4),
+                delta_ln_rmssd_60s: Some(0.2),
+                rmssd_sdnn_120s: Some(0.9),
+            },
+            hrv_valid: true,
+            rr_artifact_frac: 0.0,
+            coverage: 1.0,
+            flatline_stale: false,
+            accumulators_frozen: false,
+            baseline_mu_hr: 64.0,
+            baseline_sigma_hr: 2.0,
+            baseline_frozen: true,
+            p_active_wake: 0.02,
+            p_quiet_wake: 0.08,
+            p_sleep: 0.9,
+            state: DetectorState::Confirmed,
+        });
+        idx += 1;
+    }
+
+    app.history_sessions = vec![entry.clone()];
+    app.selected_session_idx = 0;
+    app.selected_session_detail = Some(SessionFullDetail {
+        session: SessionLedgerRecord {
+            id: entry.id.clone(),
+            wearable_id: entry.wearable_id.clone(),
+            start_ts_ms: start_ts,
+            end_ts_ms: end_ts,
+            end_reason: SessionEndReason::HostSuspend,
+            detection_sensitivity: Sensitivity::Balanced,
+            had_rr: true,
+            warmup_mu_hr: Some(64.0),
+            warmup_sigma_hr: Some(2.0),
+            warmup_ln_rmssd: Some(3.0),
+            onset_candidate_ts_ms: Some(onset_ts - 60_000),
+            onset_confirmed_ts_ms: Some(onset_ts),
+            sleeping_ts_ms: Some(trigger_ts),
+            sleep_mu_hr: Some(56.0),
+            onset_hr_bpm: Some(59.0),
+            delta_hr_onset: Some(5.0),
+            sleep_ln_rmssd: Some(3.4),
+            sleep_hr_var_ratio: Some(0.2),
+            typical_sqi: Some(0.95),
+            post_trigger_sleep_sec: 600,
+            trigger_power_action: PowerAction::Suspend,
+            rapid_resume_within_5m: false,
+            grace_cancel_count: 0,
+            rapid_wake_fp_count: 0,
+            snooze_count: 0,
+            auto_anomalous: false,
+            epochs_count: epochs.len() as u32,
+            raw_samples_count: 0,
+        },
+        status: SessionStatus::Closed,
+        wearable: WearableInfo {
+            id: "w-1".into(),
+            mac_masked: "..:22:33".into(),
+            alias: Some("Polar H10".into()),
+            advertised_name: None,
+            supports_rr: true,
+            supports_contact: true,
+            hr_var_floor: 0.25,
+            typical_sqi: Some(0.95),
+        },
+        feedback: Some(SessionFeedbackRecord {
+            id: "fb-h".into(),
+            session_id: entry.id.clone(),
+            verdict: None,
+            manual_onset_ts_ms: Some(manual_ts),
+            manual_avg_sleep_hr: None,
+            notes: None,
+            updated_at_ms: end_ts + 10_000,
+        }),
+        epochs,
+        has_raw_samples: false,
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let out = buffer_to_string(buf);
+
+    // 1. Dynamic Y-axis auto-scaling (56..64 -> padded 54..66) and right-side P(Sleep) 100%/0% scale
+    let (top_bpm_x, top_row) =
+        find_text_coords(buf, "66bpm").expect("History auto-scaled 66bpm label");
+    let (_, bot_row) = find_text_coords(buf, "54bpm").expect("History auto-scaled 54bpm label");
+    let (p100_x, p100_row) = find_text_coords(buf, "100%").expect("Right-side 100% label");
+    let (_, p0_row) = find_text_coords(buf, "  0%").expect("Right-side 0% label");
+    assert_eq!(p100_row, top_row);
+    assert_eq!(p0_row, bot_row);
+    assert!(p100_x + 4 < buf.area.width, "100% must fit inside border");
+
+    let chart_left = top_bpm_x + 7;
+    let chart_right = p100_x - 2;
+
+    // 2. Both HR (Green) and P(Sleep) (Magenta) Braille curves render, and overlapping cells keep HR fg priority
+    let mut hr_braille_cells = 0usize;
+    let mut p_sleep_braille_cells = 0usize;
+    for y in top_row..=bot_row {
+        for x in chart_left..=chart_right {
+            let cell = &buf[(x, y)];
+            if cell
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(is_non_blank_braille)
+            {
+                if cell.fg == Color::Green {
+                    hr_braille_cells += 1;
+                } else if cell.fg == Color::Magenta {
+                    p_sleep_braille_cells += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        hr_braille_cells > 5 && p_sleep_braille_cells > 5,
+        "Expected Braille cells for both HR ({hr_braille_cells}) and P(Sleep) ({p_sleep_braille_cells}):\n{out}"
+    );
+
+    // 3. Gap columns around 15..18m and 22..25m (between 0..14m and 26..40m) must have NO Braille dots
+    let chart_span = (chart_right - chart_left) as f64;
+    let gap_col_a = chart_left + (0.42 * chart_span).round() as u16;
+    let gap_col_b = chart_left + (0.58 * chart_span).round() as u16;
+    for gx in [gap_col_a, gap_col_b] {
+        let any_braille = (top_row..=bot_row).any(|y| {
+            buf[(gx, y)]
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(is_non_blank_braille)
+        });
+        assert!(
+            !any_braille,
+            "Gap column x={gx} must not bridge across >30s epoch outage:\n{out}"
+        );
+    }
+
+    // 4. [O], [T], [M] vertical markers sit on top layer (all plot rows carry marker glyph)
+    let (o_col, o_label_row) = find_text_coords(buf, "[O]").unwrap();
+    let (t_col, _) = find_text_coords(buf, "[T]").unwrap();
+    let (m_col, _) = find_text_coords(buf, "[M]").unwrap();
+    assert_eq!(o_label_row, top_row - 1);
+    assert_eq!(buf[(o_col + 1, top_row)].symbol(), "▼");
+    assert_eq!(buf[(t_col + 1, top_row)].symbol(), "T");
+    assert_eq!(buf[(m_col + 1, top_row)].symbol(), "M");
+    for y in (top_row + 1)..=bot_row {
+        assert_eq!(buf[(o_col + 1, y)].symbol(), "|");
+        assert_eq!(buf[(t_col + 1, y)].symbol(), "|");
+        assert_eq!(buf[(m_col + 1, y)].symbol(), "|");
+    }
+
+    // 5. Compact 60x18 layout renders History without panic or border overflow
+    let mut compact_term = Terminal::new(TestBackend::new(60, 18)).unwrap();
+    compact_term
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 6. Equal-timestamp History session & invalid-only HR falls back to 50..100 without panicking
+    app.history_sessions[0].end_ts_ms = app.history_sessions[0].start_ts_ms;
+    app.history_sessions[0].warmup_mu_hr = None;
+    app.history_sessions[0].sleep_mu_hr = None;
+    if let Some(detail) = app.selected_session_detail.as_mut() {
+        for ep in &mut detail.epochs {
+            ep.ts_ms = app.history_sessions[0].start_ts_ms;
+            ep.features.hr_bpm_60s = 15.0; // <= 20.0 invalid
+        }
+    }
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let eq_hist_out = buffer_to_string(terminal.backend().buffer());
+    assert!(eq_hist_out.contains("100bpm"));
+    assert!(eq_hist_out.contains("50bpm"));
+}
+
+#[test]
+fn test_trace_ascii_fallback_no_color_modifiers_and_braille_compositing() {
+    use ratatui::style::Modifier;
+
+    // 1. Braille bitwise-OR compositing + HR foreground priority in History
+    let mut comp_app = TuiApp::new(false, false, false);
+    comp_app.daemon_connected = true;
+    comp_app.active_tab = Tab::History;
+    let start_ts = 1_700_100_000_000i64;
+    let end_ts = start_ts + 10 * 60_000;
+    let comp_entry = SessionListEntry {
+        id: "sess-comp".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Polar H10".into()),
+        wearable_mac_masked: "..:22:33".into(),
+        status: SessionStatus::Closed,
+        start_ts_ms: start_ts,
+        end_ts_ms: end_ts,
+        end_reason: Some(SessionEndReason::HostSuspend),
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(64.0),
+        sleep_mu_hr: Some(56.0),
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 41,
+        raw_samples_count: 0,
+        feedback: None,
+    };
+    let comp_epochs: Vec<Epoch> = (0..=40)
+        .map(|i| Epoch {
+            session_index: i as u64,
+            ts_ms: start_ts + (i as i64) * 15_000,
+            features: EpochFeatures {
+                hr_bpm_60s: 62.0,
+                z_hr: -0.5,
+                hr_slope_4m: 0.0,
+                r_var_120s: 0.3,
+                ln_rmssd_60s: Some(3.0),
+                delta_ln_rmssd_60s: Some(0.0),
+                rmssd_sdnn_120s: Some(0.8),
+            },
+            hrv_valid: true,
+            rr_artifact_frac: 0.0,
+            coverage: 1.0,
+            flatline_stale: false,
+            accumulators_frozen: false,
+            baseline_mu_hr: 64.0,
+            baseline_sigma_hr: 2.0,
+            baseline_frozen: true,
+            p_active_wake: 0.1,
+            p_quiet_wake: 0.25,
+            p_sleep: 0.65,
+            state: DetectorState::Warmup,
+        })
+        .collect();
+    comp_app.history_sessions = vec![comp_entry.clone()];
+    comp_app.selected_session_detail = Some(SessionFullDetail {
+        session: SessionLedgerRecord {
+            id: comp_entry.id.clone(),
+            wearable_id: comp_entry.wearable_id.clone(),
+            start_ts_ms: start_ts,
+            end_ts_ms: end_ts,
+            end_reason: SessionEndReason::HostSuspend,
+            detection_sensitivity: Sensitivity::Balanced,
+            had_rr: true,
+            warmup_mu_hr: Some(64.0),
+            warmup_sigma_hr: Some(2.0),
+            warmup_ln_rmssd: Some(3.0),
+            onset_candidate_ts_ms: None,
+            onset_confirmed_ts_ms: None,
+            sleeping_ts_ms: None,
+            sleep_mu_hr: Some(56.0),
+            onset_hr_bpm: None,
+            delta_hr_onset: None,
+            sleep_ln_rmssd: None,
+            sleep_hr_var_ratio: None,
+            typical_sqi: Some(0.95),
+            post_trigger_sleep_sec: 0,
+            trigger_power_action: PowerAction::None,
+            rapid_resume_within_5m: false,
+            grace_cancel_count: 0,
+            rapid_wake_fp_count: 0,
+            snooze_count: 0,
+            auto_anomalous: false,
+            epochs_count: comp_epochs.len() as u32,
+            raw_samples_count: 0,
+        },
+        status: SessionStatus::Closed,
+        wearable: WearableInfo {
+            id: "w-1".into(),
+            mac_masked: "..:22:33".into(),
+            alias: Some("Polar H10".into()),
+            advertised_name: None,
+            supports_rr: true,
+            supports_contact: true,
+            hr_var_floor: 0.25,
+            typical_sqi: Some(0.95),
+        },
+        feedback: None,
+        epochs: comp_epochs,
+        has_raw_samples: false,
+    });
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| comp_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let comp_buf = term.backend().buffer();
+    let (top_bpm_x, top_row) = find_text_coords(comp_buf, "66bpm").unwrap();
+    let (_, bot_row) = find_text_coords(comp_buf, "54bpm").unwrap();
+    let (p100_x, _) = find_text_coords(comp_buf, "100%").unwrap();
+    let chart_left = top_bpm_x + 7;
+    let chart_right = p100_x - 2;
+
+    // Both HR (62 bpm -> norm 0.667) and P(Sleep) (0.70) sit on the same terminal row at different sub-pixel rows:
+    // bitwise OR combines both horizontal dot pairs (4 dots = 0x36 '⠶') and gives HR (Color::Green) priority!
+    let mut merged_cells = 0usize;
+    for y in top_row..=bot_row {
+        for x in chart_left..=chart_right {
+            let cell = &comp_buf[(x, y)];
+            if let Some(ch) = cell.symbol().chars().next()
+                && is_non_blank_braille(ch)
+            {
+                let mask = u32::from(ch) - 0x2800;
+                // A single flat horizontal curve sets at most 2 dots in a cell; >= 4 dots proves both sub-rows were ORed
+                if mask.count_ones() >= 4 {
+                    assert_eq!(
+                        cell.fg,
+                        Color::Green,
+                        "Composited Braille cell must take HR foreground priority"
+                    );
+                    merged_cells += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        merged_cells > 5,
+        "Expected bitwise-OR composited Braille cells across overlapping HR and P(Sleep):\n{}",
+        buffer_to_string(comp_buf)
+    );
+
+    // 2. --ascii mode on populated Dashboard & History: strictly 7-bit ASCII, continuous strokes, HR glyph priority
+    let mut ascii_app = TuiApp::new(false, true, false);
+    ascii_app.daemon_connected = true;
+    ascii_app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(90),
+        Some("Chest"),
+    )];
+    ascii_app.sparkline_data.quiet_wake_baseline = Some(64.0);
+    ascii_app.sparkline_data.sleeping_hr = Some(56.0);
+    for sec in (0..=1800).step_by(30) {
+        let bpm = 64.0 - (sec as f64 / 1800.0) * 8.0;
+        ascii_app.handle_event(TuiEvent::ipc(IpcEvent::HrSample(HrSampleEvent {
+            ts_ms: start_ts + sec * 1_000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+            wearable_id: "w-1".into(),
+            session_id: Some("s-1".into()),
+        })));
+    }
+    term.draw(|f| ascii_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let dash_ascii_out = buffer_to_string(term.backend().buffer());
+    assert!(
+        dash_ascii_out.is_ascii(),
+        "Dashboard --ascii must emit strictly 7-bit ASCII:\n{dash_ascii_out}"
+    );
+    assert!(
+        dash_ascii_out.contains('|'),
+        "Dashboard --ascii must render '|' -15m guide:\n{dash_ascii_out}"
+    );
+    assert!(
+        dash_ascii_out.contains('*') || dash_ascii_out.contains('\\'),
+        "Dashboard --ascii must render continuous ASCII stroke glyphs:\n{dash_ascii_out}"
+    );
+
+    // History --ascii with overlapping HR and P(Sleep) -> strictly ASCII, HR ('*' / Green) wins over P(Sleep)
+    ascii_app.active_tab = Tab::History;
+    ascii_app.history_sessions = comp_app.history_sessions.clone();
+    ascii_app.selected_session_detail = comp_app.selected_session_detail.clone();
+    term.draw(|f| ascii_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let hist_ascii_buf = term.backend().buffer();
+    let hist_ascii_out = buffer_to_string(hist_ascii_buf);
+    assert!(
+        hist_ascii_out.is_ascii(),
+        "History --ascii must emit strictly 7-bit ASCII:\n{hist_ascii_out}"
+    );
+    let mut hr_ascii_cells = 0usize;
+    for y in top_row..=bot_row {
+        for x in chart_left..=chart_right {
+            let cell = &hist_ascii_buf[(x, y)];
+            if cell.symbol() == "*" && cell.fg == Color::Green {
+                hr_ascii_cells += 1;
+            }
+        }
+    }
+    assert!(
+        hr_ascii_cells > 5,
+        "History --ascii must give HR glyph ('*') priority over P(Sleep) on overlap:\n{hist_ascii_out}"
+    );
+
+    // 3. NO_COLOR mode (no_color = true, ascii = false) preserves Braille with BOLD/DIM/UNDERLINED modifiers
+    let mut nc_app = TuiApp::new(false, false, true);
+    nc_app.daemon_connected = true;
+    nc_app.enrolled_wearables = ascii_app.enrolled_wearables.clone();
+    nc_app.sparkline_data = ascii_app.sparkline_data.clone();
+    term.draw(|f| nc_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let nc_dash_buf = term.backend().buffer();
+    let mut saw_bold_braille = false;
+    let mut saw_dim_ref = false;
+    let mut saw_underlined_ref = false;
+    for y in 0..nc_dash_buf.area.height {
+        for x in 0..nc_dash_buf.area.width {
+            let cell = &nc_dash_buf[(x, y)];
+            assert_eq!(cell.fg, Color::Reset);
+            assert_eq!(cell.bg, Color::Reset);
+            if cell
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(is_non_blank_braille)
+                && cell.modifier.contains(Modifier::BOLD)
+            {
+                saw_bold_braille = true;
+            }
+            if cell.symbol() == "┄" && cell.modifier.contains(Modifier::DIM) {
+                saw_dim_ref = true;
+            }
+            if cell.symbol() == "┄" && cell.modifier.contains(Modifier::UNDERLINED) {
+                saw_underlined_ref = true;
+            }
+        }
+    }
+    assert!(
+        saw_bold_braille,
+        "NO_COLOR Dashboard must render BOLD Braille HR curve"
+    );
+    assert!(
+        saw_dim_ref,
+        "NO_COLOR Dashboard must render DIM QW reference line"
+    );
+    assert!(
+        saw_underlined_ref,
+        "NO_COLOR Dashboard must render UNDERLINED Sleep reference line"
+    );
+
+    nc_app.active_tab = Tab::History;
+    nc_app.history_sessions = comp_app.history_sessions.clone();
+    let mut nc_detail = comp_app.selected_session_detail.clone().unwrap();
+    for ep in nc_detail.epochs.iter_mut().skip(20) {
+        ep.p_sleep = 0.25;
+    }
+    nc_app.selected_session_detail = Some(nc_detail);
+    term.draw(|f| nc_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let nc_hist_buf = term.backend().buffer();
+    let mut saw_hist_bold_braille = false;
+    let mut saw_hist_underlined_braille = false;
+    let mut saw_hist_dim_ref = false;
+    for y in 0..nc_hist_buf.area.height {
+        for x in 0..nc_hist_buf.area.width {
+            let cell = &nc_hist_buf[(x, y)];
+            assert_eq!(cell.fg, Color::Reset);
+            assert_eq!(cell.bg, Color::Reset);
+            if cell
+                .symbol()
+                .chars()
+                .next()
+                .is_some_and(is_non_blank_braille)
+            {
+                if cell.modifier.contains(Modifier::BOLD) {
+                    saw_hist_bold_braille = true;
+                }
+                if cell.modifier.contains(Modifier::UNDERLINED) {
+                    saw_hist_underlined_braille = true;
+                }
+            }
+            if cell.symbol() == "┄" && cell.modifier.contains(Modifier::DIM) {
+                saw_hist_dim_ref = true;
+            }
+        }
+    }
+    assert!(
+        saw_hist_bold_braille,
+        "NO_COLOR History must preserve BOLD Braille HR curve"
+    );
+    assert!(
+        saw_hist_underlined_braille,
+        "NO_COLOR History must preserve UNDERLINED Braille P(Sleep) curve"
+    );
+    assert!(
+        saw_hist_dim_ref,
+        "NO_COLOR History must preserve DIM QW reference line"
+    );
 }

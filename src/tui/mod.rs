@@ -18,6 +18,7 @@ pub mod input;
 pub mod sparkline;
 pub mod terminal;
 pub mod theme;
+pub mod trace;
 pub mod views;
 
 pub use app::{

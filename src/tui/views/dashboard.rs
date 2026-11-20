@@ -331,7 +331,7 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
 }
 
 fn render_sparkline_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
-    let block = app.theme.card_block(" 30-Minute Heart Rate Sparkline ");
+    let block = app.theme.card_block(" 30-Minute Heart Rate Trace ");
     let inner = block.inner(area);
     block.render(area, buf);
 
