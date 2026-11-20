@@ -763,7 +763,7 @@ fn test_zero_wearables_cta_and_systemd_unit_detection() {
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
 
-    // When unit is NOT installed, hint shows without nonexistent `bpmute service install`
+    // When unit is NOT installed, hint directs users to `bpmute service install`
     let mut app_uninstalled = TuiApp::new(false, false, false);
     app_uninstalled.daemon_connected = true;
     app_uninstalled.systemd_service_installed = false;
@@ -773,7 +773,7 @@ fn test_zero_wearables_cta_and_systemd_unit_detection() {
     let out = buffer_to_string(terminal.backend().buffer());
     assert!(out.contains("No BLE Heart Rate wearables enrolled yet."));
     assert!(out.contains("systemd --user unit not found"));
-    assert!(!out.contains("bpmute service install"));
+    assert!(out.contains("bpmute service install"));
 
     // When unit IS installed, hint is hidden
     let mut app_installed = TuiApp::new(false, false, false);

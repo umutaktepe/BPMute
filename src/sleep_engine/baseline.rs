@@ -11,6 +11,7 @@ const WARMUP_RECOVERY_SLOPE_THRESHOLD: f64 = -0.75; // bpm/min
 const MIN_RETAINED_EPOCHS: usize = 4;
 const SPIKE_MULTIPLIER: f64 = 1.15; // Exclude > +15% ActiveWake spikes
 const MAX_REANCHOR_NEG_SLOPE: f64 = -0.15; // bpm/min: block N1 deceleration descent
+const MAX_REANCHOR_POS_SLOPE: f64 = 0.75; // bpm/min: exclude rising edges of ActiveWake spikes
 
 #[derive(Debug, Clone, Copy)]
 struct BaselineEpoch {
@@ -136,9 +137,27 @@ impl QuietWakeBaseline {
         }
 
         self.frozen = false;
-        if raw.accumulators_frozen || raw.hr_slope_4m < MAX_REANCHOR_NEG_SLOPE {
+        if raw.accumulators_frozen {
             return;
         }
+
+        let local_var_ratio = raw.local_mad_120s / self.sigma_hr();
+        // Exclude rising edges and step-edge MAD bursts of transient ActiveWake spikes.
+        if raw.hr_slope_4m > MAX_REANCHOR_POS_SLOPE || local_var_ratio > 1.80 {
+            return;
+        }
+
+        if raw.hr_slope_4m < MAX_REANCHOR_NEG_SLOPE {
+            let below_current_baseline = self.mu_hr.is_none_or(|mu| raw.hr_bpm_60s <= mu);
+            if !below_current_baseline || local_var_ratio < 0.80 {
+                return;
+            }
+            // Waking post-activity recovery: purge only stale elevated epochs above current calm HR,
+            // preserving any older low-HR quiet-wake baseline history.
+            let upper_bound = raw.hr_bpm_60s + 1.5 * self.sigma_hr();
+            self.epochs.retain(|ep| ep.hr_bpm_60s <= upper_bound);
+        }
+
         self.try_record_epoch(raw);
     }
 
@@ -210,11 +229,11 @@ impl QuietWakeBaseline {
         let kept_hrvs: Vec<f64> = filtered.iter().filter_map(|ep| ep.ln_rmssd_60s).collect();
 
         self.mu_hr = quantile(&kept_hrs, 0.5);
-        // Mean of local 120 s MAD values avoids discrete 1.4826 multiples on integer BPM streams
-        // while staying immune to slow inter-epoch baseline trends.
-        let mad_sum: f64 = filtered.iter().map(|ep| ep.local_mad_120s).sum();
-        let mean_mad = mad_sum / filtered.len() as f64;
-        self.sigma_hr = mean_mad.max(SIGMA_MIN_BPM);
+        // Median of detrended local 120 s MAD values prevents transient step-edge MAD spikes
+        // from inflating baseline sigma_hr.
+        let kept_mads: Vec<f64> = filtered.iter().map(|ep| ep.local_mad_120s).collect();
+        let median_mad = quantile(&kept_mads, 0.5).unwrap_or(SIGMA_MIN_BPM);
+        self.sigma_hr = median_mad.max(SIGMA_MIN_BPM);
         if !kept_hrvs.is_empty() {
             self.mu_ln_rmssd = quantile(&kept_hrvs, 0.5);
         }

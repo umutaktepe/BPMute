@@ -139,6 +139,19 @@ pub enum Command {
         #[arg(long, value_name = "NAME")]
         alias: Option<String>,
     },
+    /// Provision and manage the `systemd --user` background service.
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
+    /// Upgrade BPMute via the companion `bpmute-update` binary.
+    Update,
+    /// Generate shell completion scripts for bash, zsh, or fish.
+    Completions {
+        /// Target shell (`bash`, `zsh`, or `fish`).
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -381,4 +394,53 @@ pub enum ConfigCommand {
     Edit,
     /// Ask the running daemon to reload `config.toml` live without dropping IPC connections.
     Reload,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Generate and enable `~/.config/systemd/user/bpmute.service`.
+    Install {
+        /// systemd target unit mode (`auto`, `graphical-session`, or `default`).
+        #[arg(long, value_enum, default_value = "auto", value_name = "TARGET")]
+        target: ServiceTargetArg,
+    },
+    /// Disable and remove `~/.config/systemd/user/bpmute.service`.
+    Uninstall {
+        /// Also remove `$XDG_CONFIG_HOME/bpmute/config.toml`.
+        #[arg(long)]
+        purge_config: bool,
+    },
+    /// Start `bpmute.service` via `systemctl --user start`.
+    Start,
+    /// Stop `bpmute.service` via `systemctl --user stop`.
+    Stop,
+    /// Restart `bpmute.service` via `systemctl --user restart`.
+    Restart,
+    /// Reload daemon configuration via `systemctl --user reload` (`SIGHUP`).
+    Reload,
+    /// Show `bpmute.service` status via `systemctl --user status`.
+    Status,
+    /// Show `bpmute.service` logs via `journalctl --user -u bpmute.service`.
+    Logs {
+        /// Stream new log entries continuously (`-f`).
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ServiceTargetArg {
+    Auto,
+    #[value(alias = "graphical_session")]
+    GraphicalSession,
+    Default,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }

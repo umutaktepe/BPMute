@@ -7,7 +7,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -15,3 +15,63 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/check.sh
+
+  static-musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl-tools and configure static musl linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target_under="${{ matrix.target }}"
+          target_under="${target_under//-/_}"
+          target_upper="${target_under^^}"
+          echo "CC_${target_under}=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_upper}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+      - name: Build static musl release binary
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Verify zero dynamic .so dependencies
+        run: ./scripts/verify-static-musl.sh "target/${{ matrix.target }}/release/bpmute"
+
+  tier2-monte-carlo:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tier2-monte-carlo
+      - name: Run Tier 2 seeded Monte Carlo sweep (~200 nights)
+        env:
+          BPMUTE_MONTE_CARLO_OUT_DIR: target/tier2-report
+        run: cargo test --release --test monte_carlo -- --ignored --nocapture
+      - name: Publish Tier 2 summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f target/tier2-report/monte-carlo-report.md ]; then
+            cat target/tier2-report/monte-carlo-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload Tier 2 report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-monte-carlo-report
+          path: target/tier2-report/

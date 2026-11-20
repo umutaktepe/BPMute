@@ -430,23 +430,13 @@ impl PpgPipeline {
 
         let hr_slope_4m = self.compute_hr_slope_4m();
 
-        let vals_120s: Vec<f64> = self
+        let vals_120s: Vec<(i64, f64)> = self
             .filtered_bpm_240s
             .iter()
             .filter(|v| ts_ms - v.ts_ms <= HR_VAR_WINDOW_MS)
-            .map(|v| v.val)
+            .map(|v| (v.ts_ms, v.val))
             .collect();
-        let local_mad_120s = if vals_120s.len() >= 5 {
-            let smoothed: Vec<f64> = vals_120s
-                .windows(5)
-                .map(|w| w.iter().sum::<f64>() * 0.2)
-                .collect();
-            scaled_mad(&smoothed).unwrap_or(SIGMA_MIN_BPM)
-        } else if vals_120s.len() >= 3 {
-            scaled_mad(&vals_120s).unwrap_or(SIGMA_MIN_BPM)
-        } else {
-            SIGMA_MIN_BPM
-        };
+        let local_mad_120s = detrended_scaled_mad(&vals_120s).unwrap_or(SIGMA_MIN_BPM);
 
         let sqi_beats: Vec<TimedBeat> = self
             .rr_120s
@@ -517,27 +507,64 @@ impl PpgPipeline {
         if last_ts - first_ts < 60_000 {
             return 0.0;
         }
-
-        let n = self.filtered_bpm_240s.len() as f64;
-        let mut t_sum = 0.0;
-        let mut y_sum = 0.0;
-        for s in &self.filtered_bpm_240s {
-            t_sum += (s.ts_ms - first_ts) as f64 / 60_000.0;
-            y_sum += s.val;
-        }
-        let t_mean = t_sum / n;
-        let y_mean = y_sum / n;
-
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for s in &self.filtered_bpm_240s {
-            let dt = (s.ts_ms - first_ts) as f64 / 60_000.0 - t_mean;
-            let dy = s.val - y_mean;
-            num += dt * dy;
-            den += dt * dt;
-        }
-        if den <= 1e-12 { 0.0 } else { num / den }
+        let points: Vec<(i64, f64)> = self
+            .filtered_bpm_240s
+            .iter()
+            .map(|s| (s.ts_ms, s.val))
+            .collect();
+        ols_trend(&points).map_or(0.0, |(_, _, _, slope)| slope)
     }
+}
+
+fn ols_trend(series: &[(i64, f64)]) -> Option<(i64, f64, f64, f64)> {
+    let first_ts = series.first()?.0;
+    let n = series.len() as f64;
+    let mut t_sum = 0.0;
+    let mut y_sum = 0.0;
+    for &(ts, val) in series {
+        t_sum += (ts - first_ts) as f64 / 60_000.0;
+        y_sum += val;
+    }
+    let t_mean = t_sum / n;
+    let y_mean = y_sum / n;
+
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for &(ts, val) in series {
+        let dt = (ts - first_ts) as f64 / 60_000.0 - t_mean;
+        let dy = val - y_mean;
+        num += dt * dy;
+        den += dt * dt;
+    }
+    let slope = if den <= 1e-12 { 0.0 } else { num / den };
+    Some((first_ts, t_mean, y_mean, slope))
+}
+
+fn detrended_scaled_mad(points: &[(i64, f64)]) -> Option<f64> {
+    let smoothed;
+    let series: &[(i64, f64)] = if points.len() >= 5 {
+        smoothed = points
+            .windows(5)
+            .map(|w| {
+                let avg = w.iter().map(|p| p.1).sum::<f64>() * 0.2;
+                (w[2].0, avg)
+            })
+            .collect::<Vec<_>>();
+        &smoothed
+    } else if points.len() >= 3 {
+        points
+    } else {
+        return None;
+    };
+    let (first_ts, t_mean, y_mean, slope) = ols_trend(series)?;
+    let residuals: Vec<f64> = series
+        .iter()
+        .map(|&(ts, val)| {
+            let t = (ts - first_ts) as f64 / 60_000.0;
+            val - (y_mean + slope * (t - t_mean))
+        })
+        .collect();
+    scaled_mad(&residuals)
 }
 
 /// Computes `z_hr` and `r_var_120s` relative to `Quiet-Wake Baseline` and per-Wearable floor.

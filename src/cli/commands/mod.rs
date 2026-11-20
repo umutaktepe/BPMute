@@ -16,13 +16,18 @@ use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, split_shell_words};
 use crate::storage::{LedgerStore, StorageError, db_exists, db_path_in_data_dir};
 
+pub mod completions;
 pub mod data;
 pub mod monitor;
+pub mod service;
 pub mod sessions;
+pub mod system_exec;
+pub mod update;
 pub mod wearables;
 
 use data::run_data;
 use monitor::{run_cancel, run_snooze, run_test_trigger};
+use service::run_service;
 use sessions::{run_calibration, run_replay, run_sessions};
 use wearables::{run_enroll, run_wearables};
 
@@ -36,6 +41,22 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
     stdout: &mut WOut,
     stderr: &mut WErr,
 ) -> ExitCode {
+    if cli.command.is_some() && (cli.no_mouse || cli.ascii) {
+        let _ = writeln!(
+            stderr,
+            "error: --no-mouse and --ascii are only valid when launching the interactive TUI without a subcommand"
+        );
+        return ExitCode::UsageOrConfigError;
+    }
+
+    match cli.command {
+        Some(Command::Completions { shell }) => {
+            return completions::run_completions(shell, stdout);
+        }
+        Some(Command::Update) => return update::run_update(env, stdout, stderr),
+        _ => {}
+    }
+
     let paths = match ResolvedPaths::resolve(
         cli.config.as_deref(),
         cli.data_dir.as_deref(),
@@ -50,14 +71,6 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
     };
 
     let cli_overrides = build_cli_overrides(&cli, None);
-
-    if cli.command.is_some() && (cli.no_mouse || cli.ascii) {
-        let _ = writeln!(
-            stderr,
-            "error: --no-mouse and --ascii are only valid when launching the interactive TUI without a subcommand"
-        );
-        return ExitCode::UsageOrConfigError;
-    }
 
     match cli.command {
         None => crate::tui::run_tui(paths, env, cli.no_mouse, cli.ascii, stdout, stderr).await,
@@ -110,6 +123,10 @@ pub async fn execute_cli<WOut: Write, WErr: Write>(
         }
         Some(Command::Config { action }) => {
             run_config(action, &paths, env, &cli_overrides, stdout, stderr).await
+        }
+        Some(Command::Service { action }) => run_service(action, &paths, env, stdout, stderr),
+        Some(Command::Completions { .. }) | Some(Command::Update) => {
+            unreachable!("handled before path resolution")
         }
     }
 }

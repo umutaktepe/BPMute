@@ -350,9 +350,9 @@ fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     if !app.systemd_service_installed {
         lines.push(Line::from(""));
         let hint = if app.theme.ascii {
-            "  Hint: systemd --user unit not found - run 'bpmute daemon' or enable bpmute.service."
+            "  Hint: systemd --user unit not found - run 'bpmute service install'."
         } else {
-            "  Hint: systemd --user unit not found — run 'bpmute daemon' or enable bpmute.service."
+            "  Hint: systemd --user unit not found — run 'bpmute service install'."
         };
         lines.push(Line::from(vec![Span::styled(hint, app.theme.muted())]));
     }

@@ -1518,3 +1518,48 @@ fn review_regression_desktop_candidate_cancel_grace_outcomes_single_gap_and_rr_d
         "steady BPM for 50 s after dropping RR must not trigger 30 s BPM+RR flatline"
     );
 }
+
+#[test]
+fn tier1_calibrated_and_cold_start_post_workout_recovery_zero_false_positives() {
+    use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
+
+    let calibrated_priors = CalibrationPriors {
+        maturity: CalibrationMaturity::Calibrated,
+        mu_wake: Some(68.0),
+        wake_median: None,
+        sigma_wake: Some(2.2),
+        mu_sleep: Some(60.0),
+        delta_hr_onset: Some(-8.0),
+        mu_ln_rmssd_sleep: Some(3.75),
+        tau_p_sleep_offset: 0.0,
+        dwell_adjust_sec: 0,
+        wake_mad_s: Some(2.3),
+    };
+
+    for (label, priors) in [
+        ("cold_start", CalibrationPriors::cold_start()),
+        ("calibrated", calibrated_priors),
+    ] {
+        for (seed, dur) in [(17_u64, 900_i64), (83_u64, 1080_i64)] {
+            let trace = generate_paired_trace(
+                seed,
+                Phenotype::typical(),
+                &[
+                    StageKind::PostWorkoutCooldown {
+                        duration_sec: dur,
+                        initial_excess_bpm: 22.0,
+                    },
+                    StageKind::QuietWake { duration_sec: 3600 },
+                ],
+            );
+            for (mode, events) in [("BPM+RR", &trace.bpm_rr), ("BPM-only", &trace.bpm_only_gt5)] {
+                let (conf, _, _) = run_trace_collecting_confirmed(events, priors.clone());
+                assert!(
+                    conf.is_empty(),
+                    "post-workout recovery FP in {label} ({mode}, seed {seed}, dur {dur}s): {:?}",
+                    conf
+                );
+            }
+        }
+    }
+}
