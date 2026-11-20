@@ -12,6 +12,8 @@ pub(crate) enum ClickTarget {
     OpenPausePopover,
     AcceptShift,
     IgnoreShift,
+    DismissAlert,
+    DashboardEnroll,
     WearablesEnroll,
     WearablesRename,
     WearablesReconnect,
@@ -30,6 +32,7 @@ pub(crate) enum ClickTarget {
     CloseModal,
     ModalConfirm,
     ModalRescan,
+    PauseOption(usize),
     Consume,
 }
 
@@ -38,6 +41,7 @@ pub(crate) enum ClickTarget {
 pub(crate) enum ScrollTarget {
     WearablesTable,
     HelpModal,
+    PausePopover,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +78,21 @@ impl HitMap {
     /// Records a clickable background target rectangle if non-empty.
     pub(crate) fn push_click(&mut self, rect: Rect, target: ClickTarget) {
         push_region(&mut self.clicks, rect, target);
+    }
+
+    /// Records a single-row clickable target clipped to `bounds`.
+    pub(crate) fn push_clipped_row_click(
+        &mut self,
+        bounds: Rect,
+        x: u16,
+        y: u16,
+        width: u16,
+        target: ClickTarget,
+    ) {
+        if x < bounds.right() && y >= bounds.y && y < bounds.bottom() {
+            let visible_w = width.min(bounds.right().saturating_sub(x));
+            self.push_click(Rect::new(x, y, visible_w, 1), target);
+        }
     }
 
     /// Records a clickable modal-layer target rectangle if non-empty.

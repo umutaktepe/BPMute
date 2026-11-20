@@ -118,8 +118,7 @@ impl TuiApp {
                 KeyCode::Char('e')
                     if self.daemon_connected && self.enrolled_wearables.is_empty() =>
                 {
-                    self.active_tab = Tab::Wearables;
-                    Some(self.open_enrollment_modal())
+                    self.enroll_from_dashboard()
                 }
                 KeyCode::Char('a')
                     if self.daemon_connected && self.has_persistent_shift_alert() =>
@@ -131,17 +130,7 @@ impl TuiApp {
                 {
                     Some(TuiCommand::DismissShift)
                 }
-                KeyCode::Char('x') if self.daemon_connected => {
-                    if let Some(alert) = self.active_alert()
-                        && alert.dismissible
-                    {
-                        let id = alert.id.clone();
-                        self.alerts.retain(|a| a.id != id);
-                        Some(TuiCommand::DismissAlert { id })
-                    } else {
-                        None
-                    }
-                }
+                KeyCode::Char('x') if self.daemon_connected => self.dismiss_active_alert(),
                 _ => None,
             },
             Tab::Wearables if self.daemon_connected => match key.code {
@@ -195,6 +184,27 @@ impl TuiApp {
         }
         self.modal = ModalState::PausePopover { selected_idx: 0 };
         None
+    }
+
+    pub(super) fn dismiss_active_alert(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        let alert = self.active_alert()?;
+        if !alert.dismissible {
+            return None;
+        }
+        let id = alert.id.clone();
+        self.alerts.retain(|a| a.id != id);
+        Some(TuiCommand::DismissAlert { id })
+    }
+
+    pub(super) fn enroll_from_dashboard(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected || !self.enrolled_wearables.is_empty() {
+            return None;
+        }
+        self.active_tab = Tab::Wearables;
+        Some(self.open_enrollment_modal())
     }
 
     pub(super) fn open_rename_selected_wearable_modal(&mut self) -> Option<TuiCommand> {

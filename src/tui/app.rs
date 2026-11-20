@@ -8,7 +8,7 @@ use super::hit_map::HitMap;
 use super::sparkline::HrSparklineData;
 use super::theme::Theme;
 use super::views::centered_rect;
-use super::views::dashboard::render_dashboard;
+use super::views::dashboard::{render_dashboard, render_pause_popover};
 use super::views::footer::render_footer;
 use super::views::header::{render_global_banner, render_header};
 use super::views::help::render_help;
@@ -740,7 +740,7 @@ impl TuiApp {
         }
 
         match self.active_tab {
-            Tab::Dashboard => render_dashboard(self, content_area, buf),
+            Tab::Dashboard => render_dashboard(self, content_area, buf, &mut hit_map),
             Tab::History => render_history(self, content_area, buf),
             Tab::Wearables => render_wearables(self, content_area, buf, &mut hit_map),
             Tab::Settings => render_settings(self, content_area, buf),
@@ -750,6 +750,8 @@ impl TuiApp {
             let max_scroll = render_help(self, area, buf, &mut hit_map);
             self.help_max_scroll = max_scroll;
             self.help_scroll_offset = self.help_scroll_offset.min(max_scroll);
+        } else if let ModalState::PausePopover { selected_idx } = self.modal {
+            render_pause_popover(self, selected_idx, area, content_area, buf, &mut hit_map);
         }
 
         render_footer(self, footer_area, buf, &mut hit_map);

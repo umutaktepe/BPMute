@@ -50,9 +50,12 @@ impl<'a> FooterWriter<'a> {
         let item_w = (key_span.width() + label_span.width()) as u16;
         let gap_w = gap_span.width() as u16;
 
-        if enabled
-            && let Some(click_target) = target
-            && self.x < self.area.right()
+        if self.x < self.area.right()
+            && let Some(click_target) = if enabled {
+                target.or(self.modal_active.then_some(ClickTarget::Consume))
+            } else {
+                None
+            }
         {
             let visible_w = item_w.min(self.area.right().saturating_sub(self.x));
             let rect = Rect::new(self.x, self.area.y, visible_w, 1);

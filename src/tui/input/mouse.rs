@@ -28,6 +28,8 @@ impl TuiApp {
                     ClickTarget::IgnoreShift => (self.daemon_connected
                         && self.has_persistent_shift_alert())
                     .then_some(TuiCommand::DismissShift),
+                    ClickTarget::DismissAlert => self.dismiss_active_alert(),
+                    ClickTarget::DashboardEnroll => self.enroll_from_dashboard(),
                     ClickTarget::WearablesEnroll => {
                         self.daemon_connected.then(|| self.open_enrollment_modal())
                     }
@@ -62,6 +64,7 @@ impl TuiApp {
                     ClickTarget::CloseModal => self.cancel_active_modal(),
                     ClickTarget::ModalConfirm => self.confirm_active_modal(),
                     ClickTarget::ModalRescan => self.rescan_enrollment_modal(),
+                    ClickTarget::PauseOption(idx) => self.click_pause_option(idx),
                     ClickTarget::Consume => None,
                 }
             }
@@ -78,6 +81,9 @@ impl TuiApp {
                     }
                     ScrollTarget::HelpModal => {
                         self.scroll_help(delta);
+                    }
+                    ScrollTarget::PausePopover => {
+                        self.scroll_pause_popover(delta);
                     }
                 }
                 None

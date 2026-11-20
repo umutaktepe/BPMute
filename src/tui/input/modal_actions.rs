@@ -6,7 +6,38 @@ use crate::calibration::FeedbackVerdict;
 use crate::ipc::protocol::{PauseMode, PauseParams};
 use crate::replay::TraceFormat;
 
+const PAUSE_OPTION_COUNT: usize = 5;
+
 impl TuiApp {
+    pub(super) fn click_pause_option(&mut self, idx: usize) -> Option<TuiCommand> {
+        let ModalState::PausePopover {
+            ref mut selected_idx,
+        } = self.modal
+        else {
+            return None;
+        };
+        if idx >= PAUSE_OPTION_COUNT {
+            return None;
+        }
+        if *selected_idx == idx {
+            self.confirm_pause_selection(idx)
+        } else {
+            *selected_idx = idx;
+            None
+        }
+    }
+
+    pub(super) fn scroll_pause_popover(&mut self, delta: isize) {
+        if let ModalState::PausePopover {
+            ref mut selected_idx,
+        } = self.modal
+        {
+            let max_idx = (PAUSE_OPTION_COUNT - 1) as isize;
+            let next = (*selected_idx as isize + delta).clamp(0, max_idx);
+            *selected_idx = next as usize;
+        }
+    }
+
     pub(super) fn confirm_pause_selection(&mut self, sel: usize) -> Option<TuiCommand> {
         self.modal = ModalState::None;
         match sel {

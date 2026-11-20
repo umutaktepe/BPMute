@@ -3401,3 +3401,545 @@ fn test_mouse_help_modal_scrolling_and_backdrop_dismissal() {
     app_nm.handle_event(mouse_left_click(0, 0));
     assert_eq!(app_nm.modal, ModalState::Help);
 }
+
+#[test]
+fn test_mouse_dashboard_alert_strip_actions() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.alerts = vec![DaemonAlert {
+        id: alert_ids::PERSISTENT_SHIFT.into(),
+        kind: "calibration".into(),
+        severity: AlertSeverity::Info,
+        message: "Persistent baseline shift detected".into(),
+        dismissible: true,
+    }];
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    let (accept_col, accept_row) = find_text_coords(buf, "[a] Accept").unwrap();
+    let (ignore_col, ignore_row) = find_text_coords(buf, "[i] Ignore").unwrap();
+    let (dismiss_col, dismiss_row) = find_text_coords(buf, "[x] Dismiss").unwrap();
+    let (msg_col, msg_row) = find_text_coords(buf, "Persistent").unwrap();
+
+    // Clicking message body or border does nothing
+    assert_eq!(
+        app.handle_event(mouse_left_click(msg_col + 1, msg_row)),
+        None
+    );
+    assert_eq!(app.handle_event(mouse_left_click(0, msg_row - 1)), None);
+
+    // [a] Accept and [i] Ignore dispatch AcceptShift and DismissShift
+    assert_eq!(
+        app.handle_event(mouse_left_click(accept_col + 1, accept_row)),
+        Some(TuiCommand::AcceptShift)
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(ignore_col + 1, ignore_row)),
+        Some(TuiCommand::DismissShift)
+    );
+
+    // [x] Dismiss dispatches DismissAlert and removes the alert locally
+    assert_eq!(
+        app.handle_event(mouse_left_click(dismiss_col + 1, dismiss_row)),
+        Some(TuiCommand::DismissAlert {
+            id: alert_ids::PERSISTENT_SHIFT.into(),
+        })
+    );
+    assert!(app.alerts.is_empty());
+
+    // Non-shift dismissible alert: [a] and [i] are absent, [x] Dismiss works
+    app.alerts = vec![DaemonAlert {
+        id: "warn-battery".into(),
+        kind: "wearable".into(),
+        severity: AlertSeverity::Warn,
+        message: "Low battery".into(),
+        dismissible: true,
+    }];
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    assert!(find_text_coords_in_row(buf, accept_row, "[a] Accept").is_none());
+    assert!(find_text_coords_in_row(buf, ignore_row, "[i] Ignore").is_none());
+    let (d_col, d_row) = find_text_coords_in_row(buf, accept_row, "[x] Dismiss").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(d_col + 1, d_row)),
+        Some(TuiCommand::DismissAlert {
+            id: "warn-battery".into(),
+        })
+    );
+    assert!(app.alerts.is_empty());
+
+    // Non-dismissible non-shift alert: no action hints, clicks inside alert strip are ignored
+    app.alerts = vec![DaemonAlert {
+        id: alert_ids::LOGIND_INHIBITED.into(),
+        kind: "action".into(),
+        severity: AlertSeverity::Warn,
+        message: "Desktop idle inhibited".into(),
+        dismissible: false,
+    }];
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let (inh_col, inh_row) = find_text_coords(buf, "Desktop idle").unwrap();
+    assert!(find_text_coords_in_row(buf, inh_row, "[x] Dismiss").is_none());
+    assert_eq!(
+        app.handle_event(mouse_left_click(inh_col + 2, inh_row)),
+        None
+    );
+    assert_eq!(app.alerts.len(), 1);
+
+    // Offline guard: even if an alert is present while disconnected, clicks do not dispatch
+    app.daemon_connected = false;
+    app.alerts = vec![DaemonAlert {
+        id: alert_ids::PERSISTENT_SHIFT.into(),
+        kind: "calibration".into(),
+        severity: AlertSeverity::Info,
+        message: "Persistent baseline shift detected".into(),
+        dismissible: true,
+    }];
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let (off_a_col, off_a_row) = find_text_coords(buf, "[a] Accept").unwrap();
+    let (off_i_col, off_i_row) = find_text_coords(buf, "[i] Ignore").unwrap();
+    let (off_x_col, off_x_row) = find_text_coords(buf, "[x] Dismiss").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(off_a_col + 1, off_a_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(off_i_col + 1, off_i_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(off_x_col + 1, off_x_row)),
+        None
+    );
+    assert_eq!(app.alerts.len(), 1);
+}
+
+#[test]
+fn test_mouse_dashboard_zero_wearables_cta() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+
+    // 1. At 100x24 online with no enrolled wearables, Getting Started CTA is shown
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+
+    // Non-interactive CTA prose ignores clicks
+    let (msg_col, msg_row) = find_text_coords(buf, "No BLE Heart Rate").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(msg_col + 1, msg_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    assert_eq!(app.modal, ModalState::None);
+
+    // Clicking "Wearables tab (3)" switches to Wearables without opening EnrollmentModal
+    let (tab_cta_col, tab_cta_row) = find_text_coords(buf, "Wearables tab (3)").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(tab_cta_col + 2, tab_cta_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert_eq!(app.modal, ModalState::None);
+
+    // Return to Dashboard, re-render, and click [e] -> switches to Wearables + opens EnrollmentModal + EnrollStart
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (e_col, e_row) =
+        find_text_coords(terminal.backend().buffer(), "[e] on the Dashboard").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(e_col + 1, e_row)),
+        Some(TuiCommand::EnrollStart(Some(30)))
+    );
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
+
+    // 2. Narrow 60x18 viewport still keeps [e] and clipped "Wearables ta" clickable
+    app.modal = ModalState::None;
+    app.active_tab = Tab::Dashboard;
+    let mut narrow = Terminal::new(TestBackend::new(60, 18)).unwrap();
+    narrow
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let narrow_buf = narrow.backend().buffer();
+    let (nw_col, nw_row) = find_text_coords(narrow_buf, "Wearables ta").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(nw_col + 1, nw_row)), None);
+    assert_eq!(app.active_tab, Tab::Wearables);
+
+    // 3. Offline renders sparkline instead of CTA
+    app.active_tab = Tab::Dashboard;
+    app.daemon_connected = false;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "Getting Started").is_none());
+}
+
+#[test]
+fn test_mouse_dashboard_system_card_diagnostics_and_readonly_cards() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.armed = true;
+    app.latest_bpm = Some(62.0);
+    app.latest_p_sleep = Some(0.18);
+    app.is_diagnostics_open = true;
+    app.enrolled_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(88),
+        None,
+    )];
+    app.daemon_status = Some(DaemonStatus {
+        v: 1,
+        daemon_running: true,
+        version: "0.1.0".into(),
+        pid: 1,
+        uptime_sec: 10,
+        monitoring_state: MonitoringState::Monitoring,
+        armed: true,
+        paused: false,
+        paused_until: None,
+        pause_mode: None,
+        dry_run: false,
+        schedule: ScheduleConfig::default(),
+        config_path: String::new(),
+        config_loaded_from_file: false,
+        socket_path: String::new(),
+        log_biometrics: false,
+        alerts: Vec::new(),
+        idle_backend: Some("ext-idle-notify".into()),
+        playing_players_count: Some(1),
+    });
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 1. Read-only cards ignore clicks and wheel scroll
+    for needle in [
+        "Live Heart Rate",
+        "62",
+        "Sleep State",
+        "P(SleepNREM)",
+        "30-Minute Heart Rate Sparkline",
+    ] {
+        let (col, row) = find_text_coords(terminal.backend().buffer(), needle).unwrap();
+        let target_row = if needle.contains("Heart Rate") || needle == "Sleep State" {
+            row + 1
+        } else {
+            row
+        };
+        assert_eq!(
+            app.handle_event(mouse_left_click(col + 1, target_row)),
+            None
+        );
+        assert_eq!(
+            app.handle_event(mouse_scroll_down(col + 1, target_row)),
+            None
+        );
+        assert_eq!(app.handle_event(mouse_scroll_up(col + 1, target_row)), None);
+        assert_eq!(app.active_tab, Tab::Dashboard);
+        assert_eq!(app.modal, ModalState::None);
+        assert!(app.is_diagnostics_open);
+    }
+
+    // 2. Wearable & System card: middle status line is read-only; Wearable: switches to Wearables
+    let (stream_col, stream_row) =
+        find_text_coords(terminal.backend().buffer(), "Streaming |").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(stream_col + 1, stream_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Dashboard);
+
+    let (w_col, w_row) = find_text_coords(terminal.backend().buffer(), "Wearable: Polar").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(w_col + 1, w_row)), None);
+    assert_eq!(app.active_tab, Tab::Wearables);
+
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // 3. Armed / Paused / Disarmed line opens PausePopover when connected
+    let (armed_col, armed_row) = find_text_coords(terminal.backend().buffer(), "Armed |").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(armed_col + 1, armed_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 0 });
+    app.modal = ModalState::None;
+
+    app.daemon_status.as_mut().unwrap().paused = true;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (paused_col, paused_row) =
+        find_text_coords(terminal.backend().buffer(), "Paused |").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(paused_col + 1, paused_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 0 });
+    app.modal = ModalState::None;
+
+    app.daemon_status.as_mut().unwrap().paused = false;
+    app.armed = false;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (dis_col, dis_row) = find_text_coords(terminal.backend().buffer(), "Disarmed |").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(dis_col + 1, dis_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 0 });
+    app.modal = ModalState::None;
+
+    // 4. Engine Diagnostics [d] header collapses diagnostics pane; body rows do not
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (diag_body_col, diag_body_row) =
+        find_text_coords(terminal.backend().buffer(), "Idle Probe:").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(diag_body_col + 1, diag_body_row)),
+        None
+    );
+    assert!(app.is_diagnostics_open);
+
+    let (diag_hdr_col, diag_hdr_row) =
+        find_text_coords(terminal.backend().buffer(), "Engine Diagnostics [d]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(diag_hdr_col + 1, diag_hdr_row)),
+        None
+    );
+    assert!(!app.is_diagnostics_open);
+
+    // Re-rendering after collapse removes diagnostics header hit region
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "Engine Diagnostics [d]").is_none());
+    assert_eq!(
+        app.handle_event(mouse_left_click(diag_hdr_col + 1, diag_hdr_row)),
+        None
+    );
+    assert!(!app.is_diagnostics_open);
+
+    // 5. Offline: Wearable: still switches to Wearables, Disarmed line is a no-op
+    app.daemon_connected = false;
+    app.daemon_status = None;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (off_dis_col, off_dis_row) =
+        find_text_coords(terminal.backend().buffer(), "Disarmed |").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(off_dis_col + 1, off_dis_row)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    let (off_w_col, off_w_row) =
+        find_text_coords(terminal.backend().buffer(), "Wearable: Polar").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(off_w_col + 1, off_w_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Wearables);
+
+    // 6. Below 80 cols (79x24): Wearable & System collapses so old coordinates no-op
+    app.active_tab = Tab::Dashboard;
+    let mut narrow = Terminal::new(TestBackend::new(79, 24)).unwrap();
+    narrow
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(narrow.backend().buffer(), "Wearable & System").is_none());
+    assert_eq!(
+        app.handle_event(mouse_left_click(off_w_col + 1, off_w_row)),
+        None
+    );
+    assert_eq!(app.active_tab, Tab::Dashboard);
+}
+
+#[test]
+fn test_mouse_pause_popover_two_click_wheel_and_backdrop() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.grace_state = Some(GraceState {
+        session_id: "s-grace".into(),
+        remaining_sec: 30,
+        total_sec: 60,
+        planned_actions: vec!["Pause Media".into()],
+        dry_run: false,
+    });
+    app.modal = ModalState::PausePopover { selected_idx: 0 };
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    // Verify all 5 options with state-based two-click selection and confirmation
+    let expected_cases = [
+        (0usize, "1. Resume monitoring", TuiCommand::Resume),
+        (
+            1usize,
+            "2. Pause indefinitely",
+            TuiCommand::Pause(PauseParams {
+                mode: Some(PauseMode::Indefinite),
+                duration_sec: None,
+            }),
+        ),
+        (
+            2usize,
+            "3. Pause 1 hour",
+            TuiCommand::Pause(PauseParams {
+                mode: Some(PauseMode::Duration),
+                duration_sec: Some(3600),
+            }),
+        ),
+        (
+            3usize,
+            "4. Pause 2 hours",
+            TuiCommand::Pause(PauseParams {
+                mode: Some(PauseMode::Duration),
+                duration_sec: Some(7200),
+            }),
+        ),
+        (
+            4usize,
+            "5. Pause until next morning",
+            TuiCommand::Pause(PauseParams {
+                mode: Some(PauseMode::UntilMorning),
+                duration_sec: None,
+            }),
+        ),
+    ];
+
+    for (idx, label, expected_cmd) in expected_cases {
+        // Start with a different selected_idx when idx > 0 to prove first click selects, second confirms
+        let initial_sel = if idx == 0 { 1 } else { 0 };
+        app.modal = ModalState::PausePopover {
+            selected_idx: initial_sel,
+        };
+        terminal
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let (col, row) = find_text_coords(terminal.backend().buffer(), label).unwrap();
+
+        // First click selects without dispatching
+        assert_eq!(app.handle_event(mouse_left_click(col + 1, row)), None);
+        assert_eq!(app.modal, ModalState::PausePopover { selected_idx: idx });
+
+        // Second click on already-selected option confirms and closes popover
+        assert_eq!(
+            app.handle_event(mouse_left_click(col + 1, row)),
+            Some(expected_cmd)
+        );
+        assert_eq!(app.modal, ModalState::None);
+    }
+
+    // Mouse-wheel scrolling navigates 0..=4 and clamps at both ends
+    app.modal = ModalState::PausePopover { selected_idx: 0 };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (pop_col, pop_row) =
+        find_text_coords(terminal.backend().buffer(), "Pause / Resume Monitoring").unwrap();
+
+    // ScrollUp at 0 clamps at 0
+    assert_eq!(
+        app.handle_event(mouse_scroll_up(pop_col + 2, pop_row + 2)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 0 });
+
+    // ScrollDown steps 0 -> 1 -> 2 -> 3 -> 4 and clamps at 4
+    for expected in 1..=4 {
+        assert_eq!(
+            app.handle_event(mouse_scroll_down(pop_col + 2, pop_row + 2)),
+            None
+        );
+        assert_eq!(
+            app.modal,
+            ModalState::PausePopover {
+                selected_idx: expected
+            }
+        );
+    }
+    assert_eq!(app.handle_event(mouse_scroll_down(0, 5)), None);
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 4 });
+
+    // ScrollUp steps back from 4 -> 3 (immediate, no unclamped dead zone)
+    assert_eq!(app.handle_event(mouse_scroll_up(0, 5)), None);
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 3 });
+
+    // Clicking popover title, border, or empty inner row below option 5 consumes without closing
+    assert_eq!(
+        app.handle_event(mouse_left_click(pop_col + 1, pop_row)),
+        None
+    );
+    assert_eq!(
+        app.handle_event(mouse_left_click(pop_col + 1, pop_row + 6)),
+        None
+    );
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 3 });
+
+    // Clicking outside popover (dashboard area and header row) closes PausePopover
+    assert_eq!(app.handle_event(mouse_left_click(0, 5)), None);
+    assert_eq!(app.modal, ModalState::None);
+
+    app.modal = ModalState::PausePopover { selected_idx: 0 };
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.modal, ModalState::None);
+
+    // Resize below 60x18 clears HitMap so stale backdrop/wheel coords are ignored
+    app.modal = ModalState::PausePopover { selected_idx: 1 };
+    let mut small = Terminal::new(TestBackend::new(55, 15)).unwrap();
+    small
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(app.handle_event(mouse_scroll_down(10, 5)), None);
+    assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app.modal, ModalState::PausePopover { selected_idx: 1 });
+
+    // --no-mouse suppresses PausePopover wheel, option click, and backdrop dismissal
+    let mut app_nm = TuiApp::new(true, false, false);
+    app_nm.daemon_connected = true;
+    app_nm.modal = ModalState::PausePopover { selected_idx: 0 };
+    terminal
+        .draw(|f| app_nm.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (nm_col, nm_row) =
+        find_text_coords(terminal.backend().buffer(), "2. Pause indefinitely").unwrap();
+    assert_eq!(
+        app_nm.handle_event(mouse_left_click(nm_col + 1, nm_row)),
+        None
+    );
+    assert_eq!(app_nm.handle_event(mouse_scroll_down(0, 5)), None);
+    assert_eq!(app_nm.handle_event(mouse_left_click(0, 0)), None);
+    assert_eq!(app_nm.modal, ModalState::PausePopover { selected_idx: 0 });
+}

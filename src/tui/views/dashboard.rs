@@ -3,12 +3,13 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Gauge, Paragraph, Widget};
 
-use super::super::app::{ModalState, TuiApp};
+use super::super::app::{Tab, TuiApp};
+use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::super::sparkline::HrSparklineWidget;
 use super::centered_rect;
 use crate::ipc::protocol::alert_ids;
 
-pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.height < 5 || area.width < 10 {
         return;
     }
@@ -24,7 +25,7 @@ pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
                 .constraints([Constraint::Length(alert_h), Constraint::Min(0)])
                 .split(current_area);
 
-            render_alert_strip(app, alert, chunks[0], buf);
+            render_alert_strip(app, alert, chunks[0], buf, hit_map);
             current_area = chunks[1];
         }
     }
@@ -60,7 +61,7 @@ pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
         render_live_bpm_card(app, card_chunks[0], buf);
         render_sleep_state_card(app, card_chunks[1], buf);
-        render_system_card(app, card_chunks[2], buf);
+        render_system_card(app, card_chunks[2], buf, hit_map);
     } else if top_cards_area.width >= 50 {
         let card_chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -75,20 +76,36 @@ pub fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer) {
 
     // 4. Render Sparkline or Zero-Wearables CTA
     if app.enrolled_wearables.is_empty() && app.daemon_connected {
-        render_zero_wearables_cta(app, sparkline_area, buf);
+        render_zero_wearables_cta(app, sparkline_area, buf, hit_map);
     } else {
         render_sparkline_card(app, sparkline_area, buf);
     }
 
     // 5. Render Diagnostics Pane if toggled
     if show_diag && diag_height > 0 {
-        render_diagnostics_pane(app, diag_area, buf);
+        render_diagnostics_pane(app, diag_area, buf, hit_map);
     }
+}
 
-    // 6. Render Pause Popover if active
-    if let ModalState::PausePopover { selected_idx } = app.modal {
-        render_pause_popover(app, selected_idx, area, buf);
+fn build_clickable_row_line<'a>(
+    inner: Rect,
+    y: u16,
+    items: Vec<(Span<'a>, Option<ClickTarget>)>,
+    hit_map: &mut HitMap,
+) -> Line<'a> {
+    let mut x = inner.x;
+    let mut spans = Vec::with_capacity(items.len());
+    for (span, target) in items {
+        let w = span.width() as u16;
+        if let Some(click_target) = target
+            && inner.height > 0
+        {
+            hit_map.push_clipped_row_click(inner, x, y, w, click_target);
+        }
+        x = x.saturating_add(w);
+        spans.push(span);
     }
+    Line::from(spans)
 }
 
 fn render_alert_strip(
@@ -96,38 +113,44 @@ fn render_alert_strip(
     alert: &crate::ipc::protocol::DaemonAlert,
     area: Rect,
     buf: &mut Buffer,
+    hit_map: &mut HitMap,
 ) {
     let is_shift = alert.id == alert_ids::PERSISTENT_SHIFT;
     let style = app.theme.alert_strip(is_shift);
     let border_style = app.theme.alert_border(alert.severity);
 
     let title = format!(" ALERT [{}] ", alert.kind);
-    let mut hint_spans: Vec<Span<'_>> = Vec::new();
+    let block = app.theme.card_block(title).border_style(border_style);
+    let inner = block.inner(area);
+
+    let mut action_spans: Vec<(Span<'_>, Option<ClickTarget>)> = Vec::new();
     let mut hints_len = 0usize;
 
     if is_shift {
-        hint_spans.push(Span::raw("  "));
-        hint_spans.push(Span::styled("[a] Accept", app.theme.key_hint()));
-        hint_spans.push(Span::raw("  "));
-        hint_spans.push(Span::styled("[i] Ignore", app.theme.key_hint()));
-        hints_len += 2 + "[a] Accept".len() + 2 + "[i] Ignore".len();
+        let accept = Span::styled("[a] Accept", app.theme.key_hint());
+        let ignore = Span::styled("[i] Ignore", app.theme.key_hint());
+        hints_len += 2 + accept.width() + 2 + ignore.width();
+        action_spans.push((Span::raw("  "), None));
+        action_spans.push((accept, Some(ClickTarget::AcceptShift)));
+        action_spans.push((Span::raw("  "), None));
+        action_spans.push((ignore, Some(ClickTarget::IgnoreShift)));
     }
     if alert.dismissible {
-        hint_spans.push(Span::raw("  "));
-        hint_spans.push(Span::styled("[x] Dismiss", app.theme.key_hint()));
-        hints_len += 2 + "[x] Dismiss".len();
+        let dismiss = Span::styled("[x] Dismiss", app.theme.key_hint());
+        hints_len += 2 + dismiss.width();
+        action_spans.push((Span::raw("  "), None));
+        action_spans.push((dismiss, Some(ClickTarget::DismissAlert)));
     }
 
-    let inner_width = usize::from(area.width.saturating_sub(2));
+    let inner_width = usize::from(inner.width);
     let msg_budget = inner_width.saturating_sub(hints_len + 1);
     let clipped_msg = truncate_label(&alert.message, msg_budget);
 
-    let mut spans = vec![Span::styled(clipped_msg, style)];
-    spans.extend(hint_spans);
+    let mut items = vec![(Span::styled(clipped_msg, style), None)];
+    items.extend(action_spans);
+    let line = build_clickable_row_line(inner, inner.y, items, hit_map);
 
-    let p = Paragraph::new(Line::from(spans))
-        .block(app.theme.card_block(title).border_style(border_style));
-    p.render(area, buf);
+    Paragraph::new(line).block(block).render(area, buf);
 }
 
 fn render_live_bpm_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
@@ -227,13 +250,24 @@ fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 }
 
-fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let block = app.theme.card_block(" Wearable & System ");
     let inner = block.inner(area);
     block.render(area, buf);
 
     if inner.height == 0 || inner.width == 0 {
         return;
+    }
+
+    hit_map.push_click(
+        Rect::new(inner.x, inner.y, inner.width, 1),
+        ClickTarget::SelectTab(Tab::Wearables),
+    );
+    if inner.height >= 3 && app.daemon_connected {
+        hit_map.push_click(
+            Rect::new(inner.x, inner.y + 2, inner.width, 1),
+            ClickTarget::OpenPausePopover,
+        );
     }
 
     let active_w = app.active_wearable();
@@ -326,10 +360,40 @@ fn render_sparkline_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     sparkline.render(inner, buf);
 }
 
-fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let block = app.theme.card_block(" Getting Started ");
     let inner = block.inner(area);
     block.render(area, buf);
+
+    let cta_items = vec![
+        (Span::styled("  Press ", app.theme.base()), None),
+        (
+            Span::styled("[e]", app.theme.key_hint()),
+            Some(ClickTarget::DashboardEnroll),
+        ),
+        (
+            Span::styled(" on the Dashboard or switch to the ", app.theme.base()),
+            None,
+        ),
+        (
+            Span::styled("Wearables tab (3)", app.theme.primary()),
+            Some(ClickTarget::SelectTab(Tab::Wearables)),
+        ),
+        (
+            Span::styled(" to enroll your wearable.", app.theme.base()),
+            None,
+        ),
+    ];
+    let cta_line = if inner.height > 3 && inner.width > 0 {
+        build_clickable_row_line(inner, inner.y.saturating_add(3), cta_items, hit_map)
+    } else {
+        Line::from(
+            cta_items
+                .into_iter()
+                .map(|(span, _)| span)
+                .collect::<Vec<_>>(),
+        )
+    };
 
     let mut lines = vec![
         Line::from(""),
@@ -338,13 +402,7 @@ fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             app.theme.warning(),
         )]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  Press ", app.theme.base()),
-            Span::styled("[e]", app.theme.key_hint()),
-            Span::styled(" on the Dashboard or switch to the ", app.theme.base()),
-            Span::styled("Wearables tab (3)", app.theme.primary()),
-            Span::styled(" to enroll your wearable.", app.theme.base()),
-        ]),
+        cta_line,
     ];
 
     if !app.systemd_service_installed {
@@ -360,7 +418,11 @@ fn render_zero_wearables_cta(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_diagnostics_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_diagnostics_pane(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+    hit_map.push_click(
+        Rect::new(area.x, area.y, area.width, 1),
+        ClickTarget::ToggleDiagnostics,
+    );
     let block = app.theme.card_block(" Engine Diagnostics [d] ");
     let inner = block.inner(area);
     block.render(area, buf);
@@ -418,8 +480,20 @@ fn render_diagnostics_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     Paragraph::new(lines).render(inner, buf);
 }
 
-fn render_pause_popover(app: &TuiApp, selected_idx: usize, area: Rect, buf: &mut Buffer) {
-    let popover_area = centered_rect(area, 44, 9);
+pub(crate) fn render_pause_popover(
+    app: &TuiApp,
+    selected_idx: usize,
+    full_area: Rect,
+    content_area: Rect,
+    buf: &mut Buffer,
+    hit_map: &mut HitMap,
+) {
+    let popover_area = centered_rect(content_area, 44, 9);
+    // Register backdrop close + wheel navigation before popover body absorber and option rows
+    hit_map.push_modal_click(full_area, ClickTarget::CloseModal);
+    hit_map.push_modal_scroll(full_area, ScrollTarget::PausePopover);
+    hit_map.push_modal_click(popover_area, ClickTarget::Consume);
+
     Clear.render(popover_area, buf);
 
     let block = app.theme.card_block(" Pause / Resume Monitoring ");
@@ -436,6 +510,12 @@ fn render_pause_popover(app: &TuiApp, selected_idx: usize, area: Rect, buf: &mut
 
     let mut lines = Vec::new();
     for (idx, opt) in options.iter().enumerate() {
+        if idx < usize::from(inner.height) && inner.width > 0 {
+            hit_map.push_modal_click(
+                Rect::new(inner.x, inner.y.saturating_add(idx as u16), inner.width, 1),
+                ClickTarget::PauseOption(idx),
+            );
+        }
         let is_selected = idx == selected_idx;
         let style = if is_selected {
             app.theme.highlight()

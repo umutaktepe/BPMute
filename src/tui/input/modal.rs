@@ -21,32 +21,24 @@ impl TuiApp {
                 }
                 None
             }
-            ModalState::PausePopover {
-                ref mut selected_idx,
-            } => match key.code {
+            ModalState::PausePopover { selected_idx } => match key.code {
                 KeyCode::Esc => {
                     self.modal = ModalState::None;
                     None
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    *selected_idx = selected_idx.saturating_sub(1);
+                    self.scroll_pause_popover(-1);
                     None
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if *selected_idx < 4 {
-                        *selected_idx += 1;
-                    }
+                    self.scroll_pause_popover(1);
                     None
                 }
                 KeyCode::Char(c @ '1'..='5') => {
                     let sel = (c as usize) - ('1' as usize);
-                    *selected_idx = sel;
                     self.confirm_pause_selection(sel)
                 }
-                KeyCode::Enter => {
-                    let sel = *selected_idx;
-                    self.confirm_pause_selection(sel)
-                }
+                KeyCode::Enter => self.confirm_pause_selection(selected_idx),
                 _ => None,
             },
             ModalState::EnrollmentModal { .. } => self.handle_enrollment_modal_key(key),
