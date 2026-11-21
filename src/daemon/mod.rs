@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::actions::traits::{ActionExecutor, Notifier};
 use crate::config::{CliOverrides, DetectionConfig, LoadedConfig, RawSamplesRetention};
 use crate::idle::IdleProbe;
-use crate::ipc::protocol::{EpochUpdateEvent, HrSampleEvent};
+use crate::ipc::protocol::{EpochUpdateEvent, HrSampleEvent, SessionStartedEvent};
 use crate::ipc::pubsub::EventBroker;
 use crate::ipc::server::handle_connection;
 use crate::logging::BiometricLogContext;
@@ -531,7 +531,7 @@ impl MonitoringContext {
                         .await
                     {
                         Ok(sid) => {
-                            self.active_session_id = Some(sid);
+                            self.active_session_id = Some(sid.clone());
                             self.epoch_seq = 0;
                             self.raw_seq = 0;
                             self.pending_raw.clear();
@@ -540,6 +540,11 @@ impl MonitoringContext {
                                 self.active_session_id.clone(),
                                 self.active_wearable_id.clone(),
                             );
+                            self.core.publish_session_started(SessionStartedEvent {
+                                session_id: sid,
+                                wearable_id: wearable_id.to_string(),
+                                start_ts_ms: ts_ms,
+                            });
                         }
                         Err(err) => {
                             tracing::error!(error = %err, "failed to open monitoring session in SQLite");

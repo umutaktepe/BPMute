@@ -558,6 +558,14 @@ pub struct GraceTickEvent {
     pub planned_steps: Vec<String>,
 }
 
+/// Control event payload pushed as `SessionStarted` when a `Monitoring Session` opens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStartedEvent {
+    pub session_id: String,
+    pub wearable_id: String,
+    pub start_ts_ms: i64,
+}
+
 /// Control event payload pushed as `EpochUpdate` every 15-second `Epoch`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpochUpdateEvent {

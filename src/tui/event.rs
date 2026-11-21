@@ -5,7 +5,7 @@ use crate::config::{Config, ConfigPatch};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
-    PauseParams,
+    PauseParams, SessionStartedEvent,
 };
 use crate::replay::TraceFormat;
 use crate::storage::{SessionFullDetail, SessionListEntry, StorageStats};
@@ -42,6 +42,8 @@ pub enum IpcEvent {
     HrSample(HrSampleEvent),
     GraceTick(GraceTickEvent),
     EpochUpdate(EpochUpdateEvent),
+    SessionStarted(SessionStartedEvent),
+    SessionClosed(Box<SessionFullDetail>),
     StateChanged(DaemonStatus),
     AlertChanged(Vec<DaemonAlert>),
     CalibrationUpdated(CalibrationState),

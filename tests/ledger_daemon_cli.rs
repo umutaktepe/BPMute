@@ -425,12 +425,20 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
     let mut saw_hr = false;
     let mut saw_epoch = false;
     let mut saw_state_changed = false;
+    let mut saw_session_started = false;
+    let mut started_session_id = String::new();
     let mut confirmed_ts_ms = None;
 
     for _ in 0..10_000 {
         let ev = client.next_event().await.unwrap();
         match ev.event.as_str() {
             "HrSample" => saw_hr = true,
+            "SessionStarted" => {
+                saw_session_started = true;
+                started_session_id = ev.data["session_id"].as_str().unwrap().to_string();
+                assert!(!ev.data["wearable_id"].as_str().unwrap().is_empty());
+                assert!(ev.data["start_ts_ms"].as_i64().is_some());
+            }
             "EpochUpdate" => saw_epoch = true,
             "StateChanged" => {
                 saw_state_changed = true;
@@ -498,6 +506,8 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
     }
 
     assert!(saw_hr, "must publish HrSample");
+    assert!(saw_session_started, "must publish SessionStarted");
+    assert_eq!(started_session_id, closed_session_id);
     assert!(saw_epoch, "must publish EpochUpdate");
     assert!(saw_state_changed, "must publish StateChanged");
     assert!(

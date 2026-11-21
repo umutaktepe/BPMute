@@ -199,6 +199,7 @@ pub struct TuiApp {
     pub alerts: Vec<DaemonAlert>,
     pub grace_state: Option<GraceState>,
     pub op_feedback: Option<OpFeedback>,
+    pub session_deletion_in_progress: bool,
 
     // Diagnostics
     pub is_diagnostics_open: bool,
@@ -265,6 +266,7 @@ impl TuiApp {
             alerts: Vec::new(),
             grace_state: None,
             op_feedback: None,
+            session_deletion_in_progress: false,
             is_diagnostics_open: false,
             enrolled_wearables: Vec::new(),
             selected_wearable_idx: 0,
@@ -520,6 +522,7 @@ impl TuiApp {
         self.playing_players_count = None;
         self.alerts.clear();
         self.op_feedback = None;
+        self.session_deletion_in_progress = false;
         self.discovered_wearables.clear();
         if self.modal != ModalState::Help {
             self.close_modal();
@@ -581,6 +584,45 @@ impl TuiApp {
                     self.sparkline_data.quiet_wake_baseline = Some(epoch_ev.epoch.baseline_mu_hr);
                 }
                 self.latest_epoch = Some(epoch_ev.epoch);
+            }
+            IpcEvent::SessionStarted(_) => {
+                if self.daemon_connected {
+                    return Some(TuiCommand::RefreshSessions);
+                }
+            }
+            IpcEvent::SessionClosed(closed_detail) => {
+                if let Some(entry) = self
+                    .history_sessions
+                    .iter_mut()
+                    .find(|s| s.id == closed_detail.session.id)
+                {
+                    entry.status = closed_detail.status;
+                    entry.end_ts_ms = closed_detail.session.end_ts_ms;
+                    entry.end_reason = Some(closed_detail.session.end_reason);
+                    entry.warmup_mu_hr = closed_detail.session.warmup_mu_hr;
+                    entry.sleep_mu_hr = closed_detail.session.sleep_mu_hr;
+                    entry.onset_confirmed_ts_ms = closed_detail.session.onset_confirmed_ts_ms;
+                    entry.sleeping_ts_ms = closed_detail.session.sleeping_ts_ms;
+                    entry.auto_anomalous = closed_detail.session.auto_anomalous;
+                    entry.fp_count = u8::from(
+                        closed_detail.session.grace_cancel_count > 0
+                            || closed_detail.session.rapid_wake_fp_count > 0
+                            || closed_detail.session.rapid_resume_within_5m,
+                    );
+                    entry.epochs_count = closed_detail.session.epochs_count;
+                    entry.raw_samples_count = closed_detail.session.raw_samples_count;
+                    entry.feedback = closed_detail.feedback.clone();
+                }
+                if self
+                    .selected_session_detail
+                    .as_ref()
+                    .is_some_and(|d| d.session.id == closed_detail.session.id)
+                {
+                    self.selected_session_detail = Some(*closed_detail);
+                }
+                if self.daemon_connected {
+                    return Some(TuiCommand::RefreshSessions);
+                }
             }
             IpcEvent::StateChanged(status) => {
                 self.apply_daemon_status(status);
@@ -669,25 +711,45 @@ impl TuiApp {
                 sessions,
                 boundaries,
             } => {
+                let is_tui_deletion = std::mem::take(&mut self.session_deletion_in_progress);
+                let prev_selected_id = self
+                    .history_sessions
+                    .get(self.selected_session_idx)
+                    .map(|s| s.id.clone());
                 self.history_sessions = sessions;
                 self.history_boundaries = boundaries;
-                if self.selected_session_idx >= self.history_sessions.len() {
-                    self.selected_session_idx = self.history_sessions.len().saturating_sub(1);
-                }
-                if let Some(selected) = self.history_sessions.get(self.selected_session_idx) {
-                    let target_id = selected.id.clone();
-                    if self
-                        .selected_session_detail
-                        .as_ref()
-                        .is_some_and(|detail| detail.session.id != target_id)
+                if self.history_sessions.is_empty() {
+                    self.selected_session_idx = 0;
+                    self.selected_session_detail = None;
+                } else if let Some(prev_id) = prev_selected_id
+                    && let Some(new_idx) =
+                        self.history_sessions.iter().position(|s| s.id == prev_id)
+                {
+                    self.selected_session_idx = new_idx;
+                    if self.selected_session_detail.as_ref().map(|d| &d.session.id)
+                        != Some(&prev_id)
                     {
                         self.selected_session_detail = None;
                         if self.daemon_connected {
-                            return Some(TuiCommand::SessionGet { id: target_id });
+                            return Some(TuiCommand::SessionGet { id: prev_id });
                         }
                     }
-                } else {
+                } else if is_tui_deletion {
+                    self.selected_session_idx = self
+                        .selected_session_idx
+                        .min(self.history_sessions.len().saturating_sub(1));
+                    let target_id = self.history_sessions[self.selected_session_idx].id.clone();
                     self.selected_session_detail = None;
+                    if self.daemon_connected {
+                        return Some(TuiCommand::SessionGet { id: target_id });
+                    }
+                } else {
+                    self.selected_session_idx = 0;
+                    let target_id = self.history_sessions[0].id.clone();
+                    self.selected_session_detail = None;
+                    if self.daemon_connected {
+                        return Some(TuiCommand::SessionGet { id: target_id });
+                    }
                 }
             }
             IpcEvent::SessionDetailLoaded(detail) => {
@@ -709,8 +771,11 @@ impl TuiApp {
                 success,
                 message,
             } => {
-                if success && (op == "monitor.cancel_grace" || op == "monitor.snooze_grace") {
+                if op == "monitor.cancel_grace" || op == "monitor.snooze_grace" {
                     self.grace_state = None;
+                }
+                if !success && op == "session.delete" {
+                    self.session_deletion_in_progress = false;
                 }
                 if op == "wearable.enroll_select" {
                     if success {

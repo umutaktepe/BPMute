@@ -27,7 +27,8 @@ use crate::ipc::protocol::{
     AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
     DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus, EpochUpdateEvent,
     ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams,
-    PushEventEnvelope, SessionClosedEvent, WearablesUpdatedEvent, alert_ids, error_codes,
+    PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, WearablesUpdatedEvent, alert_ids,
+    error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -449,6 +450,13 @@ impl DaemonCore {
         };
         if let Some(status) = status_opt {
             self.publish_state_changed(&status);
+        }
+    }
+
+    /// Publishes a `SessionStarted` control event when a `Monitoring Session` opens in SQLite.
+    pub fn publish_session_started(&self, payload: SessionStartedEvent) {
+        if let Ok(val) = serde_json::to_value(payload) {
+            self.broker.publish_control("SessionStarted", val);
         }
     }
 

@@ -27,7 +27,8 @@ use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{
     AlertSeverity, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
-    EnrolledWearableStatus, HrSampleEvent, MonitoringState, PauseMode, PauseParams, alert_ids,
+    EnrolledWearableStatus, HrSampleEvent, MonitoringState, PauseMode, PauseParams,
+    SessionStartedEvent, alert_ids,
 };
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
@@ -4817,6 +4818,55 @@ fn make_history_session(
     }
 }
 
+fn make_session_detail(entry: &SessionListEntry, epochs: Vec<Epoch>) -> SessionFullDetail {
+    SessionFullDetail {
+        session: SessionLedgerRecord {
+            id: entry.id.clone(),
+            wearable_id: entry.wearable_id.clone(),
+            start_ts_ms: entry.start_ts_ms,
+            end_ts_ms: entry.end_ts_ms,
+            end_reason: entry.end_reason.unwrap_or(SessionEndReason::StreamEnded),
+            detection_sensitivity: entry.detection_sensitivity,
+            had_rr: entry.had_rr,
+            warmup_mu_hr: entry.warmup_mu_hr,
+            warmup_sigma_hr: Some(2.5),
+            warmup_ln_rmssd: Some(3.5),
+            onset_candidate_ts_ms: None,
+            onset_confirmed_ts_ms: entry.onset_confirmed_ts_ms,
+            sleeping_ts_ms: entry.sleeping_ts_ms,
+            sleep_mu_hr: entry.sleep_mu_hr,
+            onset_hr_bpm: entry.sleep_mu_hr,
+            delta_hr_onset: None,
+            sleep_ln_rmssd: Some(3.8),
+            sleep_hr_var_ratio: Some(0.25),
+            typical_sqi: Some(0.95),
+            post_trigger_sleep_sec: 0,
+            trigger_power_action: PowerAction::None,
+            rapid_resume_within_5m: false,
+            grace_cancel_count: 0,
+            rapid_wake_fp_count: 0,
+            snooze_count: 0,
+            auto_anomalous: entry.auto_anomalous,
+            epochs_count: epochs.len() as u32,
+            raw_samples_count: 0,
+        },
+        status: entry.status,
+        wearable: WearableInfo {
+            id: entry.wearable_id.clone(),
+            mac_masked: entry.wearable_mac_masked.clone(),
+            alias: entry.wearable_alias.clone(),
+            advertised_name: entry.wearable_alias.clone(),
+            supports_rr: entry.had_rr,
+            supports_contact: true,
+            hr_var_floor: 0.15,
+            typical_sqi: Some(0.95),
+        },
+        feedback: entry.feedback.clone(),
+        epochs,
+        has_raw_samples: false,
+    }
+}
+
 #[test]
 fn test_mouse_history_master_list_click_online_offline_and_boundary_guard() {
     // 1. Online mode: clicking Calibration Boundary is ignored; clicking Monitoring Session line 1/2 selects and emits SessionGet
@@ -7451,4 +7501,300 @@ fn test_trace_ascii_fallback_no_color_modifiers_and_braille_compositing() {
         saw_hist_dim_ref,
         "NO_COLOR History must preserve DIM QW reference line"
     );
+}
+
+#[test]
+fn test_tui_session_started_closed_lifecycle_and_selection_preservation() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let start_ts = 1_700_000_000_000i64;
+
+    // 1. SessionStarted arrives for session "s-1"
+    let started_ev = SessionStartedEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        start_ts_ms: start_ts,
+    };
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::SessionStarted(started_ev)));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "SessionStarted must emit RefreshSessions"
+    );
+
+    // 2. Initial SessionsUpdated arrives with "s-1" as [ACTIVE]
+    let s1_active = make_history_session(
+        "s-1",
+        "Polar H10",
+        start_ts,
+        start_ts,
+        SessionStatus::Active,
+        0,
+    );
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![s1_active.clone()],
+        boundaries: vec![],
+    }));
+    // Since history was empty, index 0 is selected and SessionGet is requested
+    assert_eq!(app.selected_session_idx, 0);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::SessionGet {
+            id: "s-1".to_string()
+        })
+    );
+
+    // 3. SessionDetailLoaded arrives with 0 epochs (Active)
+    let s1_active_detail = make_session_detail(&s1_active, vec![]);
+    app.handle_event(TuiEvent::ipc(IpcEvent::SessionDetailLoaded(Box::new(
+        s1_active_detail,
+    ))));
+    assert!(app.selected_session_detail.is_some());
+
+    // Render check: History tab displays "[ACTIVE]" and "Waiting for first 15s epoch..."
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out = buffer_to_string(term.backend().buffer());
+    assert!(out.contains("[ACTIVE]"), "Master list must show [ACTIVE]");
+    assert!(
+        out.contains("Waiting for first 15s epoch..."),
+        "Active session with zero epochs must show waiting message"
+    );
+    assert!(
+        !out.contains("Epochs were pruned by retention policy; trace unavailable."),
+        "Active session must not show retention pruning message"
+    );
+
+    // 4. A second session "s-2" starts in the background
+    let started_ev2 = SessionStartedEvent {
+        session_id: "s-2".to_string(),
+        wearable_id: "w-1".to_string(),
+        start_ts_ms: start_ts + 60_000,
+    };
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::SessionStarted(started_ev2)));
+    assert_eq!(cmd, Some(TuiCommand::RefreshSessions));
+
+    // SessionsUpdated arrives with [s-2, s-1] (newest first)
+    let s2_active = make_history_session(
+        "s-2",
+        "Polar H10",
+        start_ts + 60_000,
+        start_ts + 60_000,
+        SessionStatus::Active,
+        0,
+    );
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![s2_active.clone(), s1_active.clone()],
+        boundaries: vec![],
+    }));
+    // Selection must be preserved by session_id: "s-1" is now at index 1!
+    assert_eq!(
+        app.selected_session_idx, 1,
+        "Must preserve selected_session_idx for s-1 at index 1"
+    );
+    assert_eq!(
+        cmd, None,
+        "Detail is already loaded for s-1, no SessionGet needed"
+    );
+    assert_eq!(
+        app.selected_session_detail.as_ref().unwrap().session.id,
+        "s-1"
+    );
+
+    // 5. SessionClosed arrives for "s-1"
+    let mut s1_closed = make_history_session(
+        "s-1",
+        "Polar H10",
+        start_ts,
+        start_ts + 300_000,
+        SessionStatus::Closed,
+        0,
+    );
+    s1_closed.end_reason = Some(SessionEndReason::StreamEnded);
+    let s1_closed_detail = make_session_detail(&s1_closed, vec![]);
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::SessionClosed(Box::new(
+        s1_closed_detail,
+    ))));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "SessionClosed must emit RefreshSessions"
+    );
+    // selected_session_detail must immediately update to Closed
+    assert_eq!(
+        app.selected_session_detail.as_ref().unwrap().status,
+        SessionStatus::Closed
+    );
+
+    // Render check: Closed session with 0 epochs now displays retention pruning message
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out = buffer_to_string(term.backend().buffer());
+    assert!(
+        out.contains("Epochs were pruned by retention policy"),
+        "Closed session with 0 epochs must show retention pruning message"
+    );
+    assert!(
+        !out.contains("Waiting for first 15s epoch..."),
+        "Closed session must not show waiting message"
+    );
+
+    // Verify full string rendering in a wider terminal
+    let mut wide_term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    wide_term
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let wide_out = buffer_to_string(wide_term.backend().buffer());
+    assert!(wide_out.contains("Epochs were pruned by retention policy; trace unavailable."));
+
+    // 6. Background refresh where selected session disappears (e.g. pruned by retention policy):
+    // Even when multiple sessions exist in the updated list, disappearing selection falls back to index 0
+    let s3_closed = make_history_session(
+        "s-3",
+        "Polar H10",
+        start_ts + 30_000,
+        start_ts + 45_000,
+        SessionStatus::Closed,
+        1,
+    );
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![s2_active.clone(), s3_closed],
+        boundaries: vec![],
+    }));
+    // Since "s-1" is gone, selection falls back to index 0 ("s-2") and requests detail
+    assert_eq!(app.selected_session_idx, 0);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::SessionGet {
+            id: "s-2".to_string()
+        })
+    );
+    assert!(app.selected_session_detail.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_live_session_started_and_closed_e2e() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 20, 18, 0, 0).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+
+    let (w_tx, w_rx) = mpsc::channel(32);
+    let source = Arc::new(LiveStreamTestSource {
+        event_rx: Arc::new(tokio::sync::Mutex::new(w_rx)),
+    });
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(source),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "EC:09:86:B0:EC:05".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Watch".to_string()),
+        advertised_name: Some("HUAWEI WATCH HR-C05".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), start_utc.timestamp_millis())
+        .await
+        .unwrap();
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+
+    let mut app = TuiApp::new(false, false, false);
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+
+    // Switch to History tab (initially empty)
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert!(app.history_sessions.is_empty());
+
+    // 1. Send wearable stream packet -> starts a monitoring session in SQLite and emits SessionStarted
+    let t0 = start_utc.timestamp_millis();
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0 + 1_000,
+        },
+    })
+    .await
+    .unwrap();
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t0 + 1_000,
+            bpm: 65.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    // TUI must receive SessionStarted -> RefreshSessions -> SessionsUpdated -> SessionGet -> SessionDetailLoaded
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions.len() == 1
+            && a.history_sessions[0].status == SessionStatus::Active
+            && a.selected_session_detail.is_some()
+    })
+    .await;
+
+    // Render check on live TUI: active session appears as [ACTIVE] and waiting for first epoch
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out = buffer_to_string(term.backend().buffer());
+    assert!(
+        out.contains("[ACTIVE]"),
+        "Master list must show newly started session as [ACTIVE]"
+    );
+    assert!(
+        out.contains("Waiting for first 15s epoch..."),
+        "Active session with zero epochs must show waiting message"
+    );
+
+    // 2. Disconnect/stream end -> triggers SessionEnded -> close_session_and_recompute -> SessionClosed
+    drop(w_tx);
+
+    // TUI must receive SessionClosed -> RefreshSessions -> SessionsUpdated
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions
+            .first()
+            .is_some_and(|s| s.status == SessionStatus::Closed)
+            && a.selected_session_detail
+                .as_ref()
+                .is_some_and(|d| d.status == SessionStatus::Closed)
+    })
+    .await;
+
+    // Render check on finalized closed session: shows [Ended] and retention pruning message
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out = buffer_to_string(term.backend().buffer());
+    assert!(
+        out.contains("[Ended]"),
+        "Master list must show closed session as [Ended]"
+    );
+    assert!(
+        out.contains("Epochs were pruned by retention policy"),
+        "Closed session with zero epochs must show retention pruning message"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
 }

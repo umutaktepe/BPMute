@@ -431,12 +431,12 @@ fn render_epoch_chart(
     };
 
     if detail.epochs.is_empty() {
-        buf.set_string(
-            area.x + 2,
-            area.y + 1,
-            "Epochs were pruned by retention policy; trace unavailable.",
-            app.theme.muted(),
-        );
+        let msg = if entry.status == SessionStatus::Active {
+            "Waiting for first 15s epoch..."
+        } else {
+            "Epochs were pruned by retention policy; trace unavailable."
+        };
+        buf.set_string(area.x + 2, area.y + 1, msg, app.theme.muted());
         return;
     }
 

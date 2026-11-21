@@ -20,7 +20,8 @@ use crate::ipc::framing::{read_bounded_line, write_ndjson_line};
 use crate::ipc::protocol::{
     ConfigSnapshotPayload, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollmentUpdateEvent,
     EpochUpdateEvent, GraceTickEvent, HrSampleEvent, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    PushEventEnvelope, RequestEnvelope, ResponseEnvelope, WearablesUpdatedEvent,
+    PushEventEnvelope, RequestEnvelope, ResponseEnvelope, SessionClosedEvent, SessionStartedEvent,
+    WearablesUpdatedEvent,
 };
 
 pub(super) type PendingMap = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<ResponseEnvelope>>>>>;
@@ -264,6 +265,20 @@ async fn handle_incoming_push(push: PushEventEnvelope, event_tx: &mpsc::Sender<T
             if let Ok(epoch) = serde_json::from_value::<EpochUpdateEvent>(push.data) {
                 let _ = event_tx
                     .send(TuiEvent::ipc(IpcEvent::EpochUpdate(epoch)))
+                    .await;
+            }
+        }
+        "SessionStarted" => {
+            if let Ok(ev) = serde_json::from_value::<SessionStartedEvent>(push.data) {
+                let _ = event_tx
+                    .send(TuiEvent::ipc(IpcEvent::SessionStarted(ev)))
+                    .await;
+            }
+        }
+        "SessionClosed" => {
+            if let Ok(ev) = serde_json::from_value::<SessionClosedEvent>(push.data) {
+                let _ = event_tx
+                    .send(TuiEvent::ipc(IpcEvent::SessionClosed(Box::new(ev.session))))
                     .await;
             }
         }

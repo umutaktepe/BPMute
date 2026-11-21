@@ -469,7 +469,12 @@ impl TuiApp {
         };
         let sid = session_id.clone();
         self.modal = ModalState::None;
-        (!require_confirmed || confirmed).then_some(TuiCommand::SessionDelete { id: sid })
+        if !require_confirmed || confirmed {
+            self.session_deletion_in_progress = true;
+            Some(TuiCommand::SessionDelete { id: sid })
+        } else {
+            None
+        }
     }
 
     pub(super) fn focus_soft_rebaseline_field(&mut self, field: SoftRebaselineField) {

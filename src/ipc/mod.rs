@@ -8,5 +8,6 @@ pub use client::{IpcClient, IpcClientError};
 pub use protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
-    OfflineStatus, PairingPrompt, PauseMode, WearablesUpdatedEvent, alert_ids,
+    OfflineStatus, PairingPrompt, PauseMode, SessionClosedEvent, SessionStartedEvent,
+    WearablesUpdatedEvent, alert_ids,
 };
