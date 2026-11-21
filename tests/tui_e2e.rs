@@ -5898,31 +5898,12 @@ impl RealSocketTuiHarness {
                     .close_session_and_recompute(
                         &bpmute::storage::CloseSessionRequest {
                             session_id: sid.clone(),
-                            summary: SessionSummary {
-                                session_index: (i + 1) as u64,
-                                start_ts_ms: start_ts,
-                                end_ts_ms: end_ts,
-                                end_reason: SessionEndReason::StreamEnded,
-                                candidate_ts_ms: None,
-                                confirmed_ts_ms: None,
-                                sleeping_ts_ms: None,
-                                anomalous: false,
-                                fp_count: 0,
-                                warmup_mu_hr: Some(64.0),
-                                warmup_sigma_hr: Some(2.5),
-                                warmup_ln_rmssd: None,
-                                onset_hr_bpm: Some(54.0),
-                                sleep_mu_hr: Some(54.0),
-                                sleep_ln_rmssd: None,
-                                observed_hr_var_ratio: None,
-                                typical_sqi: None,
-                                post_trigger_sleep_sec: 0,
-                                had_rr: with_raw_samples,
-                                grace_cancel_count: 0,
-                                rapid_wake_fp_count: 0,
-                                snooze_count: 0,
-                                epochs_count: usize::from(with_raw_samples),
-                            },
+                            summary: make_session_summary(
+                                (i + 1) as u64,
+                                start_ts,
+                                end_ts,
+                                with_raw_samples,
+                            ),
                             trigger_power_action: PowerAction::None,
                             rapid_resume_within_5m: false,
                         },
@@ -5974,6 +5955,38 @@ impl RealSocketTuiHarness {
             app,
             session_ids,
         }
+    }
+
+    fn insert_closed_session(&self, session_index: u64, start_ts: i64, end_ts: i64) -> String {
+        let db_file = bpmute::storage::db_path_in_data_dir(&self.paths.data_dir);
+        let db_lock = bpmute::storage::lock_path_in_data_dir(&self.paths.data_dir);
+        let mut store = bpmute::storage::LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .list_enrolled_wearables()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let sid = store
+            .open_session(&bpmute::storage::OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: start_ts,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &bpmute::storage::CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary: make_session_summary(session_index, start_ts, end_ts, false),
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                end_ts,
+            )
+            .unwrap();
+        sid
     }
 
     async fn shutdown(self) {
@@ -7964,4 +7977,264 @@ async fn test_real_socket_history_live_15s_epoch_updates_advance_session_and_cha
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;
     daemon.shutdown().await;
+}
+
+#[test]
+fn test_tui_tab_switch_history_refresh_sessions() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+
+    // 1. Direct tab key '2' from Dashboard emits RefreshSessions
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Switching from Dashboard to History via '2' must emit RefreshSessions"
+    );
+
+    // 2. Pressing '2' while already on History must NOT emit RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd, None,
+        "Pressing '2' while already on History must not emit redundant RefreshSessions"
+    );
+
+    // 3. Switching to other tabs must NOT emit RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('1'))));
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    assert_eq!(cmd, None);
+
+    // 4. Tab (next) navigation: Dashboard -> History emits RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Navigating to History via Tab must emit RefreshSessions"
+    );
+
+    // 5. Tab (next) navigation: History -> Wearables must NOT emit RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert_eq!(cmd, None);
+
+    // 6. BackTab (prev) navigation: Wearables -> History emits RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::BackTab)));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Navigating to History via BackTab must emit RefreshSessions"
+    );
+
+    // 7. 'h' (prev) navigation: History -> Dashboard must NOT emit RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('h'))));
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    assert_eq!(cmd, None);
+
+    // 8. 'l' (next) navigation: Dashboard -> History emits RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('l'))));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Navigating to History via 'l' must emit RefreshSessions"
+    );
+
+    // 9. 'h' (prev) back to Dashboard
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('h'))));
+    assert_eq!(app.active_tab, Tab::Dashboard);
+    assert_eq!(cmd, None);
+
+    // 10. Right arrow navigation: Dashboard -> History emits RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Navigating to History via Right arrow must emit RefreshSessions"
+    );
+
+    // 11. Right arrow navigation: History -> Wearables must NOT emit RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    assert_eq!(app.active_tab, Tab::Wearables);
+    assert_eq!(cmd, None);
+
+    // 12. Left arrow navigation: Wearables -> History emits RefreshSessions
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Navigating to History via Left arrow must emit RefreshSessions"
+    );
+
+    // 13. Mouse tab click: switch to Settings, re-render, then click [2:History]
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('4'))));
+    assert_eq!(app.active_tab, Tab::Settings);
+    assert_eq!(cmd, None);
+
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let (hist_col, hist_row) = find_text_coords(term.backend().buffer(), "[2:History]")
+        .expect("History tab label in header");
+
+    let cmd = app.handle_event(mouse_left_click(hist_col + 1, hist_row));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Clicking History tab from Settings must emit RefreshSessions"
+    );
+
+    // 14. Mouse click on [2:History] while already on History must NOT emit RefreshSessions
+    let cmd = app.handle_event(mouse_left_click(hist_col + 1, hist_row));
+    assert_eq!(app.active_tab, Tab::History);
+    assert_eq!(
+        cmd, None,
+        "Clicking History tab while already on History must not emit redundant RefreshSessions"
+    );
+
+    // 15. Offline behavior: when disconnected from daemon, tab switching must NOT emit RefreshSessions
+    let mut offline_app = TuiApp::new(false, false, false);
+    assert!(!offline_app.daemon_connected);
+    assert_eq!(offline_app.active_tab, Tab::Dashboard);
+
+    let cmd = offline_app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(offline_app.active_tab, Tab::History);
+    assert_eq!(
+        cmd, None,
+        "Switching to History while offline must not emit RefreshSessions"
+    );
+
+    offline_app.active_tab = Tab::Dashboard;
+    let cmd = offline_app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert_eq!(offline_app.active_tab, Tab::History);
+    assert_eq!(
+        cmd, None,
+        "Tab navigation to History while offline must not emit RefreshSessions"
+    );
+
+    term.draw(|f| offline_app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (hist_col, hist_row) = find_text_coords(term.backend().buffer(), "[2:History]")
+        .expect("History tab label in header");
+    offline_app.active_tab = Tab::Dashboard;
+    let cmd = offline_app.handle_event(mouse_left_click(hist_col + 1, hist_row));
+    assert_eq!(offline_app.active_tab, Tab::History);
+    assert_eq!(
+        cmd, None,
+        "Mouse clicking History while offline must not emit RefreshSessions"
+    );
+}
+
+#[test]
+fn test_tui_history_footer_uncluttered_no_manual_refresh() {
+    let mut app = TuiApp::new(false, false, false);
+    app.active_tab = Tab::History;
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let buf = term.backend().buffer();
+    let out = buffer_to_string(buf);
+
+    // Standard footer actions must be present
+    assert!(
+        out.contains("Feedback"),
+        "Footer must contain Feedback action"
+    );
+    assert!(out.contains("Export"), "Footer must contain Export action");
+    assert!(out.contains("Delete"), "Footer must contain Delete action");
+    assert!(
+        out.contains("Navigate"),
+        "Footer must contain Navigate hint"
+    );
+
+    // History footer must NOT add a manual refresh keybinding or footer item
+    assert!(
+        !out.contains("[r]"),
+        "History footer must not have an [r] keybinding"
+    );
+    assert!(
+        !out.contains("Refresh"),
+        "History footer must not contain a Refresh item"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_tab_switch_reconciles_sessions_e2e() {
+    let mut h = RealSocketTuiHarness::spawn(1, false).await;
+    let s1_id = h.session_ids[0].clone();
+    assert_eq!(h.app.history_sessions.len(), 1);
+    assert_eq!(h.app.history_sessions[0].id, s1_id);
+
+    // Switch to Dashboard
+    h.app.active_tab = Tab::Dashboard;
+
+    // Directly insert a second session into SQLite
+    let base_ts = Utc::now().timestamp_millis() - 100_000;
+    let s2_id = h.insert_closed_session(2, base_ts, base_ts + 50_000);
+
+    // Before tab switch, TuiApp still has 1 session cached
+    assert_eq!(h.app.history_sessions.len(), 1);
+
+    // Switch from Dashboard to History via '2': must emit RefreshSessions
+    let cmd = h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "Switching to History tab must emit RefreshSessions command"
+    );
+
+    // Send the emitted command through the bridge
+    h.cmd_tx.send(cmd.unwrap()).await.unwrap();
+
+    // Wait for the reconciled session list to arrive in TuiApp
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_sessions.len() == 2
+    })
+    .await;
+
+    // Both sessions present (s2_id is newest so index 0, s1_id is index 1)
+    assert_eq!(h.app.history_sessions[0].id, s2_id);
+    assert_eq!(h.app.history_sessions[1].id, s1_id);
+
+    // Select the older session (s1_id at index 1) via 'j'
+    let sel_cmd = h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    if let Some(c) = sel_cmd {
+        h.cmd_tx.send(c).await.unwrap();
+        wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+            a.selected_session_detail.as_ref().map(|d| &d.session.id) == Some(&s1_id)
+        })
+        .await;
+    }
+    assert_eq!(h.app.selected_session_idx, 1);
+    let selected_id = h.app.history_sessions[h.app.selected_session_idx]
+        .id
+        .clone();
+    assert_eq!(selected_id, s1_id);
+
+    // Switch to Dashboard, then back to History: must emit RefreshSessions and preserve selected session_id
+    let cmd_dash = h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('1'))));
+    assert_eq!(cmd_dash, None);
+    assert_eq!(h.app.active_tab, Tab::Dashboard);
+
+    let cmd_hist = h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert_eq!(cmd_hist, Some(TuiCommand::RefreshSessions));
+    h.cmd_tx.send(cmd_hist.unwrap()).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.history_sessions.len() == 2
+    })
+    .await;
+
+    // Preserved selection by session_id
+    assert_eq!(h.app.selected_session_idx, 1);
+    assert_eq!(h.app.history_sessions[h.app.selected_session_idx].id, s1_id);
+
+    h.shutdown().await;
 }

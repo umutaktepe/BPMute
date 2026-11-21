@@ -46,29 +46,15 @@ impl TuiApp {
                 self.open_help_modal();
                 None
             }
-            KeyCode::Char('1') => {
-                self.active_tab = Tab::Dashboard;
-                None
-            }
-            KeyCode::Char('2') => {
-                self.active_tab = Tab::History;
-                None
-            }
-            KeyCode::Char('3') => {
-                self.active_tab = Tab::Wearables;
-                None
-            }
-            KeyCode::Char('4') => {
-                self.active_tab = Tab::Settings;
-                None
-            }
+            KeyCode::Char('1') => self.switch_tab(Tab::Dashboard),
+            KeyCode::Char('2') => self.switch_tab(Tab::History),
+            KeyCode::Char('3') => self.switch_tab(Tab::Wearables),
+            KeyCode::Char('4') => self.switch_tab(Tab::Settings),
             KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right => {
-                self.active_tab = self.active_tab.next();
-                None
+                self.switch_tab(self.active_tab.next())
             }
             KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left => {
-                self.active_tab = self.active_tab.prev();
-                None
+                self.switch_tab(self.active_tab.prev())
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.active_tab == Tab::Wearables
@@ -106,6 +92,18 @@ impl TuiApp {
             }
             // Tab-specific controls
             _ => self.handle_tab_key(key),
+        }
+    }
+
+    pub(super) fn switch_tab(&mut self, target: Tab) -> Option<TuiCommand> {
+        if self.active_tab == target {
+            return None;
+        }
+        self.active_tab = target;
+        if target == Tab::History && self.daemon_connected {
+            Some(TuiCommand::RefreshSessions)
+        } else {
+            None
         }
     }
 

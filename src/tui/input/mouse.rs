@@ -11,10 +11,7 @@ impl TuiApp {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.op_feedback = None;
                 match self.hit_map.click_at(mouse.column, mouse.row)? {
-                    ClickTarget::SelectTab(tab) => {
-                        self.active_tab = tab;
-                        None
-                    }
+                    ClickTarget::SelectTab(tab) => self.switch_tab(tab),
                     ClickTarget::CancelGrace | ClickTarget::SnoozeGrace
                         if !self.daemon_connected || self.grace_state.is_none() =>
                     {

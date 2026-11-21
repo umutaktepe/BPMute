@@ -11,7 +11,9 @@ use bpmute::calibration::SessionLedgerRecord;
 use bpmute::config::PowerAction;
 use bpmute::ipc::protocol::EnrolledWearableStatus;
 use bpmute::paths::{MapEnv, ResolvedPaths};
-use bpmute::sleep_engine::{DetectorState, Epoch, EpochFeatures, SessionEndReason, StreamStatus};
+use bpmute::sleep_engine::{
+    DetectorState, Epoch, EpochFeatures, SessionEndReason, SessionSummary, StreamStatus,
+};
 use bpmute::storage::{
     EnrolledWearable, SessionFullDetail, SessionListEntry, SessionStatus, WearableInfo,
 };
@@ -251,5 +253,38 @@ pub fn make_test_epoch(
         p_quiet_wake: (1.0 - p_sleep - 0.1).max(0.0),
         p_sleep,
         state: DetectorState::Monitoring,
+    }
+}
+
+pub fn make_session_summary(
+    session_index: u64,
+    start_ts_ms: i64,
+    end_ts_ms: i64,
+    with_raw_samples: bool,
+) -> SessionSummary {
+    SessionSummary {
+        session_index,
+        start_ts_ms,
+        end_ts_ms,
+        end_reason: SessionEndReason::StreamEnded,
+        candidate_ts_ms: None,
+        confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        anomalous: false,
+        fp_count: 0,
+        warmup_mu_hr: Some(64.0),
+        warmup_sigma_hr: Some(2.5),
+        warmup_ln_rmssd: None,
+        onset_hr_bpm: Some(54.0),
+        sleep_mu_hr: Some(54.0),
+        sleep_ln_rmssd: None,
+        observed_hr_var_ratio: None,
+        typical_sqi: None,
+        post_trigger_sleep_sec: 0,
+        had_rr: with_raw_samples,
+        grace_cancel_count: 0,
+        rapid_wake_fp_count: 0,
+        snooze_count: 0,
+        epochs_count: usize::from(with_raw_samples),
     }
 }
