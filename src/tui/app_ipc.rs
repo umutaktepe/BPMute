@@ -87,6 +87,7 @@ impl TuiApp {
                         total_sec: tick.total_sec,
                         planned_actions: planned,
                         dry_run: tick.dry_run,
+                        activity_hold: tick.activity_hold,
                     });
                 }
             }

@@ -556,6 +556,8 @@ pub struct GraceTickEvent {
     pub dry_run: bool,
     #[serde(default)]
     pub planned_steps: Vec<String>,
+    #[serde(default)]
+    pub activity_hold: bool,
 }
 
 /// Control event payload pushed as `SessionStarted` when a `Monitoring Session` opens.

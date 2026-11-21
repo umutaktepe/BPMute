@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use crate::config::PowerAction;
 
 use super::traits::{
-    ActionError, ActionExecutor, BoxFuture, CommandOutput, NotificationEvent, Notifier,
+    ActionError, ActionExecutor, BoxFuture, CommandOutput, GracePhase, NotificationEvent, Notifier,
     PowerActionResult, Urgency, is_player_ignored,
 };
 
@@ -276,6 +276,7 @@ impl Notifier for FakeNotifier {
         replaces_id: u32,
         remaining_sec: u32,
         total_sec: u32,
+        phase: GracePhase,
         urgency: Urgency,
         dry_run: bool,
     ) -> BoxFuture<'a, Result<u32, ActionError>> {
@@ -289,8 +290,12 @@ impl Notifier for FakeNotifier {
                 id
             };
             guard.active_notice_id = Some(id);
+            let phase_tag = match phase {
+                GracePhase::Countdown => "countdown",
+                GracePhase::ActivityHold => "activity_hold",
+            };
             guard.events.push(format!(
-                "grace_notice: id={id}, rem={remaining_sec}/{total_sec}, urg={:?}, dry={dry_run}",
+                "grace_notice: id={id}, rem={remaining_sec}/{total_sec}, urg={:?}, dry={dry_run}, phase={phase_tag}",
                 urgency
             ));
             Ok(id)

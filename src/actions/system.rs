@@ -9,7 +9,7 @@ use zbus::zvariant::{OwnedFd, Value};
 use crate::config::PowerAction;
 
 use super::traits::{
-    ActionError, ActionExecutor, BoxFuture, CommandOutput, NotificationEvent, Notifier,
+    ActionError, ActionExecutor, BoxFuture, CommandOutput, GracePhase, NotificationEvent, Notifier,
     PowerActionResult, Urgency, is_player_ignored,
 };
 
@@ -574,6 +574,7 @@ impl Notifier for DesktopNotifier {
         replaces_id: u32,
         remaining_sec: u32,
         _total_sec: u32,
+        phase: GracePhase,
         urgency: Urgency,
         dry_run: bool,
     ) -> BoxFuture<'a, Result<u32, ActionError>> {
@@ -586,7 +587,14 @@ impl Notifier for DesktopNotifier {
                 "Sleep action pending".to_string()
             };
 
-            let body = format!("Cancelling in {remaining_sec}s... Click Cancel if you're awake.");
+            let body = match phase {
+                GracePhase::Countdown => {
+                    format!("Sleep action in {remaining_sec}s... Click Cancel if you're awake.")
+                }
+                GracePhase::ActivityHold => format!(
+                    "Activity detected — cancelling in {remaining_sec}s. Click Snooze to postpone."
+                ),
+            };
             let actions = [
                 "cancel",
                 "Cancel (I'm Awake)",

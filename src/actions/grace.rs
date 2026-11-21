@@ -10,7 +10,10 @@ use crate::ipc::protocol::GraceTickEvent;
 use crate::ipc::pubsub::EventBroker;
 use crate::sleep_engine::{GraceOutcome, GraceResult};
 
-use super::traits::{NotificationEvent, Notifier, Urgency};
+use super::traits::{GracePhase, NotificationEvent, Notifier, Urgency};
+
+/// Fixed non-resetting duration of the `Activity Hold` phase once desktop activity is detected.
+const ACTIVITY_HOLD_SEC: u32 = 10;
 
 /// Control messages delivered to [`GraceCoordinator`] while a Grace Period is active.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +67,9 @@ impl GraceCoordinator {
 
     /// Runs the cancellable Grace Period countdown loop:
     /// - Manages single `replaces_id` notification updated every 5 s, then every 1 s in final 10 s
-    /// - Emits `GraceTick` push events every 1 s
+    ///   during `Countdown`, and every 1 s during `ActivityHold`
+    /// - Transitions from `Countdown` to a fixed 10 s `ActivityHold` on the first post-settle idle event
+    /// - Emits `GraceTick` push events every 1 s (and immediately upon entering `ActivityHold`)
     /// - Handles `Cancel`, `Snooze`, `NotificationClosed` (non-cancelling), and asymmetric `Signal Lost`
     /// - Closes notification via `CloseNotification(id)` upon exit
     pub async fn run(
@@ -74,6 +79,7 @@ impl GraceCoordinator {
     ) -> GraceRunOutcome {
         let total_sec = params.config.effective_grace_period_sec();
         let mut remaining_sec = total_sec;
+        let mut phase = GracePhase::Countdown;
 
         let urgency = match params.config.power_action {
             PowerAction::None => Urgency::Normal,
@@ -81,12 +87,18 @@ impl GraceCoordinator {
         };
 
         let mut notif_rx = self.notifier.subscribe_actions();
-        let mut active_notice_id = self
-            .notifier
-            .show_grace_notice(0, remaining_sec, total_sec, urgency, params.dry_run)
-            .await
-            .unwrap_or(0);
+        let mut active_notice_id = 0;
         let mut notice_dismissed = false;
+        self.refresh_notice(
+            &mut active_notice_id,
+            notice_dismissed,
+            remaining_sec,
+            total_sec,
+            phase,
+            urgency,
+            params.dry_run,
+        )
+        .await;
 
         let mut idle_rx = self
             .idle_probe
@@ -95,7 +107,8 @@ impl GraceCoordinator {
             .ok();
 
         // Publish initial tick at start
-        self.publish_tick(&params, remaining_sec, total_sec);
+        self.publish_tick(&params, remaining_sec, total_sec, phase);
+        let mut tick_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
 
         loop {
             tokio::select! {
@@ -105,7 +118,7 @@ impl GraceCoordinator {
                     let Some(cmd) = cmd_opt else {
                         let now_ms = self.clock.now_utc().timestamp_millis();
                         self.close_notice_if_active(active_notice_id).await;
-                        self.publish_tick(&params, 0, total_sec);
+                        self.publish_tick(&params, 0, total_sec, phase);
                         return GraceRunOutcome::Completed(GraceOutcome {
                             ts_ms: now_ms,
                             outcome: GraceResult::AbortedNoPenalty,
@@ -113,7 +126,7 @@ impl GraceCoordinator {
                     };
                     let now_ms = self.clock.now_utc().timestamp_millis();
                     self.close_notice_if_active(active_notice_id).await;
-                    self.publish_tick(&params, 0, total_sec);
+                    self.publish_tick(&params, 0, total_sec, phase);
                     match cmd {
                         GraceControlCmd::Cancel => {
                             return GraceRunOutcome::Completed(GraceOutcome {
@@ -150,14 +163,28 @@ impl GraceCoordinator {
                         None => std::future::pending().await,
                     }
                 } => {
-                    let now_ms = self.clock.now_utc().timestamp_millis();
-                    self.close_notice_if_active(active_notice_id).await;
-                    self.publish_tick(&params, 0, total_sec);
-                    tracing::info!("desktop user activity detected during Grace Period; cancelling");
-                    return GraceRunOutcome::Completed(GraceOutcome {
-                        ts_ms: now_ms,
-                        outcome: GraceResult::Cancelled,
-                    });
+                    // Single-shot trigger: stop consuming idle events so continuous input
+                    // never resets or extends the fixed 10 s Activity Hold timer.
+                    phase = GracePhase::ActivityHold;
+                    remaining_sec = ACTIVITY_HOLD_SEC;
+                    idle_rx = None;
+                    tick_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+                    self.publish_tick(&params, remaining_sec, total_sec, phase);
+                    tracing::info!(
+                        "desktop user activity detected during Grace Period; entering 10s Activity Hold"
+                    );
+
+                    self.refresh_notice(
+                        &mut active_notice_id,
+                        notice_dismissed,
+                        remaining_sec,
+                        total_sec,
+                        phase,
+                        urgency,
+                        params.dry_run,
+                    )
+                    .await;
                 }
 
                 Some(notif_ev) = notif_rx.recv() => {
@@ -169,14 +196,14 @@ impl GraceCoordinator {
                             let now_ms = self.clock.now_utc().timestamp_millis();
                             if action_key == "cancel" || action_key == "default" {
                                 self.close_notice_if_active(active_notice_id).await;
-                                self.publish_tick(&params, 0, total_sec);
+                                self.publish_tick(&params, 0, total_sec, phase);
                                 return GraceRunOutcome::Completed(GraceOutcome {
                                     ts_ms: now_ms,
                                     outcome: GraceResult::Cancelled,
                                 });
                             } else if action_key == "snooze" {
                                 self.close_notice_if_active(active_notice_id).await;
-                                self.publish_tick(&params, 0, total_sec);
+                                self.publish_tick(&params, 0, total_sec, phase);
                                 let dur = params.config.snooze_duration_min * 60;
                                 return GraceRunOutcome::Completed(GraceOutcome {
                                     ts_ms: now_ms,
@@ -197,37 +224,76 @@ impl GraceCoordinator {
                     }
                 }
 
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                _ = tokio::time::sleep_until(tick_deadline) => {
+                    tick_deadline += Duration::from_secs(1);
                     remaining_sec = remaining_sec.saturating_sub(1);
-                    self.publish_tick(&params, remaining_sec, total_sec);
+                    self.publish_tick(&params, remaining_sec, total_sec, phase);
 
                     if remaining_sec == 0 {
                         let now_ms = self.clock.now_utc().timestamp_millis();
                         self.close_notice_if_active(active_notice_id).await;
+                        let outcome = match phase {
+                            GracePhase::Countdown => GraceResult::Expired,
+                            GracePhase::ActivityHold => GraceResult::Cancelled,
+                        };
                         return GraceRunOutcome::Completed(GraceOutcome {
                             ts_ms: now_ms,
-                            outcome: GraceResult::Expired,
+                            outcome,
                         });
                     }
 
-                    // Notification cadence: every 5s while remaining > 10, then every 1s
-                    if !notice_dismissed
-                        && (remaining_sec.is_multiple_of(5) || remaining_sec <= 10)
-                        && let Ok(new_id) = self
-                            .notifier
-                            .show_grace_notice(
-                                active_notice_id,
-                                remaining_sec,
-                                total_sec,
-                                urgency,
-                                params.dry_run,
-                            )
-                            .await
-                    {
-                        active_notice_id = new_id;
+                    let should_refresh_notice = match phase {
+                        GracePhase::Countdown => {
+                            remaining_sec.is_multiple_of(5) || remaining_sec <= 10
+                        }
+                        GracePhase::ActivityHold => true,
+                    };
+
+                    if should_refresh_notice {
+                        self.refresh_notice(
+                            &mut active_notice_id,
+                            notice_dismissed,
+                            remaining_sec,
+                            total_sec,
+                            phase,
+                            urgency,
+                            params.dry_run,
+                        )
+                        .await;
                     }
                 }
             }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "forwards Grace Period notification fields without allocating a transient struct"
+    )]
+    async fn refresh_notice(
+        &self,
+        active_notice_id: &mut u32,
+        notice_dismissed: bool,
+        remaining_sec: u32,
+        total_sec: u32,
+        phase: GracePhase,
+        urgency: Urgency,
+        dry_run: bool,
+    ) {
+        if !notice_dismissed
+            && let Ok(new_id) = self
+                .notifier
+                .show_grace_notice(
+                    *active_notice_id,
+                    remaining_sec,
+                    total_sec,
+                    phase,
+                    urgency,
+                    dry_run,
+                )
+                .await
+        {
+            *active_notice_id = new_id;
         }
     }
 
@@ -237,7 +303,13 @@ impl GraceCoordinator {
         }
     }
 
-    fn publish_tick(&self, params: &GraceRunParams, remaining_sec: u32, total_sec: u32) {
+    fn publish_tick(
+        &self,
+        params: &GraceRunParams,
+        remaining_sec: u32,
+        total_sec: u32,
+        phase: GracePhase,
+    ) {
         let tick = GraceTickEvent {
             session_id: params.session_id.clone(),
             remaining_sec,
@@ -245,6 +317,7 @@ impl GraceCoordinator {
             power_action: params.config.power_action,
             dry_run: params.dry_run || params.config.dry_run,
             planned_steps: params.config.planned_pipeline_steps(),
+            activity_hold: phase == GracePhase::ActivityHold,
         };
         if let Ok(v) = serde_json::to_value(tick) {
             self.broker.publish_control("GraceTick", v);

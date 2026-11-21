@@ -226,6 +226,7 @@ fn test_mouse_tab_clicks_grace_banner_buttons_and_no_mouse() {
         total_sec: 60,
         planned_actions: vec!["Pause Media".into(), "Suspend".into()],
         dry_run: false,
+        activity_hold: false,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -759,6 +760,7 @@ fn test_global_grace_period_banner_across_tabs() {
         total_sec: 30,
         planned_actions: vec!["Pause Media".into(), "Lock Screen".into(), "Suspend".into()],
         dry_run: false,
+        activity_hold: false,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2256,6 +2258,7 @@ fn test_mouse_footer_tab_actions_and_navigation_hint_ignores() {
         total_sec: 60,
         planned_actions: vec!["Pause Media".into()],
         dry_run: false,
+        activity_hold: false,
     });
     app.alerts = vec![DaemonAlert {
         id: alert_ids::PERSISTENT_SHIFT.into(),
@@ -3687,6 +3690,7 @@ fn test_mouse_pause_popover_two_click_wheel_and_backdrop() {
         total_sec: 60,
         planned_actions: vec!["Pause Media".into()],
         dry_run: false,
+        activity_hold: false,
     });
     app.modal = ModalState::PausePopover { selected_idx: 0 };
 
@@ -8238,4 +8242,108 @@ async fn test_real_socket_history_tab_switch_reconciles_sessions_e2e() {
     assert_eq!(h.app.history_sessions[h.app.selected_session_idx].id, s1_id);
 
     h.shutdown().await;
+}
+
+#[test]
+fn test_grace_tick_activity_hold_banner_and_hit_map() {
+    use bpmute::ipc::GraceTickEvent;
+
+    // 1. Legacy GraceTickEvent JSON without `activity_hold` deserializes with `false`
+    let legacy_tick: GraceTickEvent = serde_json::from_value(serde_json::json!({
+        "session_id": "s-legacy",
+        "remaining_sec": 23,
+        "total_sec": 30,
+        "power_action": "suspend",
+        "dry_run": false,
+        "planned_steps": ["Pause Media", "Suspend"]
+    }))
+    .expect("legacy GraceTickEvent JSON without activity_hold must deserialize");
+    assert!(!legacy_tick.activity_hold);
+
+    for (ascii, no_color) in [(false, false), (true, true)] {
+        let mut app = TuiApp::new(false, ascii, no_color);
+        app.daemon_connected = true;
+
+        // Countdown GraceTick -> GRACE: 23s
+        app.handle_ipc(IpcEvent::GraceTick(legacy_tick.clone()));
+        let mut term_80 = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term_80
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let out_countdown = buffer_to_string(term_80.backend().buffer());
+        assert!(
+            out_countdown.contains("GRACE: 23s"),
+            "countdown tick must render GRACE: 23s (ascii={ascii}, no_color={no_color}):\n{out_countdown}"
+        );
+        assert!(!out_countdown.contains("ACTIVITY HOLD:"));
+
+        // ActivityHold GraceTick -> ACTIVITY HOLD: 10s (with populated steps exercising clipping at 80x24)
+        let hold_tick = GraceTickEvent {
+            session_id: "s-hold".into(),
+            remaining_sec: 10,
+            total_sec: 30,
+            power_action: bpmute::config::PowerAction::Suspend,
+            dry_run: false,
+            planned_steps: vec![
+                "Pause Media".into(),
+                "Custom Hook".into(),
+                "Lock Screen".into(),
+                "Suspend".into(),
+            ],
+            activity_hold: true,
+        };
+        app.handle_ipc(IpcEvent::GraceTick(hold_tick));
+        term_80
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let out_hold_80 = buffer_to_string(term_80.backend().buffer());
+        assert!(
+            out_hold_80.contains("ACTIVITY HOLD: 10s"),
+            "activity hold tick must render ACTIVITY HOLD: 10s at 80x24 (ascii={ascii}, no_color={no_color}):\n{out_hold_80}"
+        );
+        assert!(out_hold_80.contains("[c] Cancel"));
+        assert!(out_hold_80.contains("[s] Snooze"));
+
+        // Verify HitMap targets on 80x24
+        let buf_80 = term_80.backend().buffer();
+        let (c_col, c_row) = find_text_coords(buf_80, "[c] Cancel").unwrap();
+        let (s_col, s_row) = find_text_coords(buf_80, "[s] Snooze").unwrap();
+        assert_eq!(
+            app.handle_event(mouse_left_click(c_col + 1, c_row)),
+            Some(TuiCommand::CancelGrace)
+        );
+        assert_eq!(
+            app.handle_event(mouse_left_click(s_col + 1, s_row)),
+            Some(TuiCommand::SnoozeGrace(None))
+        );
+
+        // Verify wide layout (>= 96 cols) renders full [c] Cancel (I'm Awake) and HitMap
+        let mut term_wide = Terminal::new(TestBackend::new(104, 24)).unwrap();
+        term_wide
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let buf_wide = term_wide.backend().buffer();
+        let (wc_col, wc_row) = find_text_coords(buf_wide, "[c] Cancel (I'm Awake)").unwrap();
+        let (ws_col, ws_row) = find_text_coords(buf_wide, "[s] Snooze").unwrap();
+        assert_eq!(
+            app.handle_event(mouse_left_click(wc_col + 18, wc_row)),
+            Some(TuiCommand::CancelGrace)
+        );
+        assert_eq!(
+            app.handle_event(mouse_left_click(ws_col + 2, ws_row)),
+            Some(TuiCommand::SnoozeGrace(None))
+        );
+
+        // Terminal GraceTick(0) clears grace_state
+        app.handle_ipc(IpcEvent::GraceTick(GraceTickEvent {
+            session_id: "s-hold".into(),
+            remaining_sec: 0,
+            total_sec: 30,
+            power_action: bpmute::config::PowerAction::Suspend,
+            dry_run: false,
+            planned_steps: vec!["Pause Media".into(), "Suspend".into()],
+            activity_hold: true,
+        }));
+        assert!(app.grace_state.is_none());
+    }
 }

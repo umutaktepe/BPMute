@@ -17,6 +17,15 @@ pub enum Urgency {
     Critical = 2,
 }
 
+/// Active phase of a `Grace Period` (ADR-0011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GracePhase {
+    /// Initial `Sleep Action Pipeline` countdown toward `GraceResult::Expired`.
+    Countdown,
+    /// Fixed `10 s` `Activity Hold` window after post-settle desktop activity.
+    ActivityHold,
+}
+
 impl Urgency {
     pub fn as_byte(self) -> u8 {
         self as u8
@@ -122,6 +131,7 @@ pub trait Notifier: Send + Sync {
         replaces_id: u32,
         remaining_sec: u32,
         total_sec: u32,
+        phase: GracePhase,
         urgency: Urgency,
         dry_run: bool,
     ) -> BoxFuture<'a, Result<u32, ActionError>>;

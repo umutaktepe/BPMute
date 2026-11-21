@@ -40,6 +40,10 @@ _Avoid_: Bad night, outlier, error session
 The cancellable countdown window between sleep-onset confirmation and executing the configured Sleep Action Pipeline, during which desktop activity, explicit cancellation, or physiological arousal can abort execution.
 _Avoid_: Countdown, delay, warning window, buffer
 
+**Activity Hold**:
+A fixed brief decision window entered when desktop activity occurs during a `Grace Period`, pausing the `Sleep Action Pipeline` countdown so the user can choose `Snooze` or `Cancel` before automatic cancellation.
+_Avoid_: Decision window, grace pause, idle delay
+
 **Sleep Action Pipeline**:
 The ordered sequence of desktop and system actions (such as pausing media, running a custom hook, locking the screen, or suspending the host) executed when a Grace Period expires uncancelled.
 _Avoid_: Trigger, automation, macro, action list

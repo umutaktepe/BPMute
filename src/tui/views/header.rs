@@ -88,7 +88,12 @@ fn render_grace_banner(
     hit_map: &mut HitMap,
 ) {
     let dry_tag = if grace.dry_run { " [DRY]" } else { "" };
-    let prefix = format!(" GRACE: {}s{} | ", grace.remaining_sec, dry_tag);
+    let phase_label = if grace.activity_hold {
+        "ACTIVITY HOLD"
+    } else {
+        "GRACE"
+    };
+    let prefix = format!(" {phase_label}: {}s{} | ", grace.remaining_sec, dry_tag);
     let full_controls = "[c] Cancel (I'm Awake)  [s] Snooze ";
     let short_controls = "[c] Cancel  [s] Snooze ";
 

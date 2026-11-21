@@ -1,7 +1,10 @@
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
 
@@ -10,7 +13,11 @@ use bpmute::config::{ActionsConfig, CliOverrides, LoadedConfig, PowerAction, Sch
 use bpmute::daemon::{DaemonClock, DaemonHandle, DaemonOptions, VirtualClock, WearableEvent};
 use bpmute::idle::fake::FakeIdleProbe;
 use bpmute::idle::traits::{IdleBackendKind, IdleProbe};
+use bpmute::ipc::IpcClient;
 use bpmute::paths::{MapEnv, ResolvedPaths};
+use bpmute::sleep_engine::EngineEvent;
+use bpmute::storage::WearableDescriptor;
+use serde_json::json;
 
 fn test_paths(temp: &TempDir) -> ResolvedPaths {
     ResolvedPaths {
@@ -26,7 +33,7 @@ struct TestWearableSource {
 
 impl TestWearableSource {
     fn new() -> (Self, mpsc::Sender<WearableEvent>) {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(4096);
         (
             Self {
                 rx: tokio::sync::Mutex::new(Some(rx)),
@@ -187,13 +194,39 @@ async fn test_virtual_time_settled_grace_cancellation_and_in_flight_race_suppres
     tokio::time::sleep(Duration::from_millis(1000)).await;
     assert!(daemon.core().is_in_grace_period());
 
-    // Activity after settle delay cancels Grace Period immediately
+    // Activity after settle delay enters fixed 10s Activity Hold (does NOT cancel immediately)
     idle_probe.trigger_activity();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     assert!(
+        daemon.core().is_in_grace_period(),
+        "activity after 1s settle delay must hold Grace Period open for 10s Activity Hold"
+    );
+    assert!(
+        notifier.active_notice_id().is_some(),
+        "grace notification must remain open during Activity Hold"
+    );
+    assert!(
+        notifier
+            .events()
+            .iter()
+            .any(|e| e.contains("rem=10/30") && e.contains("phase=activity_hold")),
+        "Activity Hold must update notification immediately to 10s; got: {:?}",
+        notifier.events()
+    );
+
+    // Still active at +9s into Activity Hold
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert!(
+        daemon.core().is_in_grace_period(),
+        "Activity Hold must remain open for the full 10s"
+    );
+
+    // Expires at +10s with GraceResult::Cancelled
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
         !daemon.core().is_in_grace_period(),
-        "activity after 1s settle delay must cancel grace period"
+        "Activity Hold must auto-cancel after 10s"
     );
     assert_eq!(notifier.active_notice_id(), None);
 
@@ -378,6 +411,300 @@ async fn test_virtual_time_degraded_fallback_grace_floor_alert_and_strict_refusa
             .iter()
             .any(|a| a.id == "idle_backend_inhibitor_sensitive"),
         "status alerts must include idle_backend_inhibitor_sensitive alert for v1"
+    );
+
+    daemon.shutdown().await;
+}
+
+fn default_test_wearable() -> WearableDescriptor {
+    WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:11".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Polar Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    }
+}
+
+async fn send_trace_slice(
+    wearable_tx: &mpsc::Sender<WearableEvent>,
+    events: &[EngineEvent],
+    base_ts: i64,
+) {
+    let desc = default_test_wearable();
+    for ev in events {
+        match ev {
+            EngineEvent::StreamState(st) => {
+                let mut shifted = *st;
+                shifted.ts_ms += base_ts;
+                wearable_tx
+                    .send(WearableEvent::StreamState {
+                        wearable: desc.clone(),
+                        state: shifted,
+                    })
+                    .await
+                    .unwrap();
+            }
+            EngineEvent::HrPacket(pkt) => {
+                let mut shifted = pkt.clone();
+                shifted.ts_ms += base_ts;
+                wearable_tx
+                    .send(WearableEvent::HrPacket {
+                        wearable: desc.clone(),
+                        packet: shifted,
+                    })
+                    .await
+                    .unwrap();
+            }
+            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+        }
+    }
+}
+
+async fn feed_trace_until_confirmed(
+    wearable_tx: &mpsc::Sender<WearableEvent>,
+    client: &mut IpcClient,
+    base_ts: i64,
+) -> (Vec<EngineEvent>, usize) {
+    let trace = generate_paired_trace(
+        101,
+        Phenotype::typical(),
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep { duration_sec: 900 },
+        ],
+    );
+    let split_idx = trace.bpm_rr.len() * 2 / 3;
+    send_trace_slice(wearable_tx, &trace.bpm_rr[..split_idx], base_ts).await;
+
+    for _ in 0..10_000 {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Confirmed" {
+            return (trace.bpm_rr, split_idx);
+        }
+    }
+    panic!("SleepEngine must reach Confirmed during N1/N2 trace");
+}
+
+async fn await_session_closed_and_calibration(sub: &mut IpcClient) -> String {
+    let mut closed_session_id = String::new();
+    let mut saw_cal_updated = false;
+    for _ in 0..10_000 {
+        let ev = sub.next_event().await.unwrap();
+        match ev.event.as_str() {
+            "SessionClosed" => {
+                closed_session_id = ev.data["session"]["session"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            }
+            "CalibrationUpdated" => {
+                saw_cal_updated = true;
+                if !closed_session_id.is_empty() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(!closed_session_id.is_empty());
+    assert!(saw_cal_updated);
+    closed_session_id
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_virtual_time_activity_hold_allows_snooze_with_zero_fp_penalty() {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let executor = Arc::new(FakeActionExecutor::new());
+    let notifier = Arc::new(FakeNotifier::new());
+    let idle_probe = Arc::new(FakeIdleProbe::new(IdleBackendKind::WaylandExtIdleV2));
+    let (source, wearable_tx) = TestWearableSource::new();
+    let actions_cfg = ActionsConfig {
+        power_action: PowerAction::Suspend,
+        grace_period_sec: Some(300),
+        snooze_duration_min: 20,
+        ..ActionsConfig::default()
+    };
+
+    let (daemon, paths, _clock) = spawn_idle_test_daemon(
+        &temp,
+        start_utc,
+        actions_cfg,
+        executor,
+        notifier,
+        Arc::clone(&idle_probe),
+        Arc::new(source),
+    )
+    .await;
+
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", json!({})).await.unwrap();
+    let _snap = sub.next_event().await.unwrap();
+
+    feed_trace_until_confirmed(&wearable_tx, &mut sub, start_utc.timestamp_millis()).await;
+
+    // Wait past 1s settle delay, then trigger desktop activity -> enters 10s Activity Hold
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    idle_probe.trigger_activity();
+
+    let mut saw_hold_tick = false;
+    for _ in 0..10_000 {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "GraceTick"
+            && ev.data["activity_hold"] == true
+            && ev.data["remaining_sec"] == 10
+        {
+            saw_hold_tick = true;
+            break;
+        }
+    }
+    assert!(
+        saw_hold_tick,
+        "must publish GraceTick(10, activity_hold=true)"
+    );
+    assert!(daemon.core().is_in_grace_period());
+
+    // Advance 2s into Activity Hold and issue monitor.snooze_grace via IPC
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut rpc = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let snooze_resp = rpc
+        .request("monitor.snooze_grace", json!({ "duration_min": 20 }))
+        .await
+        .unwrap();
+    assert_eq!(snooze_resp["snoozed"], true);
+    assert_eq!(snooze_resp["duration_sec"], 1200);
+
+    // Wait for Monitoring state and close session
+    for _ in 0..10_000 {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
+            break;
+        }
+    }
+    drop(wearable_tx);
+    let closed_session_id = await_session_closed_and_calibration(&mut sub).await;
+
+    let detail = rpc
+        .request("session.get", json!({ "id": closed_session_id }))
+        .await
+        .unwrap();
+    assert_eq!(detail["session"]["snooze_count"], 1);
+    assert_eq!(detail["session"]["grace_cancel_count"], 0);
+    assert_eq!(detail["session"]["rapid_wake_fp_count"], 0);
+
+    let list = rpc
+        .request("session.list", json!({ "limit": 10 }))
+        .await
+        .unwrap();
+    assert_eq!(list["sessions"][0]["fp_count"], 0);
+
+    let cal = rpc.request("calibration.status", json!({})).await.unwrap();
+    assert_eq!(cal["tau_p_sleep_offset"], 0.0);
+    assert_eq!(cal["dwell_adjust_sec"], 0);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_virtual_time_activity_hold_expiry_applies_cancelled_fp_penalty_and_cooldown() {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let executor = Arc::new(FakeActionExecutor::new());
+    let notifier = Arc::new(FakeNotifier::new());
+    let idle_probe = Arc::new(FakeIdleProbe::new(IdleBackendKind::WaylandExtIdleV2));
+    let (source, wearable_tx) = TestWearableSource::new();
+    let actions_cfg = ActionsConfig {
+        power_action: PowerAction::Suspend,
+        grace_period_sec: Some(300),
+        ..ActionsConfig::default()
+    };
+
+    let (daemon, paths, _clock) = spawn_idle_test_daemon(
+        &temp,
+        start_utc,
+        actions_cfg,
+        executor,
+        notifier,
+        Arc::clone(&idle_probe),
+        Arc::new(source),
+    )
+    .await;
+
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", json!({})).await.unwrap();
+    let _snap = sub.next_event().await.unwrap();
+
+    let (trace_events, split_idx) = feed_trace_until_confirmed(
+        &wearable_tx,
+        &mut sub,
+        start_utc.timestamp_millis() - 1_500_000,
+    )
+    .await;
+
+    // Wait past 1s settle delay, then trigger desktop activity -> enters 10s Activity Hold
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    idle_probe.trigger_activity();
+
+    // Let Activity Hold expire (10s) without issuing Snooze or Cancel
+    let mut saw_monitoring = false;
+    for _ in 0..10_000 {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
+            saw_monitoring = true;
+            break;
+        }
+    }
+    assert!(
+        saw_monitoring,
+        "expired Activity Hold must return engine to Monitoring"
+    );
+    assert!(!daemon.core().is_in_grace_period());
+
+    // Continued N2 sleep packets during the 15-min cooldown must NOT re-trigger Grace Period
+    let follow_end = (split_idx + 120).min(trace_events.len());
+    send_trace_slice(
+        &wearable_tx,
+        &trace_events[split_idx..follow_end],
+        start_utc.timestamp_millis() - 1_460_000,
+    )
+    .await;
+    tokio::task::yield_now().await;
+    assert!(!daemon.core().is_in_grace_period());
+    assert_eq!(
+        daemon.core().status().monitoring_state.to_string(),
+        "Monitoring",
+        "15-min false-positive cooldown must suppress re-entering Candidate/Confirmed"
+    );
+
+    drop(wearable_tx);
+    let closed_session_id = await_session_closed_and_calibration(&mut sub).await;
+
+    let mut rpc = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let detail = rpc
+        .request("session.get", json!({ "id": closed_session_id }))
+        .await
+        .unwrap();
+    assert_eq!(detail["session"]["grace_cancel_count"], 1);
+    assert_eq!(detail["session"]["snooze_count"], 0);
+    assert_eq!(detail["session"]["rapid_wake_fp_count"], 0);
+
+    let list = rpc
+        .request("session.list", json!({ "limit": 10 }))
+        .await
+        .unwrap();
+    assert_eq!(list["sessions"][0]["fp_count"], 1);
+
+    let cal = rpc.request("calibration.status", json!({})).await.unwrap();
+    assert!(
+        cal["tau_p_sleep_offset"].as_f64().unwrap() > 0.0,
+        "expired Activity Hold cancellation must apply strong_fp calibration threshold penalty: {cal}"
+    );
+    assert!(
+        cal["dwell_adjust_sec"].as_i64().unwrap() > 0,
+        "expired Activity Hold cancellation must apply strong_fp dwell penalty: {cal}"
     );
 
     daemon.shutdown().await;
