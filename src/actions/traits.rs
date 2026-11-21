@@ -116,7 +116,7 @@ pub trait ActionExecutor: Send + Sync {
 
 /// Boundary trait for interactive desktop notification management (ADR-0006).
 pub trait Notifier: Send + Sync {
-    /// Emits or updates the countdown notice using `replaces_id`, `transient = true`, and `expire_timeout = 0`.
+    /// Emits or updates the countdown notice using `replaces_id`, `resident = true`, and `expire_timeout = 0`.
     fn show_grace_notice<'a>(
         &'a self,
         replaces_id: u32,

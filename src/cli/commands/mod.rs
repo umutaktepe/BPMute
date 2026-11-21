@@ -194,7 +194,7 @@ async fn run_daemon<WErr: Write>(
         wearable_source: Some(wearable_source),
         install_signals: true,
         action_executor: Some(Arc::new(crate::actions::SystemActionExecutor)),
-        notifier: Some(Arc::new(crate::actions::DesktopNotifier)),
+        notifier: Some(Arc::new(crate::actions::DesktopNotifier::new())),
         idle_probe: Some(Arc::new(crate::idle::SystemIdleProbe::new(env_arc))),
         enrollment_driver: Some(Arc::new(crate::daemon::BluezEnrollmentDriver)),
     })

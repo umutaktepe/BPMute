@@ -80,13 +80,14 @@ impl GraceCoordinator {
             PowerAction::Suspend | PowerAction::Poweroff => Urgency::Critical,
         };
 
+        let mut notif_rx = self.notifier.subscribe_actions();
         let mut active_notice_id = self
             .notifier
             .show_grace_notice(0, remaining_sec, total_sec, urgency, params.dry_run)
             .await
             .unwrap_or(0);
+        let mut notice_dismissed = false;
 
-        let mut notif_rx = self.notifier.subscribe_actions();
         let mut idle_rx = self
             .idle_probe
             .watch_grace_period_activity(Duration::from_secs(1))
@@ -100,9 +101,19 @@ impl GraceCoordinator {
             tokio::select! {
                 biased;
 
-                Some(cmd) = ctrl_rx.recv() => {
+                cmd_opt = ctrl_rx.recv() => {
+                    let Some(cmd) = cmd_opt else {
+                        let now_ms = self.clock.now_utc().timestamp_millis();
+                        self.close_notice_if_active(active_notice_id).await;
+                        self.publish_tick(&params, 0, total_sec);
+                        return GraceRunOutcome::Completed(GraceOutcome {
+                            ts_ms: now_ms,
+                            outcome: GraceResult::AbortedNoPenalty,
+                        });
+                    };
                     let now_ms = self.clock.now_utc().timestamp_millis();
                     self.close_notice_if_active(active_notice_id).await;
+                    self.publish_tick(&params, 0, total_sec);
                     match cmd {
                         GraceControlCmd::Cancel => {
                             return GraceRunOutcome::Completed(GraceOutcome {
@@ -141,6 +152,7 @@ impl GraceCoordinator {
                 } => {
                     let now_ms = self.clock.now_utc().timestamp_millis();
                     self.close_notice_if_active(active_notice_id).await;
+                    self.publish_tick(&params, 0, total_sec);
                     tracing::info!("desktop user activity detected during Grace Period; cancelling");
                     return GraceRunOutcome::Completed(GraceOutcome {
                         ts_ms: now_ms,
@@ -150,15 +162,21 @@ impl GraceCoordinator {
 
                 Some(notif_ev) = notif_rx.recv() => {
                     match notif_ev {
-                        NotificationEvent::ActionInvoked { action_key, .. } => {
+                        NotificationEvent::ActionInvoked { id, action_key } => {
+                            if active_notice_id != 0 && id != active_notice_id {
+                                continue;
+                            }
                             let now_ms = self.clock.now_utc().timestamp_millis();
-                            self.close_notice_if_active(active_notice_id).await;
                             if action_key == "cancel" || action_key == "default" {
+                                self.close_notice_if_active(active_notice_id).await;
+                                self.publish_tick(&params, 0, total_sec);
                                 return GraceRunOutcome::Completed(GraceOutcome {
                                     ts_ms: now_ms,
                                     outcome: GraceResult::Cancelled,
                                 });
                             } else if action_key == "snooze" {
+                                self.close_notice_if_active(active_notice_id).await;
+                                self.publish_tick(&params, 0, total_sec);
                                 let dur = params.config.snooze_duration_min * 60;
                                 return GraceRunOutcome::Completed(GraceOutcome {
                                     ts_ms: now_ms,
@@ -166,8 +184,15 @@ impl GraceCoordinator {
                                 });
                             }
                         }
-                        NotificationEvent::NotificationClosed { .. } => {
-                            // Non-cancelling: user dismiss / swipe keeps countdown active
+                        NotificationEvent::NotificationClosed { id, reason } => {
+                            if active_notice_id != 0 && id == active_notice_id {
+                                active_notice_id = 0;
+                                if reason == 2 {
+                                    // Non-cancelling: user dismiss / swipe keeps countdown active
+                                    // without repeatedly re-popping the dismissed notification.
+                                    notice_dismissed = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -186,7 +211,8 @@ impl GraceCoordinator {
                     }
 
                     // Notification cadence: every 5s while remaining > 10, then every 1s
-                    if (remaining_sec.is_multiple_of(5) || remaining_sec <= 10)
+                    if !notice_dismissed
+                        && (remaining_sec.is_multiple_of(5) || remaining_sec <= 10)
                         && let Ok(new_id) = self
                             .notifier
                             .show_grace_notice(
