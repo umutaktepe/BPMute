@@ -35,6 +35,7 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 - **ASCII progress bars**: `ratatui::widgets::Gauge` renders Unicode `'█'` even when `use_unicode(false)` is set; render explicit ASCII progress bars (`[#---]`) whenever `theme.ascii` is enabled.
 - **Non-blocking interactive IPC ops**: Operations that wait on follow-up requests over the same socket (such as `wearable.enroll_select` awaiting `wearable.enroll_auth_response`) must run as spawned tasks on the connection handler rather than blocking the socket read loop.
 - **History selection stability across updates**: Interactive deletion via `DeleteSessionModal` preserves row index $k$ (clamped to list bounds) so focus stays on the succeeding item. External or background list updates where the selected session disappears (retention pruning, purge, or remote delete) fall back to index 0 and reload detail. Refreshes that still contain the selected session preserve selection by `session_id`.
+- **Shared test fixtures (`tests/common/tui.rs`)**: Construct standardized test entities via `make_history_session`, `make_session_detail`, and `make_test_epoch` instead of manually writing out 20-line struct literals, keeping tests decoupled from internal field additions.
 
 ## Test Execution
 
