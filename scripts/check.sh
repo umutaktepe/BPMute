@@ -100,13 +100,15 @@ for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
             )
 PY
 
-if awk '
-  FNR == 1 { in_test = 0; paused = 0 }
+if find src tests -name '*.rs' -print0 | xargs -0 awk '
+  FNR == 1 { in_test = 0; paused = 0; test_indent = 0 }
   /^[[:space:]]*#\[tokio::test/ {
+    match($0, /^[[:space:]]*/)
+    test_indent = RLENGTH
     in_test = 1
     paused = ($0 ~ /start_paused[[:space:]]*=[[:space:]]*true/)
   }
-  /^\}/ { in_test = 0; paused = 0 }
+  in_test && $0 ~ ("^ {" test_indent "}\\}$") { in_test = 0; paused = 0 }
   /tokio::time::pause\(\)/ { paused = 1 }
   {
     line = $0
@@ -117,7 +119,7 @@ if awk '
     }
   }
   END { exit !found }
-' tests/*.rs; then
+'; then
   echo "error: tokio::time::{sleep,timeout,interval} inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
   exit 1
 fi

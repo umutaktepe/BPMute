@@ -24,6 +24,7 @@ use crate::storage::schema::{
 pub mod calibration;
 pub mod maintenance;
 pub mod session;
+mod session_export;
 mod session_lifecycle;
 pub mod wearable;
 

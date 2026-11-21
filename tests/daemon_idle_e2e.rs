@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use common::daemon::TestWearableSource;
 use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 use tempfile::TempDir;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use bpmute::actions::fake::{FakeActionExecutor, FakeNotifier};
 use bpmute::config::{ActionsConfig, CliOverrides, LoadedConfig, PowerAction, ScheduleConfig};
@@ -24,32 +25,6 @@ fn test_paths(temp: &TempDir) -> ResolvedPaths {
         config_file: temp.path().join("cfg/bpmute/config.toml"),
         data_dir: temp.path().join("data/bpmute"),
         socket_path: temp.path().join("run/bpmute/daemon.sock"),
-    }
-}
-
-struct TestWearableSource {
-    rx: tokio::sync::Mutex<Option<mpsc::Receiver<WearableEvent>>>,
-}
-
-impl TestWearableSource {
-    fn new() -> (Self, mpsc::Sender<WearableEvent>) {
-        let (tx, rx) = mpsc::channel(4096);
-        (
-            Self {
-                rx: tokio::sync::Mutex::new(Some(rx)),
-            },
-            tx,
-        )
-    }
-}
-
-impl bpmute::daemon::WearableSource for TestWearableSource {
-    fn subscribe(&self, _shutdown_rx: watch::Receiver<bool>) -> mpsc::Receiver<WearableEvent> {
-        self.rx
-            .try_lock()
-            .expect("single subscriber")
-            .take()
-            .expect("only subscribed once")
     }
 }
 
