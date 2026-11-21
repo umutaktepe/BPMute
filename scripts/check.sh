@@ -14,12 +14,11 @@ cargo fmt --check
 while IFS= read -r -d '' file; do
   lines=$(wc -l < "$file")
   limit=1000
-  case "$file" in
-    ./src/sleep_engine/state_machine.rs) limit=1041 ;;
-  esac
   if [ "$lines" -gt "$limit" ]; then
     echo "error: $file has $lines lines (limit: $limit); split into sibling submodules" >&2
     exit 1
+  elif [ "$lines" -gt 900 ]; then
+    echo "warning: $file has $lines lines (>900); decompose into sibling submodules before hitting $limit" >&2
   fi
 done < <(find ./src -name '*.rs' -print0)
 

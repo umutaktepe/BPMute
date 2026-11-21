@@ -22,4 +22,4 @@ Runtime actor ownership (`DaemonCore`, `MonitoringContext`, `GraceCoordinator`, 
 
 ## Verification
 
-Run iterative tests with `./scripts/test.sh <args>` (enforces 30 s timeout and hermetic D-Bus isolation); run `./scripts/check.sh` before finishing any change.
+Run targeted iterative tests with `./scripts/test.sh --test <target> [filter]` (compiles first, then enforces 30 s execution timeout and hermetic D-Bus isolation); run `./scripts/check.sh` before finishing any change.

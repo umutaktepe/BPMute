@@ -9,7 +9,7 @@ TuiApp (src/tui/app.rs)
   └─ TuiIpcBridge (src/tui/client.rs, client_commands.rs)
        └─ Unix NDJSON IPC (src/ipc/server.rs)
             └─ DaemonCore (src/daemon/state/mod.rs, ipc.rs)
-                 ├─ MonitoringContext + SleepEngine (src/daemon/mod.rs)
+                 ├─ MonitoringContext (src/daemon/monitoring.rs) + SleepEngine (src/sleep_engine/state_machine/)
                  ├─ GraceCoordinator (src/actions/grace.rs)
                  └─ PersistenceWorker -> LedgerStore (src/storage/worker.rs, store/)
 ```
