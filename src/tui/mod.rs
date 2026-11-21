@@ -10,6 +10,7 @@
 //! - [`theme`]: 16-color ANSI and NO_COLOR-compliant theme definitions.
 
 pub mod app;
+mod app_ipc;
 pub mod client;
 mod client_commands;
 pub mod event;

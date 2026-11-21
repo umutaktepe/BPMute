@@ -11,7 +11,7 @@ use bpmute::calibration::SessionLedgerRecord;
 use bpmute::config::PowerAction;
 use bpmute::ipc::protocol::EnrolledWearableStatus;
 use bpmute::paths::{MapEnv, ResolvedPaths};
-use bpmute::sleep_engine::{Epoch, SessionEndReason, StreamStatus};
+use bpmute::sleep_engine::{DetectorState, Epoch, EpochFeatures, SessionEndReason, StreamStatus};
 use bpmute::storage::{
     EnrolledWearable, SessionFullDetail, SessionListEntry, SessionStatus, WearableInfo,
 };
@@ -217,5 +217,39 @@ pub fn make_session_detail(entry: &SessionListEntry, epochs: Vec<Epoch>) -> Sess
         feedback: entry.feedback.clone(),
         epochs,
         has_raw_samples: false,
+    }
+}
+
+pub fn make_test_epoch(
+    session_index: u64,
+    ts_ms: i64,
+    hr: f64,
+    p_sleep: f64,
+    baseline_mu_hr: f64,
+) -> Epoch {
+    Epoch {
+        session_index,
+        ts_ms,
+        features: EpochFeatures {
+            hr_bpm_60s: hr,
+            z_hr: -1.0,
+            hr_slope_4m: -0.2,
+            r_var_120s: 0.3,
+            ln_rmssd_60s: Some(3.0),
+            delta_ln_rmssd_60s: Some(0.1),
+            rmssd_sdnn_120s: Some(0.8),
+        },
+        hrv_valid: true,
+        rr_artifact_frac: 0.0,
+        coverage: 1.0,
+        flatline_stale: false,
+        accumulators_frozen: false,
+        baseline_mu_hr,
+        baseline_sigma_hr: 2.0,
+        baseline_frozen: false,
+        p_active_wake: 0.1,
+        p_quiet_wake: (1.0 - p_sleep - 0.1).max(0.0),
+        p_sleep,
+        state: DetectorState::Monitoring,
     }
 }

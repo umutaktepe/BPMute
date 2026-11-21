@@ -30,7 +30,8 @@ use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{
     AlertSeverity, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
-    HrSampleEvent, MonitoringState, PauseMode, PauseParams, SessionStartedEvent, alert_ids,
+    EpochUpdateEvent, HrSampleEvent, MonitoringState, PauseMode, PauseParams, SessionStartedEvent,
+    alert_ids,
 };
 use bpmute::paths::MapEnv;
 use bpmute::sleep_engine::{
@@ -7481,6 +7482,224 @@ fn test_tui_session_started_closed_lifecycle_and_selection_preservation() {
     assert!(app.selected_session_detail.is_none());
 }
 
+#[test]
+fn test_tui_epoch_update_unknown_session_triggers_fallback_refresh() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let start_ts = 1_700_000_000_000i64;
+    let epoch = make_test_epoch(0, start_ts + 15_000, 68.0, 0.1, 70.0);
+    let epoch_ev = EpochUpdateEvent {
+        session_id: "s-unknown".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch,
+    };
+
+    let cmd = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(epoch_ev)));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::RefreshSessions),
+        "EpochUpdate for unknown session must trigger fallback RefreshSessions"
+    );
+}
+
+#[test]
+fn test_tui_epoch_update_advances_known_session_row_without_ipc_commands_and_deduplicates() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let start_ts = 1_700_000_000_000i64;
+    let mut s1 = make_history_session(
+        "s-1",
+        "Polar H10",
+        start_ts,
+        start_ts,
+        SessionStatus::Active,
+        0,
+    );
+    s1.warmup_mu_hr = None;
+    app.history_sessions = vec![s1];
+
+    // 1. First 15s epoch arrives
+    let epoch1 = make_test_epoch(0, start_ts + 15_000, 65.0, 0.05, 63.5);
+    let cmd1 = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch: epoch1.clone(),
+    })));
+    assert_eq!(
+        cmd1, None,
+        "Known session epoch update must not emit any IPC command"
+    );
+    assert_eq!(
+        app.history_sessions[0].end_ts_ms,
+        start_ts + 15_000,
+        "end_ts_ms must advance to epoch timestamp"
+    );
+    assert_eq!(
+        app.history_sessions[0].epochs_count, 1,
+        "epochs_count must increment on new epoch"
+    );
+    assert_eq!(
+        app.history_sessions[0].warmup_mu_hr,
+        Some(63.5),
+        "warmup_mu_hr must reflect finite positive baseline"
+    );
+
+    // 2. Duplicate epoch with identical timestamp arrives
+    let cmd_dup = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch: epoch1,
+    })));
+    assert_eq!(cmd_dup, None);
+    assert_eq!(
+        app.history_sessions[0].end_ts_ms,
+        start_ts + 15_000,
+        "end_ts_ms must remain unchanged on duplicate"
+    );
+    assert_eq!(
+        app.history_sessions[0].epochs_count, 1,
+        "epochs_count must NOT double-increment on duplicate timestamp"
+    );
+
+    // 3. Second 15s epoch arrives
+    let epoch2 = make_test_epoch(1, start_ts + 30_000, 64.0, 0.10, 63.5);
+    let cmd2 = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch: epoch2,
+    })));
+    assert_eq!(cmd2, None);
+    assert_eq!(
+        app.history_sessions[0].end_ts_ms,
+        start_ts + 30_000,
+        "end_ts_ms must advance to second epoch timestamp"
+    );
+    assert_eq!(
+        app.history_sessions[0].epochs_count, 2,
+        "epochs_count must increment to 2 on second distinct epoch"
+    );
+}
+
+#[test]
+fn test_tui_epoch_update_appends_to_open_session_detail_and_renders_live_chart() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+
+    let start_ts = 1_700_000_000_000i64;
+    let mut s1 = make_history_session(
+        "s-1",
+        "Polar H10",
+        start_ts,
+        start_ts,
+        SessionStatus::Active,
+        0,
+    );
+    s1.warmup_mu_hr = None;
+    let s1_detail = make_session_detail(&s1, vec![]);
+    app.history_sessions = vec![s1];
+    app.selected_session_idx = 0;
+    app.selected_session_detail = Some(s1_detail);
+
+    // Initial render check: active session with zero epochs shows waiting message
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out0 = buffer_to_string(term.backend().buffer());
+    assert!(
+        out0.contains("Waiting for first 15s epoch..."),
+        "Must show waiting message when epochs are empty"
+    );
+
+    // 1. First 15s epoch arrives
+    let epoch1 = make_test_epoch(0, start_ts + 15_000, 65.0, 0.15, 64.0);
+    let cmd1 = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch: epoch1.clone(),
+    })));
+    assert_eq!(cmd1, None);
+
+    let detail1 = app.selected_session_detail.as_ref().unwrap();
+    assert_eq!(detail1.epochs.len(), 1, "Must append epoch to detail trace");
+    assert_eq!(detail1.epochs[0].ts_ms, start_ts + 15_000);
+    assert_eq!(detail1.session.epochs_count, 1);
+    assert_eq!(detail1.session.end_ts_ms, start_ts + 15_000);
+    assert_eq!(detail1.session.warmup_mu_hr, Some(64.0));
+
+    // Render check: chart is now active, waiting message gone, P(Sleep) legend present
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out1 = buffer_to_string(term.backend().buffer());
+    assert!(
+        !out1.contains("Waiting for first 15s epoch..."),
+        "Waiting message must disappear once epochs exist"
+    );
+    assert!(
+        out1.contains("P(Sleep)"),
+        "Chart legend must render P(Sleep)"
+    );
+    assert!(
+        out1.contains("QW: 64.0 bpm"),
+        "Live QW baseline display hint must render in header"
+    );
+
+    // 2. Duplicate epoch1 arrives (simulating race or retransmission)
+    let cmd_dup = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch: epoch1,
+    })));
+    assert_eq!(cmd_dup, None);
+    let detail_dup = app.selected_session_detail.as_ref().unwrap();
+    assert_eq!(
+        detail_dup.epochs.len(),
+        1,
+        "Duplicate epoch must not append duplicate point to detail trace"
+    );
+    assert_eq!(detail_dup.session.epochs_count, 1);
+
+    // 3. Second epoch arrives
+    let epoch2 = make_test_epoch(1, start_ts + 30_000, 62.0, 0.40, 64.0);
+    let cmd2 = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-1".to_string(),
+        wearable_id: "w-1".to_string(),
+        epoch: epoch2,
+    })));
+    assert_eq!(cmd2, None);
+    let detail2 = app.selected_session_detail.as_ref().unwrap();
+    assert_eq!(detail2.epochs.len(), 2, "Second epoch must append to trace");
+    assert_eq!(detail2.session.epochs_count, 2);
+    assert_eq!(detail2.session.end_ts_ms, start_ts + 30_000);
+
+    // 4. Session for a DIFFERENT session ID arrives; must NOT affect open detail
+    let epoch_other = make_test_epoch(0, start_ts + 15_000, 75.0, 0.05, 72.0);
+    let s_other = make_history_session(
+        "s-other",
+        "Chest Strap",
+        start_ts,
+        start_ts,
+        SessionStatus::Active,
+        0,
+    );
+    app.history_sessions.push(s_other);
+    let cmd_other = app.handle_event(TuiEvent::ipc(IpcEvent::EpochUpdate(EpochUpdateEvent {
+        session_id: "s-other".to_string(),
+        wearable_id: "w-2".to_string(),
+        epoch: epoch_other,
+    })));
+    assert_eq!(cmd_other, None);
+    let detail_after_other = app.selected_session_detail.as_ref().unwrap();
+    assert_eq!(detail_after_other.session.id, "s-1");
+    assert_eq!(
+        detail_after_other.epochs.len(),
+        2,
+        "Detail trace for s-1 must remain untouched by s-other update"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_real_socket_history_live_session_started_and_closed_e2e() {
     let temp = TempDir::new().unwrap();
@@ -7602,6 +7821,146 @@ async fn test_real_socket_history_live_session_started_and_closed_e2e() {
         "Closed session with zero epochs must show retention pruning message"
     );
 
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_live_15s_epoch_updates_advance_session_and_chart_e2e() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 20, 18, 0, 0).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+
+    let (w_tx, w_rx) = mpsc::channel(32);
+    let source = Arc::new(LiveStreamTestSource {
+        event_rx: Arc::new(tokio::sync::Mutex::new(w_rx)),
+    });
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(source),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "EC:09:86:B0:EC:05".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Watch".to_string()),
+        advertised_name: Some("HUAWEI WATCH HR-C05".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), start_utc.timestamp_millis())
+        .await
+        .unwrap();
+
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+
+    let mut app = TuiApp::new(false, false, false);
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+
+    // Switch to History tab (initially empty)
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    assert!(app.history_sessions.is_empty());
+
+    // 1. Send wearable stream packet -> starts a monitoring session in SQLite and emits SessionStarted
+    let t0 = start_utc.timestamp_millis();
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0 + 1_000,
+        },
+    })
+    .await
+    .unwrap();
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t0 + 1_000,
+            bpm: 65.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    // TUI receives SessionStarted -> RefreshSessions -> SessionsUpdated -> SessionGet -> SessionDetailLoaded
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions.len() == 1
+            && a.history_sessions[0].status == SessionStatus::Active
+            && a.selected_session_detail.is_some()
+    })
+    .await;
+
+    // Before first epoch: shows "Waiting for first 15s epoch..."
+    let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out = buffer_to_string(term.backend().buffer());
+    assert!(out.contains("Waiting for first 15s epoch..."));
+
+    // 2. Stream 15 seconds of HR packets -> triggers first 15s EpochUpdate
+    for sec in 2..=16 {
+        w_tx.send(WearableEvent::HrPacket {
+            wearable: desc.clone(),
+            packet: HrPacket {
+                ts_ms: t0 + sec * 1_000,
+                bpm: 64.0,
+                rr_ms: vec![],
+                contact_status: ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    // TUI must receive EpochUpdate over real Unix socket -> in-memory advance without polling SQLite
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions
+            .first()
+            .is_some_and(|s| s.epochs_count >= 1)
+            && a.selected_session_detail
+                .as_ref()
+                .is_some_and(|d| !d.epochs.is_empty())
+    })
+    .await;
+
+    // Verify in-memory state: 1 epoch appended, end_ts_ms advanced, duration updated
+    let active_entry = &app.history_sessions[0];
+    assert_eq!(active_entry.epochs_count, 1);
+    assert!(active_entry.end_ts_ms >= t0 + 15_000);
+    let active_detail = app.selected_session_detail.as_ref().unwrap();
+    assert_eq!(active_detail.epochs.len(), 1);
+    assert_eq!(active_detail.session.epochs_count, 1);
+
+    // Render check on live TUI: waiting message gone, real-time heart-rate and P(Sleep) chart rendered
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let live_out = buffer_to_string(term.backend().buffer());
+    assert!(
+        !live_out.contains("Waiting for first 15s epoch..."),
+        "Waiting message must disappear once first epoch arrives"
+    );
+    assert!(
+        live_out.contains("P(Sleep)"),
+        "Real-time chart must render P(Sleep) legend"
+    );
+
+    drop(w_tx);
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;
     daemon.shutdown().await;
