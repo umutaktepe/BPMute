@@ -9,8 +9,8 @@ use zbus::zvariant::{OwnedFd, Value};
 use crate::config::PowerAction;
 
 use super::traits::{
-    ActionError, ActionExecutor, BoxFuture, CommandOutput, GracePhase, NotificationEvent, Notifier,
-    PowerActionResult, Urgency, is_player_ignored,
+    ActionError, ActionExecutor, BoxFuture, CommandOutput, GraceNoticeSpec, GracePhase,
+    NotificationEvent, Notifier, PowerActionResult, Urgency, is_player_ignored,
 };
 
 #[proxy(
@@ -572,27 +572,27 @@ impl Notifier for DesktopNotifier {
     fn show_grace_notice<'a>(
         &'a self,
         replaces_id: u32,
-        remaining_sec: u32,
-        _total_sec: u32,
-        phase: GracePhase,
-        urgency: Urgency,
-        dry_run: bool,
+        spec: GraceNoticeSpec,
     ) -> BoxFuture<'a, Result<u32, ActionError>> {
         Box::pin(async move {
             let proxy = self.notifications_proxy().await?;
 
-            let summary = if dry_run {
+            let summary = if spec.dry_run {
                 "[Dry Run] Sleep action pending".to_string()
             } else {
                 "Sleep action pending".to_string()
             };
 
-            let body = match phase {
+            let body = match spec.phase {
                 GracePhase::Countdown => {
-                    format!("Sleep action in {remaining_sec}s... Click Cancel if you're awake.")
+                    format!(
+                        "Sleep action in {}s... Click Cancel if you're awake.",
+                        spec.remaining_sec
+                    )
                 }
                 GracePhase::ActivityHold => format!(
-                    "Activity detected — cancelling in {remaining_sec}s. Click Snooze to postpone."
+                    "Activity detected — cancelling in {}s. Click Snooze to pause sleep actions.",
+                    spec.remaining_sec
                 ),
             };
             let actions = [
@@ -605,7 +605,7 @@ impl Notifier for DesktopNotifier {
             ];
 
             let mut hints = HashMap::new();
-            hints.insert("urgency", Value::U8(urgency.as_byte()));
+            hints.insert("urgency", Value::U8(spec.urgency.as_byte()));
             hints.insert("resident", Value::Bool(true));
             hints.insert("transient", Value::Bool(false));
 

@@ -18,12 +18,24 @@ pub enum Urgency {
 }
 
 /// Active phase of a `Grace Period` (ADR-0011).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GracePhase {
     /// Initial `Sleep Action Pipeline` countdown toward `GraceResult::Expired`.
+    #[default]
     Countdown,
     /// Fixed `10 s` `Activity Hold` window after post-settle desktop activity.
     ActivityHold,
+}
+
+/// Notification parameters for displaying or updating a `Grace Period` notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraceNoticeSpec {
+    pub remaining_sec: u32,
+    pub total_sec: u32,
+    pub phase: GracePhase,
+    pub urgency: Urgency,
+    pub dry_run: bool,
 }
 
 impl Urgency {
@@ -129,11 +141,7 @@ pub trait Notifier: Send + Sync {
     fn show_grace_notice<'a>(
         &'a self,
         replaces_id: u32,
-        remaining_sec: u32,
-        total_sec: u32,
-        phase: GracePhase,
-        urgency: Urgency,
-        dry_run: bool,
+        spec: GraceNoticeSpec,
     ) -> BoxFuture<'a, Result<u32, ActionError>>;
 
     /// Dismisses the active countdown notice via `CloseNotification(id)`.

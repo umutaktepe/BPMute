@@ -4,6 +4,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::actions::GracePhase;
 use crate::calibration::{CalibrationState, FeedbackVerdict};
 use crate::config::{ClockTime, Config, LogFormat, PatchField, ScheduleConfig};
 use crate::replay::TraceFormat;
@@ -557,7 +558,7 @@ pub struct GraceTickEvent {
     #[serde(default)]
     pub planned_steps: Vec<String>,
     #[serde(default)]
-    pub activity_hold: bool,
+    pub phase: GracePhase,
 }
 
 /// Control event payload pushed as `SessionStarted` when a `Monitoring Session` opens.

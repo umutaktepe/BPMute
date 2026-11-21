@@ -9,6 +9,6 @@ pub use grace::{GraceControlCmd, GraceCoordinator, GraceRunOutcome, GraceRunPara
 pub use pipeline::{PipelineContext, PipelineResult, SleepActionPipeline};
 pub use system::{DesktopNotifier, SystemActionExecutor};
 pub use traits::{
-    ActionError, ActionExecutor, BoxFuture, CommandOutput, GracePhase, NotificationEvent, Notifier,
-    PowerActionResult, Urgency, is_player_ignored,
+    ActionError, ActionExecutor, BoxFuture, CommandOutput, GraceNoticeSpec, GracePhase,
+    NotificationEvent, Notifier, PowerActionResult, Urgency, is_player_ignored,
 };

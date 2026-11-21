@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use crate::config::PowerAction;
 
 use super::traits::{
-    ActionError, ActionExecutor, BoxFuture, CommandOutput, GracePhase, NotificationEvent, Notifier,
-    PowerActionResult, Urgency, is_player_ignored,
+    ActionError, ActionExecutor, BoxFuture, CommandOutput, GraceNoticeSpec, GracePhase,
+    NotificationEvent, Notifier, PowerActionResult, is_player_ignored,
 };
 
 #[derive(Default)]
@@ -274,11 +274,7 @@ impl Notifier for FakeNotifier {
     fn show_grace_notice<'a>(
         &'a self,
         replaces_id: u32,
-        remaining_sec: u32,
-        total_sec: u32,
-        phase: GracePhase,
-        urgency: Urgency,
-        dry_run: bool,
+        spec: GraceNoticeSpec,
     ) -> BoxFuture<'a, Result<u32, ActionError>> {
         Box::pin(async move {
             let mut guard = self.inner.lock().expect("mutex poisoned");
@@ -290,13 +286,13 @@ impl Notifier for FakeNotifier {
                 id
             };
             guard.active_notice_id = Some(id);
-            let phase_tag = match phase {
+            let phase_tag = match spec.phase {
                 GracePhase::Countdown => "countdown",
                 GracePhase::ActivityHold => "activity_hold",
             };
             guard.events.push(format!(
-                "grace_notice: id={id}, rem={remaining_sec}/{total_sec}, urg={:?}, dry={dry_run}, phase={phase_tag}",
-                urgency
+                "grace_notice: id={id}, rem={}/{}, urg={:?}, dry={}, phase={phase_tag}",
+                spec.remaining_sec, spec.total_sec, spec.urgency, spec.dry_run
             ));
             Ok(id)
         })

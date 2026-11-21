@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use bpmute::actions::fake::FakeActionExecutor;
-use bpmute::actions::traits::{ActionExecutor, BoxFuture, PowerActionResult};
+use bpmute::actions::traits::{ActionExecutor, BoxFuture, GracePhase, PowerActionResult};
 use bpmute::bluetooth::agent::AgentAuthRequest;
 use bpmute::cli::args::Cli;
 use bpmute::cli::execute_cli;
@@ -226,7 +226,7 @@ fn test_mouse_tab_clicks_grace_banner_buttons_and_no_mouse() {
         total_sec: 60,
         planned_actions: vec!["Pause Media".into(), "Suspend".into()],
         dry_run: false,
-        activity_hold: false,
+        phase: GracePhase::Countdown,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -760,7 +760,7 @@ fn test_global_grace_period_banner_across_tabs() {
         total_sec: 30,
         planned_actions: vec!["Pause Media".into(), "Lock Screen".into(), "Suspend".into()],
         dry_run: false,
-        activity_hold: false,
+        phase: GracePhase::Countdown,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2258,7 +2258,7 @@ fn test_mouse_footer_tab_actions_and_navigation_hint_ignores() {
         total_sec: 60,
         planned_actions: vec!["Pause Media".into()],
         dry_run: false,
-        activity_hold: false,
+        phase: GracePhase::Countdown,
     });
     app.alerts = vec![DaemonAlert {
         id: alert_ids::PERSISTENT_SHIFT.into(),
@@ -3690,7 +3690,7 @@ fn test_mouse_pause_popover_two_click_wheel_and_backdrop() {
         total_sec: 60,
         planned_actions: vec!["Pause Media".into()],
         dry_run: false,
-        activity_hold: false,
+        phase: GracePhase::Countdown,
     });
     app.modal = ModalState::PausePopover { selected_idx: 0 };
 
@@ -8248,7 +8248,7 @@ async fn test_real_socket_history_tab_switch_reconciles_sessions_e2e() {
 fn test_grace_tick_activity_hold_banner_and_hit_map() {
     use bpmute::ipc::GraceTickEvent;
 
-    // 1. Legacy GraceTickEvent JSON without `activity_hold` deserializes with `false`
+    // 1. Legacy GraceTickEvent JSON without `phase` deserializes with `GracePhase::Countdown`
     let legacy_tick: GraceTickEvent = serde_json::from_value(serde_json::json!({
         "session_id": "s-legacy",
         "remaining_sec": 23,
@@ -8257,8 +8257,8 @@ fn test_grace_tick_activity_hold_banner_and_hit_map() {
         "dry_run": false,
         "planned_steps": ["Pause Media", "Suspend"]
     }))
-    .expect("legacy GraceTickEvent JSON without activity_hold must deserialize");
-    assert!(!legacy_tick.activity_hold);
+    .expect("legacy GraceTickEvent JSON without phase must deserialize");
+    assert_eq!(legacy_tick.phase, GracePhase::Countdown);
 
     for (ascii, no_color) in [(false, false), (true, true)] {
         let mut app = TuiApp::new(false, ascii, no_color);
@@ -8290,7 +8290,7 @@ fn test_grace_tick_activity_hold_banner_and_hit_map() {
                 "Lock Screen".into(),
                 "Suspend".into(),
             ],
-            activity_hold: true,
+            phase: GracePhase::ActivityHold,
         };
         app.handle_ipc(IpcEvent::GraceTick(hold_tick));
         term_80
@@ -8342,7 +8342,7 @@ fn test_grace_tick_activity_hold_banner_and_hit_map() {
             power_action: bpmute::config::PowerAction::Suspend,
             dry_run: false,
             planned_steps: vec!["Pause Media".into(), "Suspend".into()],
-            activity_hold: true,
+            phase: GracePhase::ActivityHold,
         }));
         assert!(app.grace_state.is_none());
     }

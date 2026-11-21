@@ -10,7 +10,7 @@ use crate::ipc::protocol::GraceTickEvent;
 use crate::ipc::pubsub::EventBroker;
 use crate::sleep_engine::{GraceOutcome, GraceResult};
 
-use super::traits::{GracePhase, NotificationEvent, Notifier, Urgency};
+use super::traits::{GraceNoticeSpec, GracePhase, NotificationEvent, Notifier, Urgency};
 
 /// Fixed non-resetting duration of the `Activity Hold` phase once desktop activity is detected.
 const ACTIVITY_HOLD_SEC: u32 = 10;
@@ -92,11 +92,13 @@ impl GraceCoordinator {
         self.refresh_notice(
             &mut active_notice_id,
             notice_dismissed,
-            remaining_sec,
-            total_sec,
-            phase,
-            urgency,
-            params.dry_run,
+            GraceNoticeSpec {
+                remaining_sec,
+                total_sec,
+                phase,
+                urgency,
+                dry_run: params.dry_run,
+            },
         )
         .await;
 
@@ -178,11 +180,13 @@ impl GraceCoordinator {
                     self.refresh_notice(
                         &mut active_notice_id,
                         notice_dismissed,
-                        remaining_sec,
-                        total_sec,
-                        phase,
-                        urgency,
-                        params.dry_run,
+                        GraceNoticeSpec {
+                            remaining_sec,
+                            total_sec,
+                            phase,
+                            urgency,
+                            dry_run: params.dry_run,
+                        },
                     )
                     .await;
                 }
@@ -253,11 +257,13 @@ impl GraceCoordinator {
                         self.refresh_notice(
                             &mut active_notice_id,
                             notice_dismissed,
-                            remaining_sec,
-                            total_sec,
-                            phase,
-                            urgency,
-                            params.dry_run,
+                            GraceNoticeSpec {
+                                remaining_sec,
+                                total_sec,
+                                phase,
+                                urgency,
+                                dry_run: params.dry_run,
+                            },
                         )
                         .await;
                     }
@@ -266,31 +272,16 @@ impl GraceCoordinator {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "forwards Grace Period notification fields without allocating a transient struct"
-    )]
     async fn refresh_notice(
         &self,
         active_notice_id: &mut u32,
         notice_dismissed: bool,
-        remaining_sec: u32,
-        total_sec: u32,
-        phase: GracePhase,
-        urgency: Urgency,
-        dry_run: bool,
+        spec: GraceNoticeSpec,
     ) {
         if !notice_dismissed
             && let Ok(new_id) = self
                 .notifier
-                .show_grace_notice(
-                    *active_notice_id,
-                    remaining_sec,
-                    total_sec,
-                    phase,
-                    urgency,
-                    dry_run,
-                )
+                .show_grace_notice(*active_notice_id, spec)
                 .await
         {
             *active_notice_id = new_id;
@@ -317,7 +308,7 @@ impl GraceCoordinator {
             power_action: params.config.power_action,
             dry_run: params.dry_run || params.config.dry_run,
             planned_steps: params.config.planned_pipeline_steps(),
-            activity_hold: phase == GracePhase::ActivityHold,
+            phase,
         };
         if let Ok(v) = serde_json::to_value(tick) {
             self.broker.publish_control("GraceTick", v);

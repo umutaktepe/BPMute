@@ -514,23 +514,26 @@ async fn await_session_closed_and_calibration(sub: &mut IpcClient) -> String {
     closed_session_id
 }
 
-#[tokio::test(start_paused = true)]
-async fn test_virtual_time_activity_hold_allows_snooze_with_zero_fp_penalty() {
-    let temp = TempDir::new().unwrap();
-    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+async fn enter_activity_hold_in_daemon(
+    temp: &TempDir,
+    start_utc: DateTime<Utc>,
+    trace_base_ts: i64,
+    actions_cfg: ActionsConfig,
+) -> (
+    DaemonHandle,
+    ResolvedPaths,
+    mpsc::Sender<WearableEvent>,
+    IpcClient,
+    Vec<EngineEvent>,
+    usize,
+) {
     let executor = Arc::new(FakeActionExecutor::new());
     let notifier = Arc::new(FakeNotifier::new());
     let idle_probe = Arc::new(FakeIdleProbe::new(IdleBackendKind::WaylandExtIdleV2));
     let (source, wearable_tx) = TestWearableSource::new();
-    let actions_cfg = ActionsConfig {
-        power_action: PowerAction::Suspend,
-        grace_period_sec: Some(300),
-        snooze_duration_min: 20,
-        ..ActionsConfig::default()
-    };
 
     let (daemon, paths, _clock) = spawn_idle_test_daemon(
-        &temp,
+        temp,
         start_utc,
         actions_cfg,
         executor,
@@ -544,17 +547,38 @@ async fn test_virtual_time_activity_hold_allows_snooze_with_zero_fp_penalty() {
     sub.request("daemon.subscribe", json!({})).await.unwrap();
     let _snap = sub.next_event().await.unwrap();
 
-    feed_trace_until_confirmed(&wearable_tx, &mut sub, start_utc.timestamp_millis()).await;
+    let (trace_events, split_idx) =
+        feed_trace_until_confirmed(&wearable_tx, &mut sub, trace_base_ts).await;
 
     // Wait past 1s settle delay, then trigger desktop activity -> enters 10s Activity Hold
     tokio::time::sleep(Duration::from_millis(1500)).await;
     idle_probe.trigger_activity();
 
+    (daemon, paths, wearable_tx, sub, trace_events, split_idx)
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_virtual_time_activity_hold_allows_snooze_with_zero_fp_penalty() {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let (daemon, paths, wearable_tx, mut sub, _, _) = enter_activity_hold_in_daemon(
+        &temp,
+        start_utc,
+        start_utc.timestamp_millis(),
+        ActionsConfig {
+            power_action: PowerAction::Suspend,
+            grace_period_sec: Some(300),
+            snooze_duration_min: 20,
+            ..ActionsConfig::default()
+        },
+    )
+    .await;
+
     let mut saw_hold_tick = false;
     for _ in 0..10_000 {
         let ev = sub.next_event().await.unwrap();
         if ev.event == "GraceTick"
-            && ev.data["activity_hold"] == true
+            && ev.data["phase"] == "activity_hold"
             && ev.data["remaining_sec"] == 10
         {
             saw_hold_tick = true;
@@ -563,7 +587,7 @@ async fn test_virtual_time_activity_hold_allows_snooze_with_zero_fp_penalty() {
     }
     assert!(
         saw_hold_tick,
-        "must publish GraceTick(10, activity_hold=true)"
+        "must publish GraceTick(10, phase=activity_hold)"
     );
     assert!(daemon.core().is_in_grace_period());
 
@@ -612,41 +636,18 @@ async fn test_virtual_time_activity_hold_allows_snooze_with_zero_fp_penalty() {
 async fn test_virtual_time_activity_hold_expiry_applies_cancelled_fp_penalty_and_cooldown() {
     let temp = TempDir::new().unwrap();
     let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
-    let executor = Arc::new(FakeActionExecutor::new());
-    let notifier = Arc::new(FakeNotifier::new());
-    let idle_probe = Arc::new(FakeIdleProbe::new(IdleBackendKind::WaylandExtIdleV2));
-    let (source, wearable_tx) = TestWearableSource::new();
-    let actions_cfg = ActionsConfig {
-        power_action: PowerAction::Suspend,
-        grace_period_sec: Some(300),
-        ..ActionsConfig::default()
-    };
-
-    let (daemon, paths, _clock) = spawn_idle_test_daemon(
-        &temp,
-        start_utc,
-        actions_cfg,
-        executor,
-        notifier,
-        Arc::clone(&idle_probe),
-        Arc::new(source),
-    )
-    .await;
-
-    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
-    sub.request("daemon.subscribe", json!({})).await.unwrap();
-    let _snap = sub.next_event().await.unwrap();
-
-    let (trace_events, split_idx) = feed_trace_until_confirmed(
-        &wearable_tx,
-        &mut sub,
-        start_utc.timestamp_millis() - 1_500_000,
-    )
-    .await;
-
-    // Wait past 1s settle delay, then trigger desktop activity -> enters 10s Activity Hold
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    idle_probe.trigger_activity();
+    let (daemon, paths, wearable_tx, mut sub, trace_events, split_idx) =
+        enter_activity_hold_in_daemon(
+            &temp,
+            start_utc,
+            start_utc.timestamp_millis() - 1_500_000,
+            ActionsConfig {
+                power_action: PowerAction::Suspend,
+                grace_period_sec: Some(300),
+                ..ActionsConfig::default()
+            },
+        )
+        .await;
 
     // Let Activity Hold expire (10s) without issuing Snooze or Cancel
     let mut saw_monitoring = false;

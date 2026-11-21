@@ -59,7 +59,7 @@ pub struct GraceState {
     pub total_sec: u32,
     pub planned_actions: Vec<String>,
     pub dry_run: bool,
-    pub activity_hold: bool,
+    pub phase: crate::actions::GracePhase,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

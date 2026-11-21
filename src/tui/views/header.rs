@@ -88,10 +88,9 @@ fn render_grace_banner(
     hit_map: &mut HitMap,
 ) {
     let dry_tag = if grace.dry_run { " [DRY]" } else { "" };
-    let phase_label = if grace.activity_hold {
-        "ACTIVITY HOLD"
-    } else {
-        "GRACE"
+    let phase_label = match grace.phase {
+        crate::actions::GracePhase::Countdown => "GRACE",
+        crate::actions::GracePhase::ActivityHold => "ACTIVITY HOLD",
     };
     let prefix = format!(" {phase_label}: {}s{} | ", grace.remaining_sec, dry_tag);
     let full_controls = "[c] Cancel (I'm Awake)  [s] Snooze ";

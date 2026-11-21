@@ -4,9 +4,9 @@ use std::time::Duration;
 use chrono::DateTime;
 use tokio::sync::mpsc;
 
-use bpmute::actions::GracePhase;
 use bpmute::actions::fake::FakeNotifier;
 use bpmute::actions::grace::{GraceControlCmd, GraceCoordinator, GraceRunOutcome, GraceRunParams};
+use bpmute::actions::{GraceNoticeSpec, GracePhase};
 use bpmute::config::{ActionsConfig, PowerAction};
 use bpmute::daemon::{DaemonClock, VirtualClock};
 use bpmute::idle::fake::FakeIdleProbe;
@@ -534,19 +534,46 @@ async fn test_desktop_notifier_keeps_persistent_dbus_connection_and_resident_hin
     let mut rx = notifier.subscribe_actions();
 
     let id1 = notifier
-        .show_grace_notice(0, 90, 90, GracePhase::Countdown, Urgency::Normal, true)
+        .show_grace_notice(
+            0,
+            GraceNoticeSpec {
+                remaining_sec: 90,
+                total_sec: 90,
+                phase: GracePhase::Countdown,
+                urgency: Urgency::Normal,
+                dry_run: true,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(id1, 1);
 
     let id2 = notifier
-        .show_grace_notice(id1, 85, 90, GracePhase::Countdown, Urgency::Normal, true)
+        .show_grace_notice(
+            id1,
+            GraceNoticeSpec {
+                remaining_sec: 85,
+                total_sec: 90,
+                phase: GracePhase::Countdown,
+                urgency: Urgency::Normal,
+                dry_run: true,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(id2, 1);
 
     let id3 = notifier
-        .show_grace_notice(id1, 10, 90, GracePhase::ActivityHold, Urgency::Normal, true)
+        .show_grace_notice(
+            id1,
+            GraceNoticeSpec {
+                remaining_sec: 10,
+                total_sec: 90,
+                phase: GracePhase::ActivityHold,
+                urgency: Urgency::Normal,
+                dry_run: true,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(id3, 1);
@@ -587,7 +614,7 @@ async fn test_desktop_notifier_keeps_persistent_dbus_connection_and_resident_hin
     );
     assert_eq!(
         guard.calls[2].body,
-        "Activity detected — cancelling in 10s. Click Snooze to postpone."
+        "Activity detected — cancelling in 10s. Click Snooze to pause sleep actions."
     );
     assert_eq!(guard.calls[0].resident, Some(true));
     assert_eq!(guard.calls[0].transient, Some(false));
@@ -599,8 +626,16 @@ async fn test_desktop_notifier_keeps_persistent_dbus_connection_and_resident_hin
     assert_eq!(guard.closed_ids, vec![1]);
 }
 
-#[tokio::test(start_paused = true)]
-async fn test_grace_period_activity_hold_transition_cadence_and_auto_cancel() {
+async fn run_activity_hold_case<F, Fut>(
+    session_id: &str,
+    grace_period_sec: u32,
+    snooze_duration_min: u32,
+    driver: F,
+) -> (GraceRunOutcome, Duration, Vec<String>, Vec<(u64, String)>)
+where
+    F: FnOnce(Arc<FakeNotifier>, Arc<FakeIdleProbe>, mpsc::Sender<GraceControlCmd>) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     let clock = Arc::new(VirtualClock::starting_at(
         DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
     ));
@@ -608,32 +643,51 @@ async fn test_grace_period_activity_hold_transition_cadence_and_auto_cancel() {
     let idle_probe = Arc::new(FakeIdleProbe::default());
     let broker = Arc::new(EventBroker::default());
     let (_sub_id, queue) = broker.subscribe();
-
     let coordinator = make_coordinator(&notifier, &idle_probe, &clock, &broker);
-
-    let (_ctrl_tx, ctrl_rx) = mpsc::channel(8);
-    let config = ActionsConfig {
-        power_action: PowerAction::Suspend,
-        grace_period_sec: Some(30),
-        ..ActionsConfig::default()
-    };
+    let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
     let params = GraceRunParams {
-        session_id: "s-hold".to_string(),
+        session_id: session_id.to_string(),
         wearable_id: "w1".to_string(),
-        config,
+        config: ActionsConfig {
+            power_action: PowerAction::Suspend,
+            grace_period_sec: Some(grace_period_sec),
+            snooze_duration_min,
+            ..ActionsConfig::default()
+        },
         dry_run: false,
     };
 
     let start = tokio::time::Instant::now();
-    let i_clone = Arc::clone(&idle_probe);
-    tokio::spawn(async move {
-        // Trigger post-settle desktop activity at t=2s
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        i_clone.trigger_activity();
-    });
-
+    let _keep_ctrl_tx = ctrl_tx.clone();
+    tokio::spawn(driver(
+        Arc::clone(&notifier),
+        Arc::clone(&idle_probe),
+        ctrl_tx,
+    ));
     let outcome = coordinator.run(params, ctrl_rx).await;
     let elapsed = start.elapsed();
+
+    let mut ticks = Vec::new();
+    while let Some(ev) = queue.pop_next() {
+        if ev.event == "GraceTick" {
+            ticks.push((
+                ev.data["remaining_sec"].as_u64().unwrap(),
+                ev.data["phase"].as_str().unwrap().to_string(),
+            ));
+        }
+    }
+    (outcome, elapsed, notifier.events(), ticks)
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_grace_period_activity_hold_transition_cadence_and_auto_cancel() {
+    let (outcome, elapsed, events, ticks) =
+        run_activity_hold_case("s-hold", 30, 30, |_, i, _| async move {
+            // Trigger post-settle desktop activity at t=2s
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            i.trigger_activity();
+        })
+        .await;
 
     assert!(matches!(
         outcome,
@@ -650,7 +704,6 @@ async fn test_grace_period_activity_hold_transition_cadence_and_auto_cancel() {
 
     // Verify notification cadence: initial Countdown (30/30), immediate ActivityHold (10/30),
     // then 9..=1 every 1s, then close_notice:1
-    let events = notifier.events();
     let hold_notices: Vec<_> = events
         .iter()
         .filter(|e| e.contains("phase=activity_hold"))
@@ -664,35 +717,13 @@ async fn test_grace_period_activity_hold_transition_cadence_and_auto_cancel() {
     assert!(hold_notices[9].contains("rem=1/30"));
     assert!(events.iter().any(|e| e == "close_notice:1"));
 
-    // Verify GraceTick sequence: (30, false), (29, false), (28, false), (10, true)..(0, true)
-    let mut ticks = Vec::new();
-    while let Some(ev) = queue.pop_next() {
-        if ev.event == "GraceTick" {
-            ticks.push((
-                ev.data["remaining_sec"].as_u64().unwrap(),
-                ev.data["activity_hold"].as_bool().unwrap(),
-            ));
-        }
-    }
-    assert_eq!(
-        ticks,
-        vec![
-            (30, false),
-            (29, false),
-            (28, false),
-            (10, true),
-            (9, true),
-            (8, true),
-            (7, true),
-            (6, true),
-            (5, true),
-            (4, true),
-            (3, true),
-            (2, true),
-            (1, true),
-            (0, true),
-        ]
-    );
+    // Verify GraceTick sequence: (30..=28, countdown), (10..=0, activity_hold)
+    let expected: Vec<(u64, String)> = [30, 29, 28]
+        .into_iter()
+        .map(|s| (s, "countdown".to_string()))
+        .chain((0..=10).rev().map(|s| (s, "activity_hold".to_string())))
+        .collect();
+    assert_eq!(ticks, expected);
 }
 
 fn make_coordinator(
@@ -712,43 +743,20 @@ fn make_coordinator(
 #[tokio::test(start_paused = true)]
 async fn test_grace_period_activity_hold_grants_full_10s_when_remaining_below_10_and_non_resetting()
 {
-    let clock = Arc::new(VirtualClock::starting_at(
-        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-    ));
-    let notifier = Arc::new(FakeNotifier::new());
-    let idle_probe = Arc::new(FakeIdleProbe::default());
-    let broker = Arc::new(EventBroker::default());
-    let coordinator = make_coordinator(&notifier, &idle_probe, &clock, &broker);
-
-    let (_ctrl_tx, ctrl_rx) = mpsc::channel(8);
-    let params = GraceRunParams {
-        session_id: "s-short".to_string(),
-        wearable_id: "w1".to_string(),
-        config: ActionsConfig {
-            power_action: PowerAction::Suspend,
-            grace_period_sec: Some(5),
-            ..ActionsConfig::default()
-        },
-        dry_run: false,
-    };
-
-    let start = tokio::time::Instant::now();
-    let i_clone = Arc::clone(&idle_probe);
-    tokio::spawn(async move {
+    let (outcome, elapsed, _, _) = run_activity_hold_case("s-short", 5, 30, |_, i, _| async move {
         // Activity during 1s settle delay must be ignored
         tokio::time::sleep(Duration::from_millis(500)).await;
-        i_clone.trigger_activity();
+        i.trigger_activity();
         // Activity at t=3s (remaining_sec == 2 < 10) enters full 10s Activity Hold
         tokio::time::sleep(Duration::from_millis(2500)).await;
-        i_clone.trigger_activity();
+        i.trigger_activity();
         // Repeated input every 2s during Activity Hold must NOT reset or extend the 10s timer
         for _ in 0..4 {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            i_clone.trigger_activity();
+            i.trigger_activity();
         }
-    });
-
-    let outcome = coordinator.run(params, ctrl_rx).await;
+    })
+    .await;
     assert!(matches!(
         outcome,
         GraceRunOutcome::Completed(GraceOutcome {
@@ -756,39 +764,16 @@ async fn test_grace_period_activity_hold_grants_full_10s_when_remaining_below_10
             ..
         })
     ));
-    assert_eq!(start.elapsed(), Duration::from_secs(13));
+    assert_eq!(elapsed, Duration::from_secs(13));
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_grace_period_activity_hold_caps_long_grace_at_10s() {
-    let clock = Arc::new(VirtualClock::starting_at(
-        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-    ));
-    let notifier = Arc::new(FakeNotifier::new());
-    let idle_probe = Arc::new(FakeIdleProbe::default());
-    let broker = Arc::new(EventBroker::default());
-    let coordinator = make_coordinator(&notifier, &idle_probe, &clock, &broker);
-
-    let (_ctrl_tx, ctrl_rx) = mpsc::channel(8);
-    let params = GraceRunParams {
-        session_id: "s-long".to_string(),
-        wearable_id: "w1".to_string(),
-        config: ActionsConfig {
-            power_action: PowerAction::Suspend,
-            grace_period_sec: Some(90),
-            ..ActionsConfig::default()
-        },
-        dry_run: false,
-    };
-
-    let start = tokio::time::Instant::now();
-    let i_clone = Arc::clone(&idle_probe);
-    tokio::spawn(async move {
+    let (outcome, elapsed, _, _) = run_activity_hold_case("s-long", 90, 30, |_, i, _| async move {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        i_clone.trigger_activity();
-    });
-
-    let outcome = coordinator.run(params, ctrl_rx).await;
+        i.trigger_activity();
+    })
+    .await;
     assert!(matches!(
         outcome,
         GraceRunOutcome::Completed(GraceOutcome {
@@ -796,59 +781,20 @@ async fn test_grace_period_activity_hold_caps_long_grace_at_10s() {
             ..
         })
     ));
-    assert_eq!(start.elapsed(), Duration::from_secs(12));
-}
-
-async fn run_activity_hold_case<F, Fut>(
-    session_id: &str,
-    snooze_duration_min: u32,
-    driver: F,
-) -> (GraceRunOutcome, Duration, Vec<String>)
-where
-    F: FnOnce(Arc<FakeNotifier>, Arc<FakeIdleProbe>, mpsc::Sender<GraceControlCmd>) -> Fut,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
-    let clock = Arc::new(VirtualClock::starting_at(
-        DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
-    ));
-    let notifier = Arc::new(FakeNotifier::new());
-    let idle_probe = Arc::new(FakeIdleProbe::default());
-    let broker = Arc::new(EventBroker::default());
-    let coordinator = make_coordinator(&notifier, &idle_probe, &clock, &broker);
-    let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
-    let params = GraceRunParams {
-        session_id: session_id.to_string(),
-        wearable_id: "w1".to_string(),
-        config: ActionsConfig {
-            power_action: PowerAction::Suspend,
-            grace_period_sec: Some(30),
-            snooze_duration_min,
-            ..ActionsConfig::default()
-        },
-        dry_run: false,
-    };
-
-    let start = tokio::time::Instant::now();
-    let _keep_ctrl_tx = ctrl_tx.clone();
-    tokio::spawn(driver(
-        Arc::clone(&notifier),
-        Arc::clone(&idle_probe),
-        ctrl_tx,
-    ));
-    let outcome = coordinator.run(params, ctrl_rx).await;
-    (outcome, start.elapsed(), notifier.events())
+    assert_eq!(elapsed, Duration::from_secs(12));
 }
 
 #[tokio::test(start_paused = true)]
 async fn test_grace_period_activity_hold_actions_commands_and_dismiss() {
     // 1. Notification "snooze" action during ActivityHold -> Snoozed immediately
-    let (outcome, elapsed, _) = run_activity_hold_case("s-snooze-btn", 15, |n, i, _| async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        i.trigger_activity();
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        n.emit_action(1, "snooze");
-    })
-    .await;
+    let (outcome, elapsed, _, _) =
+        run_activity_hold_case("s-snooze-btn", 30, 15, |n, i, _| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            i.trigger_activity();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            n.emit_action(1, "snooze");
+        })
+        .await;
     assert!(matches!(
         outcome,
         GraceRunOutcome::Completed(GraceOutcome {
@@ -861,8 +807,8 @@ async fn test_grace_period_activity_hold_actions_commands_and_dismiss() {
     // 2. Notification "default" and "cancel" actions during ActivityHold -> Cancelled immediately
     for action_key in ["default", "cancel"] {
         let key = action_key.to_string();
-        let (outcome, elapsed, _) =
-            run_activity_hold_case(&format!("s-{action_key}"), 30, |n, i, _| async move {
+        let (outcome, elapsed, _, _) =
+            run_activity_hold_case(&format!("s-{action_key}"), 30, 30, |n, i, _| async move {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 i.trigger_activity();
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -880,17 +826,18 @@ async fn test_grace_period_activity_hold_actions_commands_and_dismiss() {
     }
 
     // 3. GraceControlCmd::Snooze & Cancel during ActivityHold
-    let (outcome, elapsed, _) = run_activity_hold_case("s-cmd-snooze", 30, |_, i, tx| async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        i.trigger_activity();
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let _ = tx
-            .send(GraceControlCmd::Snooze {
-                duration_sec: Some(600),
-            })
-            .await;
-    })
-    .await;
+    let (outcome, elapsed, _, _) =
+        run_activity_hold_case("s-cmd-snooze", 30, 30, |_, i, tx| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            i.trigger_activity();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = tx
+                .send(GraceControlCmd::Snooze {
+                    duration_sec: Some(600),
+                })
+                .await;
+        })
+        .await;
     assert!(matches!(
         outcome,
         GraceRunOutcome::Completed(GraceOutcome {
@@ -900,13 +847,14 @@ async fn test_grace_period_activity_hold_actions_commands_and_dismiss() {
     ));
     assert_eq!(elapsed, Duration::from_secs(5));
 
-    let (outcome, elapsed, _) = run_activity_hold_case("s-cmd-cancel", 30, |_, i, tx| async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        i.trigger_activity();
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let _ = tx.send(GraceControlCmd::Cancel).await;
-    })
-    .await;
+    let (outcome, elapsed, _, _) =
+        run_activity_hold_case("s-cmd-cancel", 30, 30, |_, i, tx| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            i.trigger_activity();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = tx.send(GraceControlCmd::Cancel).await;
+        })
+        .await;
     assert!(matches!(
         outcome,
         GraceRunOutcome::Completed(GraceOutcome {
@@ -917,8 +865,8 @@ async fn test_grace_period_activity_hold_actions_commands_and_dismiss() {
     assert_eq!(elapsed, Duration::from_secs(3));
 
     // 4. NotificationClosed(reason = 2) mid-second during ActivityHold does not extend or break 10s auto-cancel
-    let (outcome, elapsed, events) =
-        run_activity_hold_case("s-dismiss-hold", 30, |n, i, _| async move {
+    let (outcome, elapsed, events, _) =
+        run_activity_hold_case("s-dismiss-hold", 30, 30, |n, i, _| async move {
             tokio::time::sleep(Duration::from_secs(2)).await;
             i.trigger_activity();
             tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -950,8 +898,8 @@ async fn test_grace_period_activity_hold_actions_commands_and_dismiss() {
         (GraceControlCmd::PrepareForSleep, false),
         (GraceControlCmd::SignalLost, true),
     ] {
-        let (outcome, elapsed, _) =
-            run_activity_hold_case("s-preempt", 30, move |_, i, tx| async move {
+        let (outcome, elapsed, _, _) =
+            run_activity_hold_case("s-preempt", 30, 30, move |_, i, tx| async move {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 i.trigger_activity();
                 tokio::time::sleep(Duration::from_secs(2)).await;
