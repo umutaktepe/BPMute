@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! cargo fmt --check >/dev/null 2>&1; then
+  cargo fmt
+  git add -u
+fi

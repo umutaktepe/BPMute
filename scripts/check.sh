@@ -5,6 +5,10 @@ set -euo pipefail
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/dev/null}"
 export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/dev/null}"
 
+if [ "${1:-}" = "--fix" ]; then
+  cargo fmt
+fi
+
 cargo fmt --check
 
 while IFS= read -r -d '' file; do

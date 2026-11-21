@@ -34,6 +34,7 @@ Testing conventions, concurrency patterns, and pitfalls for BPMute daemons, work
 - **Populated-state rendering**: Assert `--ascii`, `NO_COLOR`, and `80×24` layout behavior on populated app state (enrolled wearables, live telemetry, alerts, tables/modals) rather than empty-state CTAs, which hide Unicode leaks and column clipping.
 - **ASCII progress bars**: `ratatui::widgets::Gauge` renders Unicode `'█'` even when `use_unicode(false)` is set; render explicit ASCII progress bars (`[#---]`) whenever `theme.ascii` is enabled.
 - **Non-blocking interactive IPC ops**: Operations that wait on follow-up requests over the same socket (such as `wearable.enroll_select` awaiting `wearable.enroll_auth_response`) must run as spawned tasks on the connection handler rather than blocking the socket read loop.
+- **History selection stability across updates**: Interactive deletion via `DeleteSessionModal` preserves row index $k$ (clamped to list bounds) so focus stays on the succeeding item. External or background list updates where the selected session disappears (retention pruning, purge, or remote delete) fall back to index 0 and reload detail. Refreshes that still contain the selected session preserve selection by `session_id`.
 
 ## Test Execution
 
