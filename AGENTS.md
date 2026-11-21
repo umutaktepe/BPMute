@@ -6,7 +6,7 @@ Everything outside direct chat with the user must be written in English: all sou
 
 ### Issue tracker
 
-Issues and specs are tracked in GitHub Issues (`umutaktepe/BPMute`) via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Read `docs/agents/issue-tracker.md` before running `gh` (enforces `GH_PAGER=cat` and `--json`). Issues and specs are tracked in GitHub Issues (`umutaktepe/BPMute`).
 
 ### Domain docs
 
@@ -22,4 +22,4 @@ Runtime actor ownership (`DaemonCore`, `MonitoringContext`, `GraceCoordinator`, 
 
 ## Verification
 
-Run targeted iterative tests with `./scripts/test.sh --test <target> [filter]` (compiles first, then enforces 30 s execution timeout and hermetic D-Bus isolation); run `./scripts/check.sh` before finishing any change.
+Run targeted iterative tests with `./scripts/test.sh --test <target> [filter]` (compiles first, then enforces 30 s execution timeout and hermetic D-Bus isolation), fast format/static/clippy checks with `./scripts/check.sh --lint` (or `--fix`), and `./scripts/check.sh` before finishing any change.

@@ -3,21 +3,27 @@
     reason = "shared test harness items are used selectively by separate integration test binaries"
 )]
 
+use std::sync::Arc;
+
+use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use tempfile::TempDir;
+use tokio::sync::{mpsc, watch};
 
 use bpmute::calibration::SessionLedgerRecord;
-use bpmute::config::PowerAction;
+use bpmute::config::{CliOverrides, LoadedConfig, PowerAction};
+use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock, WearableEvent, WearableSource};
 use bpmute::ipc::protocol::EnrolledWearableStatus;
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
-    DetectorState, Epoch, EpochFeatures, SessionEndReason, SessionSummary, StreamStatus,
+    ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason, SessionSummary,
+    StreamStatus,
 };
 use bpmute::storage::{
     EnrolledWearable, SessionFullDetail, SessionListEntry, SessionStatus, WearableInfo,
 };
-use bpmute::tui::TuiEvent;
+use bpmute::tui::{TuiApp, TuiCommand, TuiEvent, TuiIpcBridge};
 
 pub fn buffer_to_string(buf: &Buffer) -> String {
     let mut out = String::new();
@@ -286,5 +292,255 @@ pub fn make_session_summary(
         rapid_wake_fp_count: 0,
         snooze_count: 0,
         epochs_count: usize::from(with_raw_samples),
+    }
+}
+
+pub fn is_non_blank_braille(ch: char) -> bool {
+    ('\u{2801}'..='\u{28FF}').contains(&ch)
+}
+
+pub async fn wait_for_app_state_with_cmds<F>(
+    app: &mut TuiApp,
+    event_rx: &mut mpsc::Receiver<TuiEvent>,
+    cmd_tx: Option<&mpsc::Sender<TuiCommand>>,
+    mut pred: F,
+) where
+    F: FnMut(&TuiApp) -> bool,
+{
+    for _ in 0..256 {
+        if pred(app) {
+            return;
+        }
+        let ev = event_rx
+            .recv()
+            .await
+            .expect("TUI IPC event channel closed before reaching expected state");
+        if let Some(cmd) = app.handle_event(ev)
+            && let Some(tx) = cmd_tx
+        {
+            let _ = tx.send(cmd).await;
+        }
+    }
+    panic!(
+        "TUI app did not reach expected state within event budget (256 events). Final state: tab={:?}, modal={:?}, sel_session_idx={}, sessions={:?}, sel_session_detail={:?}",
+        app.active_tab,
+        app.modal,
+        app.selected_session_idx,
+        app.history_sessions
+            .iter()
+            .map(|s| &s.id)
+            .collect::<Vec<_>>(),
+        app.selected_session_detail.as_ref().map(|d| &d.session.id),
+    );
+}
+
+pub async fn wait_for_app_state<F>(
+    app: &mut TuiApp,
+    event_rx: &mut mpsc::Receiver<TuiEvent>,
+    pred: F,
+) where
+    F: FnMut(&TuiApp) -> bool,
+{
+    wait_for_app_state_with_cmds(app, event_rx, None, pred).await;
+}
+
+pub struct RealSocketTuiHarness {
+    pub _temp: TempDir,
+    pub paths: ResolvedPaths,
+    pub daemon: DaemonHandle,
+    pub event_rx: mpsc::Receiver<TuiEvent>,
+    pub cmd_tx: mpsc::Sender<TuiCommand>,
+    pub shutdown_tx: watch::Sender<bool>,
+    pub bridge_task: tokio::task::JoinHandle<()>,
+    pub app: TuiApp,
+    pub session_ids: Vec<String>,
+}
+
+impl RealSocketTuiHarness {
+    pub async fn spawn(session_count: usize, with_raw_samples: bool) -> Self {
+        let temp = TempDir::new().unwrap();
+        let (paths, env) = make_test_paths(&temp);
+        let base_ts = Utc::now().timestamp_millis() - 3_600_000;
+
+        let mut session_ids = Vec::with_capacity(session_count);
+        {
+            let db_file = bpmute::storage::db_path_in_data_dir(&paths.data_dir);
+            let db_lock = bpmute::storage::lock_path_in_data_dir(&paths.data_dir);
+            let mut store =
+                bpmute::storage::LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+            let wid = store
+                .upsert_wearable(
+                    &bpmute::storage::WearableDescriptor {
+                        mac: "AA:BB:CC:DD:EE:01".into(),
+                        address_type: "public".into(),
+                        alias: Some("Band".into()),
+                        advertised_name: None,
+                        supports_rr: true,
+                        supports_contact: true,
+                    },
+                    base_ts - 100_000,
+                )
+                .unwrap();
+
+            for i in 0..session_count {
+                let start_ts = base_ts + (i as i64) * 600_000;
+                let end_ts = start_ts + 400_000;
+                let sid = store
+                    .open_session(&bpmute::storage::OpenSessionRequest {
+                        wearable_id: wid.clone(),
+                        start_ts_ms: start_ts,
+                        detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+                    })
+                    .unwrap();
+                if with_raw_samples {
+                    store
+                        .append_epoch_and_raw(
+                            &sid,
+                            None,
+                            &[(
+                                0,
+                                &HrPacket {
+                                    ts_ms: start_ts + 1_000,
+                                    bpm: 64.0,
+                                    rr_ms: vec![930.0],
+                                    contact_status: ContactStatus::Contact,
+                                },
+                            )],
+                        )
+                        .unwrap();
+                }
+                store
+                    .close_session_and_recompute(
+                        &bpmute::storage::CloseSessionRequest {
+                            session_id: sid.clone(),
+                            summary: make_session_summary(
+                                (i + 1) as u64,
+                                start_ts,
+                                end_ts,
+                                with_raw_samples,
+                            ),
+                            trigger_power_action: PowerAction::None,
+                            rapid_resume_within_5m: false,
+                        },
+                        end_ts,
+                    )
+                    .unwrap();
+                session_ids.push(sid);
+            }
+        }
+
+        let loaded =
+            LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+        let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+        let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+            paths.clone(),
+            loaded,
+            Arc::new(env),
+            clock,
+        ))
+        .await
+        .unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
+        let bridge_task = tokio::spawn(bridge.run());
+
+        let mut app = TuiApp::new(false, false, false);
+        wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+            a.daemon_connected
+                && a.active_config.is_some()
+                && a.history_sessions.len() == session_count
+                && (session_count == 0 || a.selected_session_detail.is_some())
+        })
+        .await;
+
+        // `session.list` orders newest-first, matching `app.history_sessions`.
+        session_ids.reverse();
+
+        Self {
+            _temp: temp,
+            paths,
+            daemon,
+            event_rx,
+            cmd_tx,
+            shutdown_tx,
+            bridge_task,
+            app,
+            session_ids,
+        }
+    }
+
+    pub fn insert_closed_session(&self, session_index: u64, start_ts: i64, end_ts: i64) -> String {
+        let db_file = bpmute::storage::db_path_in_data_dir(&self.paths.data_dir);
+        let db_lock = bpmute::storage::lock_path_in_data_dir(&self.paths.data_dir);
+        let mut store = bpmute::storage::LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .list_enrolled_wearables()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let sid = store
+            .open_session(&bpmute::storage::OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: start_ts,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+        store
+            .close_session_and_recompute(
+                &bpmute::storage::CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary: make_session_summary(session_index, start_ts, end_ts, false),
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                end_ts,
+            )
+            .unwrap();
+        sid
+    }
+
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let _ = self.bridge_task.await;
+        self.daemon.shutdown().await;
+    }
+}
+
+pub struct LiveStreamTestSource {
+    pub event_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<WearableEvent>>>,
+}
+
+impl WearableSource for LiveStreamTestSource {
+    fn subscribe(&self, mut shutdown_rx: watch::Receiver<bool>) -> mpsc::Receiver<WearableEvent> {
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let rx_arc = Arc::clone(&self.event_rx);
+        tokio::spawn(async move {
+            let mut guard = rx_arc.lock().await;
+            loop {
+                tokio::select! {
+                    ev = guard.recv() => {
+                        match ev {
+                            Some(event) => {
+                                if out_tx.send(event).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        out_rx
     }
 }

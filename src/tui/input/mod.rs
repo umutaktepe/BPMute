@@ -2,8 +2,8 @@ use chrono::TimeZone;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::{
-    ActiveHoursField, ExportModalField, FeedbackModalField, ModalState, SoftRebaselineField, Tab,
-    TuiApp, UnenrollButton,
+    ActiveHoursField, CorePreference, ExportModalField, FeedbackModalField, ModalState,
+    SoftRebaselineField, Tab, TuiApp, UnenrollButton,
 };
 use super::event::TuiCommand;
 use crate::calibration::FeedbackVerdict;
@@ -11,8 +11,6 @@ use crate::calibration::FeedbackVerdict;
 mod modal;
 mod modal_actions;
 mod mouse;
-
-pub(super) const SETTINGS_PREFERENCE_COUNT: usize = 7;
 
 pub(super) fn step_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
@@ -66,7 +64,7 @@ impl TuiApp {
                 {
                     return self.select_history_session(self.selected_session_idx + 1);
                 } else if self.active_tab == Tab::Settings
-                    && self.selected_setting_idx + 1 < SETTINGS_PREFERENCE_COUNT
+                    && self.selected_setting_idx + 1 < CorePreference::COUNT
                 {
                     self.selected_setting_idx += 1;
                 }
@@ -374,8 +372,9 @@ impl TuiApp {
             return None;
         }
         let cfg = self.active_config.as_ref()?;
-        match self.selected_setting_idx {
-            0 => {
+        let pref = CorePreference::from_index(self.selected_setting_idx)?;
+        match pref {
+            CorePreference::Sensitivity => {
                 let next_sens = match cfg.detection.sensitivity {
                     crate::config::Sensitivity::Conservative => {
                         crate::config::Sensitivity::Balanced
@@ -393,21 +392,25 @@ impl TuiApp {
                     ..Default::default()
                 }))
             }
-            1 => Some(TuiCommand::ConfigUpdate(crate::config::ConfigPatch {
-                actions: Some(crate::config::ActionsPatch {
-                    pause_media: Some(!cfg.actions.pause_media),
+            CorePreference::PauseMedia => {
+                Some(TuiCommand::ConfigUpdate(crate::config::ConfigPatch {
+                    actions: Some(crate::config::ActionsPatch {
+                        pause_media: Some(!cfg.actions.pause_media),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })),
-            2 => Some(TuiCommand::ConfigUpdate(crate::config::ConfigPatch {
-                actions: Some(crate::config::ActionsPatch {
-                    lock_screen: Some(!cfg.actions.lock_screen),
+                }))
+            }
+            CorePreference::LockScreen => {
+                Some(TuiCommand::ConfigUpdate(crate::config::ConfigPatch {
+                    actions: Some(crate::config::ActionsPatch {
+                        lock_screen: Some(!cfg.actions.lock_screen),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            })),
-            3 => {
+                }))
+            }
+            CorePreference::PowerAction => {
                 let next_action = match cfg.actions.power_action {
                     crate::config::PowerAction::Suspend => crate::config::PowerAction::Poweroff,
                     crate::config::PowerAction::Poweroff => crate::config::PowerAction::None,
@@ -421,7 +424,7 @@ impl TuiApp {
                     ..Default::default()
                 }))
             }
-            4 => {
+            CorePreference::GracePeriod => {
                 let cur = cfg.actions.grace_period_sec.unwrap_or(0);
                 let next = match cur {
                     0..=15 => 30,
@@ -437,15 +440,14 @@ impl TuiApp {
                     ..Default::default()
                 }))
             }
-            5 => Some(TuiCommand::ConfigUpdate(crate::config::ConfigPatch {
+            CorePreference::DryRun => Some(TuiCommand::ConfigUpdate(crate::config::ConfigPatch {
                 actions: Some(crate::config::ActionsPatch {
                     dry_run: Some(!cfg.actions.dry_run),
                     ..Default::default()
                 }),
                 ..Default::default()
             })),
-            6 => self.open_active_hours_modal(),
-            _ => None,
+            CorePreference::ActiveHours => self.open_active_hours_modal(),
         }
     }
 

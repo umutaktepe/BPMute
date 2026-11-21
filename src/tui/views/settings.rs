@@ -4,10 +4,12 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
-use super::super::app::{ActiveHoursField, ModalState, SoftRebaselineField, TuiApp};
+use super::super::app::{
+    ActiveHoursField, CorePreference, ModalState, SoftRebaselineField, TuiApp,
+};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::{build_clickable_row_line, build_modal_clickable_row_line, centered_rect};
-use crate::config::{PowerAction, Sensitivity};
+use crate::config::{Config, PowerAction, Sensitivity};
 
 pub(crate) fn render_settings(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.width < 10 || area.height < 5 {
@@ -58,9 +60,10 @@ fn render_config_error_banner(app: &TuiApp, err: &str, area: Rect, buf: &mut Buf
     let inner = block.inner(area);
     block.render(area, buf);
 
+    let warn_icon = if app.theme.ascii { " ! " } else { " ⚠ " };
     let lines = vec![
         Line::from(vec![
-            Span::styled(" ⚠ ", app.theme.danger()),
+            Span::styled(warn_icon, app.theme.danger()),
             Span::styled(err, app.theme.danger()),
         ]),
         Line::from(vec![Span::styled(
@@ -89,46 +92,10 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: 
         return;
     };
 
-    let sens_str = match cfg.detection.sensitivity {
-        Sensitivity::Conservative => "Conservative",
-        Sensitivity::Balanced => "Balanced",
-        Sensitivity::Responsive => "Responsive",
-    };
-
-    let pause_str = if cfg.actions.pause_media { "ON" } else { "OFF" };
-    let lock_str = if cfg.actions.lock_screen { "ON" } else { "OFF" };
-
-    let power_str = match cfg.actions.power_action {
-        PowerAction::Suspend => "Suspend",
-        PowerAction::Poweroff => "Poweroff",
-        PowerAction::None => "None",
-    };
-
-    let grace_str = match cfg.actions.grace_period_sec {
-        Some(s) if s > 0 => format!("{s}s"),
-        _ => "Disabled".to_string(),
-    };
-
-    let dry_str = if cfg.actions.dry_run { "ON" } else { "OFF" };
-
-    let active_hours_str = if cfg.schedule.active_hours_enabled {
-        format!("{}-{}", cfg.schedule.start, cfg.schedule.end)
-    } else {
-        format!("Off {}-{}", cfg.schedule.start, cfg.schedule.end)
-    };
-
-    let items = [
-        ("Sensitivity", sens_str),
-        ("Pause Media", pause_str),
-        ("Lock Screen", lock_str),
-        ("Power Action", power_str),
-        ("Grace Period", grace_str.as_str()),
-        ("Dry Run", dry_str),
-        ("Active Hours", active_hours_str.as_str()),
-    ];
-
     let mut lines = Vec::new();
-    for (idx, (label, val)) in items.iter().enumerate() {
+    for (idx, &pref) in CorePreference::ALL.iter().enumerate() {
+        let label = pref.label();
+        let val = core_preference_value(cfg, pref);
         let row_y = inner.y.saturating_add(idx as u16);
         hit_map.push_clipped_row_click(
             inner,
@@ -177,6 +144,41 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: 
     }
 
     Paragraph::new(lines).render(inner, buf);
+}
+
+fn core_preference_value(cfg: &Config, pref: CorePreference) -> String {
+    match pref {
+        CorePreference::Sensitivity => match cfg.detection.sensitivity {
+            Sensitivity::Conservative => "Conservative",
+            Sensitivity::Balanced => "Balanced",
+            Sensitivity::Responsive => "Responsive",
+        }
+        .to_string(),
+        CorePreference::PauseMedia => {
+            if cfg.actions.pause_media { "ON" } else { "OFF" }.to_string()
+        }
+        CorePreference::LockScreen => {
+            if cfg.actions.lock_screen { "ON" } else { "OFF" }.to_string()
+        }
+        CorePreference::PowerAction => match cfg.actions.power_action {
+            PowerAction::Suspend => "Suspend",
+            PowerAction::Poweroff => "Poweroff",
+            PowerAction::None => "None",
+        }
+        .to_string(),
+        CorePreference::GracePeriod => match cfg.actions.grace_period_sec {
+            Some(s) if s > 0 => format!("{s}s"),
+            _ => "Disabled".to_string(),
+        },
+        CorePreference::DryRun => if cfg.actions.dry_run { "ON" } else { "OFF" }.to_string(),
+        CorePreference::ActiveHours => {
+            if cfg.schedule.active_hours_enabled {
+                format!("{}-{}", cfg.schedule.start, cfg.schedule.end)
+            } else {
+                format!("Off {}-{}", cfg.schedule.start, cfg.schedule.end)
+            }
+        }
+    }
 }
 
 fn render_advanced_settings(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
@@ -398,8 +400,9 @@ fn flush_wrapped_row<'a>(
 
 fn push_modal_error_line<'a>(lines: &mut Vec<Line<'a>>, err: Option<&'a str>, app: &TuiApp) {
     if let Some(err) = err {
+        let warn_icon = if app.theme.ascii { " ! " } else { " ⚠ " };
         lines.push(Line::from(vec![
-            Span::styled(" ⚠ ", app.theme.danger()),
+            Span::styled(warn_icon, app.theme.danger()),
             Span::styled(err, app.theme.danger()),
         ]));
     } else {

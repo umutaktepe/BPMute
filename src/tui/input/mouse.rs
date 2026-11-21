@@ -1,9 +1,9 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
-use super::super::app::TuiApp;
+use super::super::app::{CorePreference, TuiApp};
 use super::super::event::TuiCommand;
 use super::super::hit_map::{ClickTarget, ScrollTarget};
-use super::{SETTINGS_PREFERENCE_COUNT, step_index};
+use super::step_index;
 
 impl TuiApp {
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<TuiCommand> {
@@ -47,7 +47,7 @@ impl TuiApp {
                     ClickTarget::HistoryDelete => self.open_history_delete_modal(),
                     ClickTarget::SettingsToggleSelected => self.toggle_selected_setting(),
                     ClickTarget::SettingsSelectOrToggle(idx) => {
-                        if idx >= SETTINGS_PREFERENCE_COUNT {
+                        if idx >= CorePreference::COUNT {
                             None
                         } else if self.selected_setting_idx == idx {
                             self.toggle_selected_setting()
@@ -147,7 +147,7 @@ impl TuiApp {
                     ScrollTarget::HistorySessions => self.scroll_history_selection(delta),
                     ScrollTarget::SettingsPreferences => {
                         self.selected_setting_idx =
-                            step_index(self.selected_setting_idx, SETTINGS_PREFERENCE_COUNT, delta);
+                            step_index(self.selected_setting_idx, CorePreference::COUNT, delta);
                         None
                     }
                     ScrollTarget::ActiveHours(field) => {

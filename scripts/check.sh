@@ -5,7 +5,20 @@ set -euo pipefail
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/dev/null}"
 export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/dev/null}"
 
-if [ "${1:-}" = "--fix" ]; then
+fix_fmt=0
+lint_only=0
+for arg in "$@"; do
+  case "$arg" in
+    --fix) fix_fmt=1 ;;
+    --lint) lint_only=1 ;;
+    *)
+      echo "usage: $0 [--fix] [--lint]" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$fix_fmt" -eq 1 ]; then
   cargo fmt
 fi
 
@@ -167,6 +180,10 @@ mapfile -d '' sync_files < <(find src/sleep_engine src/calibration -name '*.rs' 
 if [ "${#sync_files[@]}" -gt 0 ] && awk '{ sub(/\/\/.*/, ""); if ($0 ~ /(^|[^[:alnum:]_])(tokio|std::fs|std::io|rusqlite|rand|rand_chacha)([^[:alnum:]_]|$)|Instant::now|SystemTime::now|Local::now|Utc::now/) { print FILENAME ":" FNR ":" $0; found=1 } } END { exit !found }' "${sync_files[@]}"; then
   echo "error: forbidden async, wall-clock, I/O, SQLite, or RNG usage inside pure-sync core (ADR-0007)" >&2
   exit 1
+fi
+
+if [ "$lint_only" -eq 1 ]; then
+  exit 0
 fi
 
 timeout 60 cargo test

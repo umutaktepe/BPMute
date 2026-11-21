@@ -108,6 +108,47 @@ pub enum SoftRebaselineField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorePreference {
+    Sensitivity,
+    PauseMedia,
+    LockScreen,
+    PowerAction,
+    GracePeriod,
+    DryRun,
+    ActiveHours,
+}
+
+impl CorePreference {
+    pub const ALL: [Self; 7] = [
+        Self::Sensitivity,
+        Self::PauseMedia,
+        Self::LockScreen,
+        Self::PowerAction,
+        Self::GracePeriod,
+        Self::DryRun,
+        Self::ActiveHours,
+    ];
+
+    pub const COUNT: usize = Self::ALL.len();
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sensitivity => "Sensitivity",
+            Self::PauseMedia => "Pause Media",
+            Self::LockScreen => "Lock Screen",
+            Self::PowerAction => "Power Action",
+            Self::GracePeriod => "Grace Period",
+            Self::DryRun => "Dry Run",
+            Self::ActiveHours => "Active Hours",
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Option<Self> {
+        Self::ALL.get(idx).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveHoursField {
     Enabled,
     Start,
