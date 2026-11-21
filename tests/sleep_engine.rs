@@ -864,6 +864,85 @@ fn slice4_tiered_gaps_and_post_sleep_1_to_1_session_splitting() {
     assert_eq!(eng1.current_session_index(), Some(2));
     assert_eq!(eng1.state(), DetectorState::Warmup);
 
+    // Sustained gap timeout (>= 15 min) without stream resume closes session to Idle
+    let mut eng_idle = default_engine();
+    assert_eq!(eng_idle.state(), DetectorState::Idle);
+    assert_eq!(eng_idle.gap_deadline_ms(), None);
+    assert!(eng_idle.check_gap_timeout(100_000).is_empty());
+    assert_eq!(eng_idle.state(), DetectorState::Idle);
+
+    // Session opened via Streaming and then disconnected without receiving packets
+    let mut eng_silent = default_engine();
+    eng_silent.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 10_000,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng_silent.state(), DetectorState::Warmup);
+    assert_eq!(eng_silent.gap_deadline_ms(), None);
+    eng_silent.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 20_000,
+        status: StreamStatus::Disconnected,
+    }));
+    assert_eq!(eng_silent.gap_deadline_ms(), Some(20_000 + 900_000 + 1));
+    assert!(eng_silent.check_gap_timeout(20_000 + 900_000).is_empty());
+    assert_eq!(eng_silent.state(), DetectorState::Warmup);
+    let silent_timeout = eng_silent.check_gap_timeout(20_000 + 900_001);
+    assert!(silent_timeout.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.end_reason == SessionEndReason::GapExceeded && s.end_ts_ms == 20_000
+    )));
+    assert_eq!(eng_silent.state(), DetectorState::Idle);
+
+    let mut eng_timeout = default_engine();
+    eng_timeout.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_timeout, 1, 600, 68.0, true);
+    assert_eq!(eng_timeout.state(), DetectorState::Monitoring);
+    assert_eq!(eng_timeout.current_session_index(), Some(1));
+
+    // Disconnect at t = 600s (600_000 ms)
+    let _ = eng_timeout.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 600_000,
+        status: StreamStatus::Disconnected,
+    }));
+    assert_eq!(eng_timeout.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_timeout.gap_deadline_ms(), Some(1_500_001));
+
+    // Check timeout after 10 minutes (1_200_000 ms = 600s after gap) -> gap NOT exceeded yet
+    let no_timeout_out = eng_timeout.check_gap_timeout(1_200_000);
+    assert!(no_timeout_out.is_empty());
+    assert_eq!(eng_timeout.state(), DetectorState::Monitoring);
+    assert_eq!(eng_timeout.current_session_index(), Some(1));
+
+    // Check timeout at 15m 0s (1_500_000 ms) -> not exceeded yet (<= 900_000 ms)
+    let at_limit_out = eng_timeout.check_gap_timeout(1_500_000);
+    assert!(at_limit_out.is_empty());
+    assert_eq!(eng_timeout.state(), DetectorState::Monitoring);
+
+    // Check timeout after 15 minutes and 1 ms (1_500_001 ms > 900s) -> closes session to Idle
+    let timeout_out = eng_timeout.check_gap_timeout(1_500_001);
+    assert!(timeout_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::GapResolved {
+            tier: GapTier::LongSessionClose,
+            ..
+        }
+    )));
+    assert!(timeout_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.session_index == 1
+                && s.end_reason == SessionEndReason::GapExceeded
+                && s.end_ts_ms == 600_000
+    )));
+    assert_eq!(eng_timeout.state(), DetectorState::Idle);
+    assert_eq!(eng_timeout.current_session_index(), Some(1));
+    assert_eq!(eng_timeout.gap_started_ms(), None);
+    assert_eq!(eng_timeout.gap_deadline_ms(), None);
+
     // Post-sleep 1:1 split on sustained wakefulness (>= 10 min with P(SleepNREM) < 0.30)
     let mut eng_split = default_engine();
     eng_split.handle_event(EngineEvent::StreamState(StreamState {

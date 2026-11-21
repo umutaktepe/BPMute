@@ -487,12 +487,11 @@ impl SleepEngine {
                             self.post_trigger_sleep_sec.saturating_add(15);
                     }
 
-                    let recent_desktop_wake = self
+                    if self
                         .last_sleeping_desktop_activity_ms
-                        .is_some_and(|act_ts| ts_ms - act_ts <= DESKTOP_REBOUND_WINDOW_MS)
-                        && self.has_wake_rebound(features.hr_bpm_60s, features.z_hr, p_sleep);
-
-                    if recent_desktop_wake {
+                        .is_some_and(|act| ts_ms - act <= DESKTOP_REBOUND_WINDOW_MS)
+                        && self.has_wake_rebound(features.hr_bpm_60s, features.z_hr, p_sleep)
+                    {
                         split_reason = Some(SessionEndReason::DesktopWakeRebound);
                     } else if self.post_sleep_wake_sec >= POST_SLEEP_WAKE_SPLIT_SEC {
                         split_reason = Some(SessionEndReason::SustainedWakefulness);
@@ -743,8 +742,7 @@ impl SleepEngine {
             self.last_local_mad,
             self.last_ln_rmssd,
         );
-        let counted = !self.fp_recorded_this_session;
-        self.fp_recorded_this_session = true;
+        let counted = !std::mem::replace(&mut self.fp_recorded_this_session, true);
         if counted {
             self.fp_count = self.fp_count.saturating_add(1);
         }
@@ -756,10 +754,7 @@ impl SleepEngine {
     }
 
     fn has_wake_rebound(&self, hr_bpm: f64, z_hr: f64, p_sleep: f64) -> bool {
-        let anchor_rebound = self
-            .sleeping_hr_anchor
-            .is_some_and(|anchor| hr_bpm >= anchor + 4.0);
-        anchor_rebound || z_hr >= -0.8 || p_sleep < 0.30
+        self.sleeping_hr_anchor.is_some_and(|a| hr_bpm >= a + 4.0) || z_hr >= -0.8 || p_sleep < 0.30
     }
 
     fn reset_candidate_counters(&mut self) {
@@ -772,63 +767,43 @@ impl SleepEngine {
     fn required_warmup_epochs(&self) -> u32 {
         match self.config.priors.maturity {
             CalibrationMaturity::Calibrated => WARMUP_EPOCHS_CALIBRATED,
-            CalibrationMaturity::ColdStart | CalibrationMaturity::Learning => {
-                WARMUP_EPOCHS_COLD_OR_LEARNING
-            }
+            _ => WARMUP_EPOCHS_COLD_OR_LEARNING,
         }
     }
 
     fn evaluate_warmup_anomaly(&mut self) {
-        if let (Some(wake_ref), Some(wake_mad), Some(session_mu)) = (
-            self.config
-                .priors
-                .wake_median
-                .or(self.config.priors.mu_wake),
-            self.config.priors.wake_mad_s,
+        let p = &self.config.priors;
+        if let (Some(ref_hr), Some(mad), Some(mu)) = (
+            p.wake_median.or(p.mu_wake),
+            p.wake_mad_s,
             self.baseline.mu_hr(),
-        ) {
-            let scale = wake_mad.max(SIGMA_MIN_BPM);
-            if (session_mu - wake_ref).abs() > 2.5 * scale {
-                self.anomalous = true;
-            }
+        ) && (mu - ref_hr).abs() > 2.5 * mad.max(SIGMA_MIN_BPM)
+        {
+            self.anomalous = true;
         }
     }
 
     fn expected_z_sleep(&self, baseline_mu_hr: f64, baseline_sigma_hr: f64) -> f64 {
-        if self.anomalous {
-            return DEFAULT_EXPECTED_Z_SLEEP;
-        }
-        if self.config.priors.maturity == CalibrationMaturity::ColdStart
-            && self.config.priors.mu_sleep.is_none()
+        let p = &self.config.priors;
+        if self.anomalous || (p.maturity == CalibrationMaturity::ColdStart && p.mu_sleep.is_none())
         {
             return DEFAULT_EXPECTED_Z_SLEEP;
         }
         let denom = baseline_sigma_hr.max(SIGMA_MIN_BPM);
-        let from_delta = self
-            .config
-            .priors
-            .delta_hr_onset
-            .map(|d| (-d.abs()) / denom);
-        let from_sleep_mu = self
-            .config
-            .priors
-            .mu_sleep
-            .map(|ms| (ms - baseline_mu_hr) / denom);
-
+        let from_delta = p.delta_hr_onset.map(|d| (-d.abs()) / denom);
+        let from_sleep_mu = p.mu_sleep.map(|ms| (ms - baseline_mu_hr) / denom);
         let personal = match (from_delta, from_sleep_mu) {
             (Some(a), Some(b)) => 0.5 * (a + b),
             (Some(a), None) => a,
             (None, Some(b)) => b,
             (None, None) => return DEFAULT_EXPECTED_Z_SLEEP,
         };
-
-        let weight = match self.config.priors.maturity {
+        let weight = match p.maturity {
             CalibrationMaturity::ColdStart => 0.25,
             CalibrationMaturity::Learning => 0.5,
             CalibrationMaturity::Calibrated => 0.8,
         };
-        let blended = (1.0 - weight) * DEFAULT_EXPECTED_Z_SLEEP + weight * personal;
-        blended.clamp(-3.5, -1.6)
+        ((1.0 - weight) * DEFAULT_EXPECTED_Z_SLEEP + weight * personal).clamp(-3.5, -1.6)
     }
 
     fn snapshot_warmup_baseline(&mut self) {
@@ -895,18 +870,17 @@ impl SleepEngine {
         outputs: &mut Vec<EngineOutput>,
     ) {
         let from = self.state;
-        if from == to {
-            return;
+        if from != to {
+            self.state = to;
+            outputs.push(EngineOutput::StateChanged {
+                session_index: self.session_index.unwrap_or(1),
+                ts_ms,
+                from,
+                to,
+                p_sleep,
+                reason: reason.to_string(),
+            });
         }
-        self.state = to;
-        outputs.push(EngineOutput::StateChanged {
-            session_index: self.session_index.unwrap_or(1),
-            ts_ms,
-            from,
-            to,
-            p_sleep,
-            reason: reason.to_string(),
-        });
     }
 
     fn open_session(&mut self, ts_ms: i64, reason: &str, outputs: &mut Vec<EngineOutput>) {
@@ -998,6 +972,32 @@ impl SleepEngine {
     /// Returns whether the active `Monitoring Session` is flagged as an `Anomalous Session`.
     pub fn is_session_anomalous(&self) -> bool {
         self.anomalous
+    }
+
+    /// Returns the active gap start timestamp in milliseconds, if the engine is currently in a gap.
+    pub fn gap_started_ms(&self) -> Option<i64> {
+        self.gap_started_ms
+    }
+
+    /// Returns the millisecond timestamp when the active gap will exceed the 15-minute threshold.
+    pub fn gap_deadline_ms(&self) -> Option<i64> {
+        if self.state == DetectorState::Idle {
+            return None;
+        }
+        let start = self.gap_started_ms?;
+        Some(start.saturating_add(MEDIUM_GAP_MAX_MS).saturating_add(1))
+    }
+
+    /// Checks whether an active gap has exceeded 15 minutes, closing the session if so.
+    pub fn check_gap_timeout(&mut self, now_ms: i64) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        if self.state != DetectorState::Idle
+            && let Some(start) = self.gap_started_ms
+            && now_ms.saturating_sub(start) > MEDIUM_GAP_MAX_MS
+        {
+            self.resolve_active_gap(now_ms, false, &mut outputs);
+        }
+        outputs
     }
 
     /// Feeds pre-extracted 15-second `Epoch` features directly (for post-filter replay).

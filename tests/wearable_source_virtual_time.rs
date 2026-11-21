@@ -56,40 +56,71 @@ impl WearableSource for ChannelWearableSource {
     }
 }
 
+struct TestHarness {
+    _temp: TempDir,
+    paths: ResolvedPaths,
+    _clock: Arc<VirtualClock>,
+    t0: i64,
+    feed_tx: mpsc::Sender<WearableEvent>,
+    daemon: DaemonHandle,
+    wearable: WearableDescriptor,
+}
+
+impl TestHarness {
+    async fn new(start_utc: chrono::DateTime<Utc>) -> Self {
+        let temp = TempDir::new().unwrap();
+        let paths = ResolvedPaths {
+            config_file: temp.path().join("cfg/bpmute/config.toml"),
+            data_dir: temp.path().join("data/bpmute"),
+            socket_path: temp.path().join("run/bpmute/daemon.sock"),
+        };
+        let env = MapEnv::new();
+        let cli = CliOverrides::default();
+        let loaded = LoadedConfig::load(&paths.config_file, &env, &cli).unwrap();
+
+        let clock = Arc::new(VirtualClock::starting_at(start_utc));
+        let t0 = start_utc.timestamp_millis();
+
+        let (feed_tx, feed_rx) = mpsc::channel(64);
+        let wearable_source = Arc::new(ChannelWearableSource::new(feed_rx));
+
+        let daemon = DaemonHandle::spawn(
+            DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock.clone())
+                .with_wearable_source(wearable_source),
+        )
+        .await
+        .unwrap();
+
+        let wearable = WearableDescriptor {
+            mac: "AA:BB:CC:DD:EE:99".to_string(),
+            address_type: "random".to_string(),
+            alias: Some("Test Strap".to_string()),
+            advertised_name: Some("Polar H10".to_string()),
+            supports_rr: true,
+            supports_contact: true,
+        };
+
+        Self {
+            _temp: temp,
+            paths,
+            _clock: clock,
+            t0,
+            feed_tx,
+            daemon,
+            wearable,
+        }
+    }
+}
+
 #[tokio::test]
 async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() {
-    let temp = TempDir::new().unwrap();
-    let paths = ResolvedPaths {
-        config_file: temp.path().join("cfg/bpmute/config.toml"),
-        data_dir: temp.path().join("data/bpmute"),
-        socket_path: temp.path().join("run/bpmute/daemon.sock"),
-    };
-    let env = MapEnv::new();
-    let cli = CliOverrides::default();
-    let loaded = LoadedConfig::load(&paths.config_file, &env, &cli).unwrap();
-
     let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
-    let clock = Arc::new(VirtualClock::starting_at(start_utc));
-    let t0 = start_utc.timestamp_millis();
-
-    let (feed_tx, feed_rx) = mpsc::channel(64);
-    let wearable_source = Arc::new(ChannelWearableSource::new(feed_rx));
-
-    let daemon = DaemonHandle::spawn(
-        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock.clone())
-            .with_wearable_source(wearable_source),
-    )
-    .await
-    .unwrap();
-
-    let wearable = WearableDescriptor {
-        mac: "AA:BB:CC:DD:EE:99".to_string(),
-        address_type: "random".to_string(),
-        alias: Some("Test Strap".to_string()),
-        advertised_name: Some("Polar H10".to_string()),
-        supports_rr: true,
-        supports_contact: true,
-    };
+    let h = TestHarness::new(start_utc).await;
+    let paths = h.paths;
+    let t0 = h.t0;
+    let feed_tx = h.feed_tx;
+    let daemon = h.daemon;
+    let wearable = h.wearable;
 
     // 1. Initial status -> running
     let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
@@ -226,6 +257,104 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
     let detail = store.get_session(&session_id).unwrap();
     assert_eq!(detail.session.end_reason, SessionEndReason::StreamEnded);
     assert_eq!(detail.wearable.alias.as_deref(), Some("Test Strap"));
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn virtual_time_sustained_disconnection_gap_timeout_closes_session() {
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let h = TestHarness::new(start_utc).await;
+    let paths = h.paths;
+    let t0 = h.t0;
+    let feed_tx = h.feed_tx;
+    let daemon = h.daemon;
+    let wearable = h.wearable;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let mut sub_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub_client
+        .request("daemon.subscribe", json!({}))
+        .await
+        .unwrap();
+
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Streaming,
+                ts_ms: t0,
+            },
+        })
+        .await
+        .unwrap();
+
+    let p1 = parse_hr_measurement(&[0x00, 68], t0 + 1000).unwrap();
+    feed_tx
+        .send(WearableEvent::HrPacket {
+            wearable: wearable.clone(),
+            packet: p1,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break;
+        }
+    }
+
+    let list_res = client
+        .request("session.list", json!({ "limit": 10 }))
+        .await
+        .unwrap();
+    let sessions = list_res["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1);
+    let session_id = sessions[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(sessions[0]["status"].as_str(), Some("active"));
+
+    // Disconnect at t0 + 2000 ms. Do NOT drop feed_tx!
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Disconnected,
+                ts_ms: t0 + 2000,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Advance 16 minutes (960s > 900s MEDIUM_GAP_MAX_MS) to trigger sustained gap timeout
+    tokio::time::advance(std::time::Duration::from_secs(960)).await;
+
+    // Await SessionClosed event emitted on gap timeout
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionClosed" {
+            assert_eq!(
+                ev.data["session"]["session"]["id"].as_str(),
+                Some(session_id.as_str())
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_reason"].as_str(),
+                Some("gap_exceeded")
+            );
+            break;
+        }
+    }
+
+    // Verify daemon status is now Idle
+    let final_status = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(final_status["monitoring_state"].as_str(), Some("Idle"));
+
+    // Verify session in SQLite is closed with end_reason 'gap_exceeded'
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let detail = store.get_session(&session_id).unwrap();
+    assert_eq!(detail.session.end_reason, SessionEndReason::GapExceeded);
 
     daemon.shutdown().await;
 }
