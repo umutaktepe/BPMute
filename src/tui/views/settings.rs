@@ -4,7 +4,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
-use super::super::app::{ModalState, SoftRebaselineField, TuiApp};
+use super::super::app::{ActiveHoursField, ModalState, SoftRebaselineField, TuiApp};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::{build_clickable_row_line, build_modal_clickable_row_line, centered_rect};
 use crate::config::{PowerAction, Sensitivity};
@@ -45,6 +45,7 @@ pub(crate) fn render_settings(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_ma
         }
         ModalState::PurgeRawModal { .. } => render_purge_raw_modal(app, area, buf, hit_map),
         ModalState::HardWipeModal { .. } => render_hard_wipe_modal(app, area, buf, hit_map),
+        ModalState::ActiveHoursModal { .. } => render_active_hours_modal(app, area, buf, hit_map),
         _ => {}
     }
 }
@@ -110,6 +111,12 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: 
 
     let dry_str = if cfg.actions.dry_run { "ON" } else { "OFF" };
 
+    let active_hours_str = if cfg.schedule.active_hours_enabled {
+        format!("{}-{}", cfg.schedule.start, cfg.schedule.end)
+    } else {
+        format!("Off {}-{}", cfg.schedule.start, cfg.schedule.end)
+    };
+
     let items = [
         ("Sensitivity", sens_str),
         ("Pause Media", pause_str),
@@ -117,6 +124,7 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: 
         ("Power Action", power_str),
         ("Grace Period", grace_str.as_str()),
         ("Dry Run", dry_str),
+        ("Active Hours", active_hours_str.as_str()),
     ];
 
     let mut lines = Vec::new();
@@ -158,7 +166,7 @@ fn render_core_preferences(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: 
     lines.push(Line::from(""));
     if app.daemon_connected {
         lines.push(Line::from(vec![Span::styled(
-            " [Space/Enter] Cycle/Toggle",
+            " [Space/Enter] Edit/Toggle",
             app.theme.muted(),
         )]));
     } else {
@@ -652,6 +660,122 @@ fn render_hard_wipe_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &
             between_pad: "    ",
             cancel_label: "[Esc] Cancel",
             cancel_style: app.theme.base(),
+        },
+        hit_map,
+    );
+
+    Paragraph::new(lines).render(inner, buf);
+}
+
+fn render_active_hours_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+    let ModalState::ActiveHoursModal {
+        enabled,
+        ref start_input,
+        ref end_input,
+        active_field,
+        ref error_message,
+        ..
+    } = app.modal
+    else {
+        return;
+    };
+
+    let modal_area = centered_rect(area, 64, 12);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
+    Clear.render(modal_area, buf);
+
+    let block = app
+        .theme
+        .card_block(" Active Hours ")
+        .border_style(app.theme.primary());
+    let inner = block.inner(modal_area);
+    block.render(modal_area, buf);
+
+    let field_style = |field: ActiveHoursField| {
+        if active_field == field {
+            app.theme.highlight()
+        } else {
+            app.theme.base()
+        }
+    };
+
+    let enabled_check = if enabled { "[x]" } else { "[ ]" };
+    let enabled_target = Some(ClickTarget::ActiveHoursToggleEnabled);
+    let step_hint = if app.theme.ascii {
+        "  (HH:MM, <-/-> +/-15m)"
+    } else {
+        "  (HH:MM, ←/→ ±15m)"
+    };
+
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            " Local-clock window to arm Grace Period & actions.",
+            app.theme.muted(),
+        )]),
+        Line::from(""),
+    ];
+
+    let enabled_y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_modal_clickable_row_line(
+        inner,
+        enabled_y,
+        vec![
+            (
+                Span::styled(" Enabled : ", app.theme.key_hint()),
+                enabled_target,
+            ),
+            (
+                Span::styled(
+                    format!("{enabled_check} Arm Grace Period during window"),
+                    field_style(ActiveHoursField::Enabled),
+                ),
+                enabled_target,
+            ),
+        ],
+        hit_map,
+    ));
+
+    let time_rows = [
+        (" Start   : ", start_input.as_str(), ActiveHoursField::Start),
+        (" End     : ", end_input.as_str(), ActiveHoursField::End),
+    ];
+    for (label, value, field) in time_rows {
+        let row_y = inner.y.saturating_add(lines.len() as u16);
+        let disp = if value.is_empty() { "     " } else { value };
+        let target = Some(ClickTarget::ActiveHoursFocusField(field));
+        if inner.height > 0 && row_y < inner.bottom() {
+            hit_map.push_modal_scroll(
+                Rect::new(inner.x, row_y, inner.width, 1),
+                ScrollTarget::ActiveHours(field),
+            );
+        }
+        lines.push(build_modal_clickable_row_line(
+            inner,
+            row_y,
+            vec![
+                (Span::styled(label, app.theme.key_hint()), target),
+                (
+                    Span::styled(format!("[ {disp:<5} ]"), field_style(field)),
+                    target,
+                ),
+                (Span::styled(step_hint, app.theme.muted()), None),
+            ],
+            hit_map,
+        ));
+    }
+
+    lines.push(Line::from(""));
+    push_modal_error_line(&mut lines, error_message.as_deref(), app);
+    push_modal_button_row(
+        &mut lines,
+        inner,
+        ModalButtons {
+            leading_pad: "     ",
+            confirm_label: "[ Save ]",
+            confirm_style: field_style(ActiveHoursField::Save),
+            between_pad: "     ",
+            cancel_label: "[ Cancel ]",
+            cancel_style: field_style(ActiveHoursField::Cancel),
         },
         hit_map,
     );

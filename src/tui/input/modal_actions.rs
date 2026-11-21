@@ -1,13 +1,14 @@
 use chrono::TimeZone;
 
 use super::super::app::{
-    ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState, SoftRebaselineField,
-    TuiApp, UnenrollButton,
+    ActiveHoursField, ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState,
+    SoftRebaselineField, TuiApp, UnenrollButton,
 };
 use super::super::event::TuiCommand;
 use super::super::hit_map::UnenrollCheckbox;
 use super::step_index;
 use crate::calibration::FeedbackVerdict;
+use crate::config::{ClockTime, ConfigPatch, SchedulePatch};
 use crate::ipc::protocol::{EnrollAuthResponseParams, PauseMode, PauseParams};
 use crate::replay::TraceFormat;
 
@@ -241,6 +242,7 @@ impl TuiApp {
             ModalState::SoftRebaselineModal { .. } => self.submit_soft_rebaseline_modal(),
             ModalState::PurgeRawModal { .. } => self.confirm_purge_raw_modal(),
             ModalState::HardWipeModal { .. } => self.submit_hard_wipe_modal(),
+            ModalState::ActiveHoursModal { .. } => self.submit_active_hours_modal(),
             _ => None,
         }
     }
@@ -499,6 +501,105 @@ impl TuiApp {
         }
     }
 
+    pub(super) fn toggle_active_hours_enabled(&mut self) {
+        if let ModalState::ActiveHoursModal {
+            ref mut enabled,
+            ref mut active_field,
+            ref mut error_message,
+            ..
+        } = self.modal
+        {
+            *enabled = !*enabled;
+            *active_field = ActiveHoursField::Enabled;
+            *error_message = None;
+        }
+    }
+
+    pub(super) fn focus_active_hours_field(&mut self, field: ActiveHoursField) {
+        if let ModalState::ActiveHoursModal {
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *active_field = field;
+        }
+    }
+
+    pub(super) fn step_active_hours_field(&mut self, field: ActiveHoursField, delta_minutes: i32) {
+        let Some((buf, last_valid, active_field, error_message)) =
+            active_hours_time_target(&mut self.modal, field)
+        else {
+            return;
+        };
+        let base = buf.parse::<ClockTime>().unwrap_or(*last_valid);
+        let total_min = i32::from(base.hour()) * 60 + i32::from(base.minute());
+        let next_min = (total_min + delta_minutes).rem_euclid(24 * 60);
+        let next = ClockTime::new((next_min / 60) as u8, (next_min % 60) as u8)
+            .expect("rem_euclid(1440) guarantees valid ClockTime");
+        *last_valid = next;
+        *buf = next.to_string();
+        *active_field = field;
+        *error_message = None;
+    }
+
+    pub(super) fn edit_active_hours_time(&mut self, ch: Option<char>) {
+        let ModalState::ActiveHoursModal { active_field, .. } = self.modal else {
+            return;
+        };
+        let Some((buf, last_valid, _, error_message)) =
+            active_hours_time_target(&mut self.modal, active_field)
+        else {
+            return;
+        };
+        match ch {
+            None => {
+                buf.pop();
+            }
+            Some(c) if (c.is_ascii_digit() || c == ':') && buf.len() < 5 => {
+                buf.push(c);
+            }
+            Some(_) => return,
+        }
+        if let Ok(parsed) = buf.parse::<ClockTime>() {
+            *last_valid = parsed;
+        }
+        *error_message = None;
+    }
+
+    pub(super) fn submit_active_hours_modal(&mut self) -> Option<TuiCommand> {
+        let ModalState::ActiveHoursModal {
+            enabled,
+            ref start_input,
+            ref end_input,
+            ref mut error_message,
+            ..
+        } = self.modal
+        else {
+            return None;
+        };
+        let Ok(start) = start_input.parse::<ClockTime>() else {
+            *error_message = Some("Start must be valid 24h HH:MM (00:00-23:59)".into());
+            return None;
+        };
+        let Ok(end) = end_input.parse::<ClockTime>() else {
+            *error_message = Some("End must be valid 24h HH:MM (00:00-23:59)".into());
+            return None;
+        };
+        if enabled && start == end {
+            *error_message = Some("Start and End must differ when Active Hours are enabled".into());
+            return None;
+        }
+        self.modal = ModalState::None;
+        Some(TuiCommand::ConfigUpdate(ConfigPatch {
+            schedule: Some(SchedulePatch {
+                active_hours_enabled: Some(enabled),
+                start: Some(start),
+                end: Some(end),
+            }),
+            ..Default::default()
+        }))
+    }
+
     pub(super) fn submit_soft_rebaseline_modal(&mut self) -> Option<TuiCommand> {
         let ModalState::SoftRebaselineModal {
             ref seed_sleep_hr_input,
@@ -552,6 +653,35 @@ impl TuiApp {
             None
         }
     }
+}
+
+fn active_hours_time_target(
+    modal: &mut ModalState,
+    field: ActiveHoursField,
+) -> Option<(
+    &mut String,
+    &mut ClockTime,
+    &mut ActiveHoursField,
+    &mut Option<String>,
+)> {
+    let ModalState::ActiveHoursModal {
+        start_input,
+        end_input,
+        last_valid_start,
+        last_valid_end,
+        active_field,
+        error_message,
+        ..
+    } = modal
+    else {
+        return None;
+    };
+    let (buf, last_valid) = match field {
+        ActiveHoursField::Start => (start_input, last_valid_start),
+        ActiveHoursField::End => (end_input, last_valid_end),
+        _ => return None,
+    };
+    Some((buf, last_valid, active_field, error_message))
 }
 
 fn update_export_path_extension(path: &mut String, ext: &str) {

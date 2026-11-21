@@ -5417,7 +5417,7 @@ fn test_mouse_settings_preferences_two_click_and_wheel() {
     assert_eq!(app.handle_event(mouse_left_click(ls_col + 2, ls_row)), None);
     assert_eq!(app.selected_setting_idx, 2);
 
-    // 5. Mouse-wheel ScrollUp / ScrollDown over Core Preferences moves selected_setting_idx between 0..=5
+    // 5. Mouse-wheel ScrollUp / ScrollDown over Core Preferences moves selected_setting_idx between 0..=6
     assert_eq!(app.handle_event(mouse_scroll_up(ls_col, ls_row)), None);
     assert_eq!(app.selected_setting_idx, 1);
     assert_eq!(app.handle_event(mouse_scroll_up(ls_col, ls_row)), None);
@@ -5426,18 +5426,18 @@ fn test_mouse_settings_preferences_two_click_and_wheel() {
     assert_eq!(app.handle_event(mouse_scroll_up(ls_col, ls_row)), None);
     assert_eq!(app.selected_setting_idx, 0);
 
-    for expected in 1..=5 {
+    for expected in 1..=6 {
         assert_eq!(app.handle_event(mouse_scroll_down(ls_col, ls_row)), None);
         assert_eq!(app.selected_setting_idx, expected);
     }
-    // Clamps at 5
+    // Clamps at 6
     assert_eq!(app.handle_event(mouse_scroll_down(ls_col, ls_row)), None);
-    assert_eq!(app.selected_setting_idx, 5);
+    assert_eq!(app.selected_setting_idx, 6);
 
     // Scrolling outside Core Preferences (e.g. over System Settings & Storage) does not move selection
     let (stor_col, stor_row) = find_text_coords(buf_off, "System Settings & Storage").unwrap();
     assert_eq!(app.handle_event(mouse_scroll_up(stor_col, stor_row)), None);
-    assert_eq!(app.selected_setting_idx, 5);
+    assert_eq!(app.selected_setting_idx, 6);
 }
 
 #[test]
@@ -8346,4 +8346,665 @@ fn test_grace_tick_activity_hold_banner_and_hit_map() {
         }));
         assert!(app.grace_state.is_none());
     }
+}
+
+#[test]
+fn test_settings_active_hours_row_and_modal_open() {
+    use bpmute::config::ClockTime;
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+
+    let cfg = bpmute::config::Config {
+        schedule: ScheduleConfig {
+            active_hours_enabled: false,
+            start: ClockTime::new(22, 0).unwrap(),
+            end: ClockTime::new(8, 0).unwrap(),
+        },
+        ..Default::default()
+    };
+    app.active_config = Some(cfg);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_off = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        out_off.contains("Active Hours") && out_off.contains("[ Off 22:00-08:00 ]"),
+        "Core Preferences must render disabled Active Hours within 15 chars:\n{out_off}"
+    );
+    assert!(
+        out_off.contains("[Space/Enter] Edit/Toggle"),
+        "Core Preferences must display updated Edit/Toggle hint:\n{out_off}"
+    );
+    assert!(
+        out_off.contains("Advanced Settings (Read-Only)")
+            && out_off.contains("[E] Edit in $EDITOR"),
+        "Advanced Settings must remain intact below Core Preferences at 80x24:\n{out_off}"
+    );
+
+    // Enabled state displays HH:MM-HH:MM without Off prefix
+    app.active_config
+        .as_mut()
+        .unwrap()
+        .schedule
+        .active_hours_enabled = true;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_on = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        out_on.contains("[ 22:00-08:00 ]") && !out_on.contains("Off 22:00-08:00"),
+        "Core Preferences must render enabled Active Hours as HH:MM-HH:MM:\n{out_on}"
+    );
+
+    // Navigate down 6 times to select Active Hours (index 6)
+    for _ in 0..6 {
+        assert_eq!(
+            app.handle_event(TuiEvent::Key(key(KeyCode::Char('j')))),
+            None
+        );
+    }
+    assert_eq!(app.selected_setting_idx, 6);
+
+    // Offline guard: Space, Enter, and second click on Active Hours do not open modal
+    app.daemon_connected = false;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(' ')))),
+        None
+    );
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+    assert_eq!(app.modal, ModalState::None);
+    let (ah_col, ah_row) = find_text_coords(terminal.backend().buffer(), "Active Hours").unwrap();
+    assert_eq!(app.handle_event(mouse_left_click(ah_col + 2, ah_row)), None);
+    assert_eq!(app.modal, ModalState::None);
+
+    // Online: Space opens ActiveHoursModal
+    app.daemon_connected = true;
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(' ')))),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::ActiveHoursModal { .. }));
+    app.modal = ModalState::None;
+
+    // Online: Enter opens ActiveHoursModal
+    assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+    assert!(matches!(app.modal, ModalState::ActiveHoursModal { .. }));
+    app.modal = ModalState::None;
+
+    // Online: Two-click HitMap pattern (select another row, click Active Hours to select, click again to open)
+    app.selected_setting_idx = 0;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (ah_col2, ah_row2) = find_text_coords(terminal.backend().buffer(), "Active Hours").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(ah_col2 + 2, ah_row2)),
+        None
+    );
+    assert_eq!(app.selected_setting_idx, 6);
+    assert_eq!(app.modal, ModalState::None);
+    assert_eq!(
+        app.handle_event(mouse_left_click(ah_col2 + 2, ah_row2)),
+        None
+    );
+    assert!(matches!(app.modal, ModalState::ActiveHoursModal { .. }));
+}
+
+#[test]
+fn test_settings_active_hours_modal_navigation_and_cancel() {
+    use bpmute::config::ClockTime;
+    use bpmute::tui::app::ActiveHoursField;
+
+    for (ascii, no_color) in [(false, false), (true, true)] {
+        let mut app = TuiApp::new(false, ascii, no_color);
+        app.daemon_connected = true;
+        app.active_tab = Tab::Settings;
+        let cfg = bpmute::config::Config {
+            schedule: ScheduleConfig {
+                active_hours_enabled: false,
+                start: ClockTime::new(22, 30).unwrap(),
+                end: ClockTime::new(7, 15).unwrap(),
+            },
+            ..Default::default()
+        };
+        app.active_config = Some(cfg);
+        app.selected_setting_idx = 6;
+
+        // Open ActiveHoursModal -> focuses Enabled and seeds Start/End even when disabled
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                enabled: false,
+                ref start_input,
+                ref end_input,
+                active_field: ActiveHoursField::Enabled,
+                error_message: None,
+                ..
+            } if start_input == "22:30" && end_input == "07:15"
+        ));
+        assert!(!app.is_input_focused());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let out = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            out.contains("Active Hours")
+                && out.contains("[ ]")
+                && out.contains("22:30")
+                && out.contains("07:15")
+                && out.contains("[ Save ]")
+                && out.contains("[ Cancel ]"),
+            "Modal must render Enabled, Start, End, Save, Cancel:\n{out}"
+        );
+        // Footer hints reflect ActiveHoursModal
+        let expected_step_hint = if ascii { "[<-/->]" } else { "[←/→]" };
+        assert!(
+            out.contains("[Tab] Field")
+                && out.contains("[Space] Toggle")
+                && out.contains(expected_step_hint)
+                && out.contains("[Enter] Save")
+                && out.contains("[Esc] Cancel"),
+            "Footer must render ActiveHoursModal hints (ascii={ascii}):\n{out}"
+        );
+
+        // Backdrop click outside modal does not dismiss or trigger background Core Preferences
+        assert_eq!(app.handle_event(mouse_left_click(0, 0)), None);
+        assert!(matches!(app.modal, ModalState::ActiveHoursModal { .. }));
+
+        // Space toggles Enabled when Enabled is focused
+        assert_eq!(
+            app.handle_event(TuiEvent::Key(key(KeyCode::Char(' ')))),
+            None
+        );
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal { enabled: true, .. }
+        ));
+
+        // Tab cycles Enabled -> Start -> End -> Save -> Cancel -> Enabled
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Tab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Start,
+                ..
+            }
+        ));
+        assert!(app.is_input_focused());
+
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Tab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::End,
+                ..
+            }
+        ));
+        assert!(app.is_input_focused());
+
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Tab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Save,
+                ..
+            }
+        ));
+        assert!(!app.is_input_focused());
+
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Tab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Cancel,
+                ..
+            }
+        ));
+
+        // BackTab reverses Cancel -> Save -> End -> Start -> Enabled
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::BackTab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Save,
+                ..
+            }
+        ));
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::BackTab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::End,
+                ..
+            }
+        ));
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::BackTab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Start,
+                ..
+            }
+        ));
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::BackTab))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Enabled,
+                ..
+            }
+        ));
+
+        // Mouse click on Enabled toggles it, mouse click on Start/End focuses input
+        terminal
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let (chk_col, chk_row) = find_text_coords(terminal.backend().buffer(), "[x]").unwrap();
+        assert_eq!(
+            app.handle_event(mouse_left_click(chk_col + 1, chk_row)),
+            None
+        );
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                enabled: false,
+                active_field: ActiveHoursField::Enabled,
+                ..
+            }
+        ));
+
+        let (start_col, start_row) =
+            find_text_coords(terminal.backend().buffer(), "[ 22:30 ]").unwrap();
+        assert_eq!(
+            app.handle_event(mouse_left_click(start_col + 2, start_row)),
+            None
+        );
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Start,
+                ..
+            }
+        ));
+
+        let (end_col, end_row) =
+            find_text_coords(terminal.backend().buffer(), "[ 07:15 ]").unwrap();
+        assert_eq!(
+            app.handle_event(mouse_left_click(end_col + 2, end_row)),
+            None
+        );
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::End,
+                ..
+            }
+        ));
+
+        // Clicking [ Cancel ] dismisses without emitting command
+        let (canc_col, canc_row) =
+            find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+        assert_eq!(
+            app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
+            None
+        );
+        assert_eq!(app.modal, ModalState::None);
+
+        // Reopen, Tab to Cancel, Enter on Cancel dismisses without command
+        app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+        for _ in 0..4 {
+            app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+        }
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Cancel,
+                ..
+            }
+        ));
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+        assert_eq!(app.modal, ModalState::None);
+
+        // Reopen and press Esc -> dismisses without command
+        app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+        assert!(matches!(app.modal, ModalState::ActiveHoursModal { .. }));
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Esc))), None);
+        assert_eq!(app.modal, ModalState::None);
+    }
+}
+
+#[test]
+fn test_settings_active_hours_hybrid_time_editing_and_stepping() {
+    use bpmute::config::ClockTime;
+    use bpmute::tui::app::ActiveHoursField;
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+    let cfg = bpmute::config::Config {
+        schedule: ScheduleConfig {
+            active_hours_enabled: true,
+            start: ClockTime::new(23, 30).unwrap(),
+            end: ClockTime::new(0, 15).unwrap(),
+        },
+        ..Default::default()
+    };
+    app.active_config = Some(cfg);
+    app.selected_setting_idx = 6;
+
+    // Open modal and Tab to Start
+    app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    assert!(app.is_input_focused());
+
+    // Global shortcuts like 'q', '?', '1', 'j' must be suppressed while Start is focused
+    for ch in ['q', '?', '1', 'j', 'x'] {
+        assert_eq!(
+            app.handle_event(TuiEvent::Key(key(KeyCode::Char(ch)))),
+            None
+        );
+    }
+    assert!(!app.should_quit);
+    assert_eq!(app.active_tab, Tab::Settings);
+    assert_eq!(app.selected_setting_idx, 6);
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal {
+            ref start_input,
+            active_field: ActiveHoursField::Start,
+            ..
+        } if start_input == "23:30"
+    ));
+
+    // Left/Right 15-min stepping with midnight wraparound: 23:30 -> 23:45 -> 00:00 -> 23:45
+    app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "23:45"
+    ));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "00:00"
+    ));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "23:45"
+    ));
+
+    // Direct typing + Backspace on Start: change 23:45 -> 21:05 (and verify 5-char cap)
+    for _ in 0..5 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for ch in "21:059".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(ch))));
+    }
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "21:05"
+    ));
+
+    // Typing a partial/invalid string then pressing Right falls back to last valid (21:05 -> 21:20)
+    app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "21:"
+    ));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "21:20"
+    ));
+
+    // Render and test mouse-wheel stepping over End (00:15 -> ScrollDown -> 00:00 -> ScrollDown -> 23:45 -> ScrollUp -> 00:00)
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (end_col, end_row) = find_text_coords(terminal.backend().buffer(), "[ 00:15 ]").unwrap();
+
+    // Scrolling outside Start/End (over background Core Preferences) must NOT change selected_setting_idx
+    assert_eq!(app.handle_event(mouse_scroll_up(2, 3)), None);
+    assert_eq!(app.selected_setting_idx, 6);
+
+    assert_eq!(
+        app.handle_event(mouse_scroll_down(end_col + 2, end_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal {
+            ref end_input,
+            active_field: ActiveHoursField::End,
+            ..
+        } if end_input == "00:00"
+    ));
+    assert_eq!(
+        app.handle_event(mouse_scroll_down(end_col + 2, end_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref end_input, .. } if end_input == "23:45"
+    ));
+    assert_eq!(
+        app.handle_event(mouse_scroll_up(end_col + 2, end_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref end_input, .. } if end_input == "00:00"
+    ));
+
+    // Also test mouse-wheel stepping over Start with invalid text ("99:99") recovers from last_valid_start (21:20)
+    let (start_col, start_row) =
+        find_text_coords(terminal.backend().buffer(), "[ 21:20 ]").unwrap();
+    app.handle_event(mouse_left_click(start_col + 2, start_row));
+    for _ in 0..5 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for ch in "99:99".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(ch))));
+    }
+    assert_eq!(
+        app.handle_event(mouse_scroll_up(start_col + 2, start_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal { ref start_input, .. } if start_input == "21:35"
+    ));
+}
+
+#[test]
+fn test_settings_active_hours_validation_submission_and_roundtrip() {
+    use bpmute::config::{ClockTime, ConfigPatch, SchedulePatch};
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::Settings;
+    let cfg = bpmute::config::Config {
+        schedule: ScheduleConfig {
+            active_hours_enabled: false,
+            start: ClockTime::new(22, 0).unwrap(),
+            end: ClockTime::new(8, 0).unwrap(),
+        },
+        ..Default::default()
+    };
+    app.active_config = Some(cfg.clone());
+    app.selected_setting_idx = 6;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // 1. Two-keystroke flow: Enter to open, Space to toggle Enabled -> true, Enter to save
+    assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(' ')))),
+        None
+    );
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::ConfigUpdate(ConfigPatch {
+            schedule: Some(SchedulePatch {
+                active_hours_enabled: Some(true),
+                start: Some(ClockTime::new(22, 0).unwrap()),
+                end: Some(ClockTime::new(8, 0).unwrap()),
+            }),
+            ..Default::default()
+        }))
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // Subsequent ConfigLoaded (from ConfigUpdated IPC event) updates rendered row
+    let mut updated_cfg = cfg.clone();
+    updated_cfg.schedule.active_hours_enabled = true;
+    app.handle_ipc(IpcEvent::ConfigLoaded(updated_cfg));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_enabled = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        out_enabled.contains("[ 22:00-08:00 ]"),
+        "Updated config must render enabled Active Hours:\n{out_enabled}"
+    );
+
+    // 2. Invalid HH:MM keeps modal open with inline ⚠ error and emits no command
+    app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab))); // Focus Start
+    for _ in 0..5 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for ch in "25:00".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(ch))));
+    }
+    assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal {
+            error_message: Some(_),
+            ..
+        }
+    ));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_err1 = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        out_err1.contains("⚠"),
+        "Invalid HH:MM must show inline ⚠ error:\n{out_err1}"
+    );
+
+    // Typing clears stale error; fix Start to "08:00" (matching End "08:00") while Enabled == true
+    for _ in 0..5 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal {
+            error_message: None,
+            ..
+        }
+    ));
+    for ch in "08:00".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(ch))));
+    }
+
+    // 3. enabled == true && start == end rejected on [ Save ] click with inline ⚠ error
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (save_col, save_row) = find_text_coords(terminal.backend().buffer(), "[ Save ]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(save_col + 2, save_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal {
+            error_message: Some(ref msg),
+            ..
+        } if msg.contains("Start and End must differ when Active Hours are enabled")
+    ));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_err2 = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        out_err2.contains("⚠ Start and End must differ when Active Hours are enabled"),
+        "Equal Start and End when enabled must show inline ⚠ error:\n{out_err2}"
+    );
+
+    // 4. Unchecking Enabled allows start == end and submits via footer [Enter] Save
+    let (chk_col, chk_row) = find_text_coords(terminal.backend().buffer(), "[x]").unwrap();
+    assert_eq!(
+        app.handle_event(mouse_left_click(chk_col + 1, chk_row)),
+        None
+    );
+    assert!(matches!(
+        app.modal,
+        ModalState::ActiveHoursModal {
+            enabled: false,
+            error_message: None,
+            ..
+        }
+    ));
+
+    // Also verify 60x18 minimum terminal renders cleanly with modal open
+    let mut term_min = Terminal::new(TestBackend::new(60, 18)).unwrap();
+    term_min
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_min = buffer_to_string(term_min.backend().buffer());
+    assert!(out_min.contains("Active Hours") && out_min.contains("[ Save ]"));
+
+    // Re-render at 80x24 and click footer [Enter] Save
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (f_save_col, f_save_row) =
+        find_footer_coords(terminal.backend().buffer(), "[Enter] Save").unwrap();
+    let cmd_disabled = app.handle_event(mouse_left_click(f_save_col + 1, f_save_row));
+    assert_eq!(
+        cmd_disabled,
+        Some(TuiCommand::ConfigUpdate(ConfigPatch {
+            schedule: Some(SchedulePatch {
+                active_hours_enabled: Some(false),
+                start: Some(ClockTime::new(8, 0).unwrap()),
+                end: Some(ClockTime::new(8, 0).unwrap()),
+            }),
+            ..Default::default()
+        }))
+    );
+    assert_eq!(app.modal, ModalState::None);
+
+    // ConfigLoaded updates rendered row to Off 08:00-08:00
+    let mut final_cfg = cfg;
+    final_cfg.schedule = ScheduleConfig {
+        active_hours_enabled: false,
+        start: ClockTime::new(8, 0).unwrap(),
+        end: ClockTime::new(8, 0).unwrap(),
+    };
+    app.handle_ipc(IpcEvent::ConfigLoaded(final_cfg));
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_final = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        out_final.contains("[ Off 08:00-08:00 ]"),
+        "Updated disabled config must render Off 08:00-08:00:\n{out_final}"
+    );
 }

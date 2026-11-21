@@ -120,6 +120,14 @@ impl TuiApp {
                         self.toggle_soft_rebaseline_reset_floors();
                         None
                     }
+                    ClickTarget::ActiveHoursToggleEnabled => {
+                        self.toggle_active_hours_enabled();
+                        None
+                    }
+                    ClickTarget::ActiveHoursFocusField(field) => {
+                        self.focus_active_hours_field(field);
+                        None
+                    }
                     ClickTarget::PauseOption(idx) => self.click_pause_option(idx),
                     ClickTarget::Consume => None,
                 }
@@ -140,6 +148,11 @@ impl TuiApp {
                     ScrollTarget::SettingsPreferences => {
                         self.selected_setting_idx =
                             step_index(self.selected_setting_idx, SETTINGS_PREFERENCE_COUNT, delta);
+                        None
+                    }
+                    ScrollTarget::ActiveHours(field) => {
+                        let step = if delta < 0 { 15 } else { -15 };
+                        self.step_active_hours_field(field, step);
                         None
                     }
                     ScrollTarget::EnrollmentList => {

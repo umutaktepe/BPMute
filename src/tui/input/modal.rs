@@ -310,6 +310,35 @@ impl TuiApp {
                 _ => None,
             },
             ModalState::HardWipeModal { .. } => None,
+            ModalState::ActiveHoursModal { active_field, .. } => match key.code {
+                KeyCode::Esc => {
+                    self.modal = ModalState::None;
+                    None
+                }
+                KeyCode::Tab => {
+                    self.focus_active_hours_field(active_field.next());
+                    None
+                }
+                KeyCode::BackTab => {
+                    self.focus_active_hours_field(active_field.prev());
+                    None
+                }
+                KeyCode::Char(' ')
+                    if active_field == super::super::app::ActiveHoursField::Enabled =>
+                {
+                    self.toggle_active_hours_enabled();
+                    None
+                }
+                KeyCode::Enter => {
+                    if active_field == super::super::app::ActiveHoursField::Cancel {
+                        self.modal = ModalState::None;
+                        None
+                    } else {
+                        self.submit_active_hours_modal()
+                    }
+                }
+                _ => None,
+            },
             ModalState::RenameModal { .. } | ModalState::None => None,
         }
     }
@@ -578,6 +607,38 @@ impl TuiApp {
                 KeyCode::Char(c) => {
                     typed_input.push(c);
                     *error_message = None;
+                    None
+                }
+                _ => None,
+            },
+            ModalState::ActiveHoursModal { active_field, .. } => match key.code {
+                KeyCode::Esc => {
+                    self.modal = ModalState::None;
+                    None
+                }
+                KeyCode::Tab => {
+                    self.focus_active_hours_field(active_field.next());
+                    None
+                }
+                KeyCode::BackTab => {
+                    self.focus_active_hours_field(active_field.prev());
+                    None
+                }
+                KeyCode::Left => {
+                    self.step_active_hours_field(active_field, -15);
+                    None
+                }
+                KeyCode::Right => {
+                    self.step_active_hours_field(active_field, 15);
+                    None
+                }
+                KeyCode::Enter => self.submit_active_hours_modal(),
+                KeyCode::Backspace => {
+                    self.edit_active_hours_time(None);
+                    None
+                }
+                KeyCode::Char(c) => {
+                    self.edit_active_hours_time(Some(c));
                     None
                 }
                 _ => None,

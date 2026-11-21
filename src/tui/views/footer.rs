@@ -174,6 +174,17 @@ pub(crate) fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map:
         ModalState::HardWipeModal { .. } => {
             writer.push_modal_confirm_cancel(" Confirm Wipe");
         }
+        ModalState::ActiveHoursModal { .. } => {
+            let (step_hint, step_label) = if app.theme.ascii {
+                ("[<-/->]", " +/-15m")
+            } else {
+                ("[←/→]", " ±15m")
+            };
+            writer.push_hint("[Tab]", " Field");
+            writer.push_hint("[Space]", " Toggle");
+            writer.push_hint(step_hint, step_label);
+            writer.push_modal_confirm_cancel(" Save");
+        }
         ModalState::None => {
             writer.push_hint("[1-4]", " Tabs");
 

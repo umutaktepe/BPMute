@@ -16,7 +16,7 @@ use super::views::history::render_history;
 use super::views::settings::render_settings;
 use super::views::wearables::render_wearables;
 use crate::calibration::CalibrationBoundaryRecord;
-use crate::config::Config;
+use crate::config::{ClockTime, Config};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, MonitoringState,
     alert_ids,
@@ -107,6 +107,37 @@ pub enum SoftRebaselineField {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveHoursField {
+    Enabled,
+    Start,
+    End,
+    Save,
+    Cancel,
+}
+
+impl ActiveHoursField {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Enabled => Self::Start,
+            Self::Start => Self::End,
+            Self::End => Self::Save,
+            Self::Save => Self::Cancel,
+            Self::Cancel => Self::Enabled,
+        }
+    }
+
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            Self::Enabled => Self::Cancel,
+            Self::Start => Self::Enabled,
+            Self::End => Self::Start,
+            Self::Save => Self::End,
+            Self::Cancel => Self::Save,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModalState {
     None,
@@ -168,6 +199,15 @@ pub enum ModalState {
     },
     HardWipeModal {
         typed_input: String,
+        error_message: Option<String>,
+    },
+    ActiveHoursModal {
+        enabled: bool,
+        start_input: String,
+        end_input: String,
+        last_valid_start: ClockTime,
+        last_valid_end: ClockTime,
+        active_field: ActiveHoursField,
         error_message: Option<String>,
     },
 }
@@ -385,6 +425,10 @@ impl TuiApp {
             } => true,
             ModalState::SoftRebaselineModal {
                 active_field: SoftRebaselineField::SeedSleepHr,
+                ..
+            } => true,
+            ModalState::ActiveHoursModal {
+                active_field: ActiveHoursField::Start | ActiveHoursField::End,
                 ..
             } => true,
             ModalState::HardWipeModal { .. } => true,

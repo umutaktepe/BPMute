@@ -2,8 +2,8 @@ use chrono::TimeZone;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::{
-    ExportModalField, FeedbackModalField, ModalState, SoftRebaselineField, Tab, TuiApp,
-    UnenrollButton,
+    ActiveHoursField, ExportModalField, FeedbackModalField, ModalState, SoftRebaselineField, Tab,
+    TuiApp, UnenrollButton,
 };
 use super::event::TuiCommand;
 use crate::calibration::FeedbackVerdict;
@@ -12,7 +12,7 @@ mod modal;
 mod modal_actions;
 mod mouse;
 
-pub(super) const SETTINGS_PREFERENCE_COUNT: usize = 6;
+pub(super) const SETTINGS_PREFERENCE_COUNT: usize = 7;
 
 pub(super) fn step_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
@@ -444,7 +444,25 @@ impl TuiApp {
                 }),
                 ..Default::default()
             })),
+            6 => self.open_active_hours_modal(),
             _ => None,
         }
+    }
+
+    pub(super) fn open_active_hours_modal(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        let cfg = self.active_config.as_ref()?;
+        self.modal = ModalState::ActiveHoursModal {
+            enabled: cfg.schedule.active_hours_enabled,
+            start_input: cfg.schedule.start.to_string(),
+            end_input: cfg.schedule.end.to_string(),
+            last_valid_start: cfg.schedule.start,
+            last_valid_end: cfg.schedule.end,
+            active_field: ActiveHoursField::Enabled,
+            error_message: None,
+        };
+        None
     }
 }
