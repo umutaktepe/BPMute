@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::actions::grace::{GraceControlCmd, GraceRunOutcome, GraceRunParams};
-use crate::actions::pipeline::PipelineContext;
+use crate::actions::pipeline::{PipelineContext, PipelineResult};
 use crate::actions::traits::PowerActionResult;
 use crate::config::PowerAction;
 use crate::daemon::EngineControlEvent;
@@ -201,6 +201,28 @@ impl DaemonCore {
         Ok(eff_sec)
     }
 
+    async fn persist_active_sleep_trigger(
+        &self,
+        session_id: Option<&str>,
+        sleeping_ts_ms: i64,
+        action: PowerAction,
+    ) {
+        let Some(sid) = session_id else {
+            return;
+        };
+        if let Err(err) = self
+            .persistence
+            .mark_session_sleep_trigger(sid.to_string(), sleeping_ts_ms, action)
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                ?action,
+                "failed to persist active session sleep trigger state"
+            );
+        }
+    }
+
     pub async fn deliver_grace_outcome(&self, outcome: GraceOutcome) {
         let _ = self
             .engine_ctrl_tx
@@ -209,21 +231,21 @@ impl DaemonCore {
     }
 
     pub async fn handle_confirmed_sleep_onset(self: &Arc<Self>, ts_ms: i64) {
-        let (is_paused, cfg, session_id, wearable_id) = {
+        let (is_paused, cfg, active_session_id, wearable_id) = {
             let guard = self.inner.lock().unwrap();
             (
                 guard.paused,
                 guard.loaded_config.config.clone(),
-                guard
-                    .active_session_id
-                    .clone()
-                    .unwrap_or_else(|| "default-session".to_string()),
+                guard.active_session_id.clone(),
                 guard
                     .active_wearable_id
                     .clone()
                     .unwrap_or_else(|| "default-wearable".to_string()),
             )
         };
+        let session_id = active_session_id
+            .clone()
+            .unwrap_or_else(|| "default-session".to_string());
 
         if is_paused {
             tracing::info!(
@@ -360,17 +382,49 @@ impl DaemonCore {
                             Some(session_id.clone()),
                             Some(wearable_id.clone()),
                         );
+                        if !core.is_dry_run() {
+                            *core.sleep_triggered_at.lock().unwrap() = Some(gr.ts_ms);
+                            *core.trigger_power_action.lock().unwrap() = eff_actions.power_action;
+                            // Deliver Sleeping transition and persist trigger metadata before any
+                            // destructive power action can trigger SIGTERM or OS shutdown.
+                            core.deliver_grace_outcome(gr).await;
+                            if matches!(
+                                eff_actions.power_action,
+                                PowerAction::Suspend | PowerAction::Poweroff
+                            ) {
+                                core.persist_active_sleep_trigger(
+                                    active_session_id.as_deref(),
+                                    gr.ts_ms,
+                                    eff_actions.power_action,
+                                )
+                                .await;
+                            }
+                        }
                         let ctx = PipelineContext {
                             session_id: session_id.clone(),
                             wearable_id: wearable_id.clone(),
                             event: "sleep_trigger".to_string(),
                             dry_run: core.is_dry_run(),
                         };
-                        let res = core
-                            .pipeline
-                            .execute(&ctx, &eff_actions)
-                            .await
-                            .unwrap_or_default();
+                        let res = match core.pipeline.execute(&ctx, &eff_actions).await {
+                            Ok(res) => res,
+                            Err(err) => {
+                                tracing::warn!(error = %err, "sleep action pipeline aborted");
+                                PipelineResult::default()
+                            }
+                        };
+                        if !core.is_dry_run()
+                            && eff_actions.power_action != PowerAction::None
+                            && !matches!(res.power_action_result, Some(PowerActionResult::Executed))
+                        {
+                            *core.trigger_power_action.lock().unwrap() = PowerAction::None;
+                            core.persist_active_sleep_trigger(
+                                active_session_id.as_deref(),
+                                gr.ts_ms,
+                                PowerAction::None,
+                            )
+                            .await;
+                        }
                         match res.power_action_result {
                             Some(PowerActionResult::RefusedInhibited(ref reason)) => {
                                 core.set_logind_inhibited_alert(Some(reason));
@@ -380,8 +434,6 @@ impl DaemonCore {
                             }
                             _ => {}
                         }
-                        *core.sleep_triggered_at.lock().unwrap() = Some(gr.ts_ms);
-                        *core.trigger_power_action.lock().unwrap() = eff_actions.power_action;
 
                         if eff_actions.power_action == PowerAction::None && !core.is_dry_run() {
                             let c_watch = Arc::clone(&core);
@@ -441,20 +493,22 @@ impl DaemonCore {
                                 }
                             });
                         }
-                    } else if matches!(
-                        gr.outcome,
-                        GraceResult::Cancelled
-                            | GraceResult::Snoozed { .. }
-                            | GraceResult::AbortedNoPenalty
-                    ) {
-                        core.set_detector_phase(
-                            DetectorState::Monitoring,
-                            Some(session_id.clone()),
-                            Some(wearable_id.clone()),
-                        );
-                    }
-                    if !core.is_dry_run() {
-                        core.deliver_grace_outcome(gr).await;
+                    } else {
+                        if matches!(
+                            gr.outcome,
+                            GraceResult::Cancelled
+                                | GraceResult::Snoozed { .. }
+                                | GraceResult::AbortedNoPenalty
+                        ) {
+                            core.set_detector_phase(
+                                DetectorState::Monitoring,
+                                Some(session_id.clone()),
+                                Some(wearable_id.clone()),
+                            );
+                        }
+                        if !core.is_dry_run() {
+                            core.deliver_grace_outcome(gr).await;
+                        }
                     }
                 }
                 GraceRunOutcome::AsymmetricSignalLost => {

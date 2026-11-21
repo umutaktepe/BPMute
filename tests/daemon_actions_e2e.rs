@@ -1,18 +1,29 @@
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 use serde_json::json;
 use tempfile::TempDir;
 
 use bpmute::actions::fake::{FakeActionExecutor, FakeNotifier};
+use bpmute::actions::traits::PowerActionResult;
+use bpmute::calibration::CalibrationState;
 use bpmute::cli::args::{Cli, Command};
 use bpmute::cli::execute_cli;
 use bpmute::config::{ActionsConfig, CliOverrides, LoadedConfig, PowerAction, ScheduleConfig};
 use bpmute::daemon::{DaemonClock, DaemonHandle, DaemonOptions, VirtualClock, WearableEvent};
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
+use bpmute::ipc::protocol::alert_ids;
 use bpmute::paths::{MapEnv, ResolvedPaths};
+use bpmute::sleep_engine::EngineEvent;
+use bpmute::storage::{
+    LedgerStore, OpenSessionRequest, SessionFullDetail, WearableDescriptor, db_path_in_data_dir,
+    lock_path_in_data_dir,
+};
 use tokio::sync::{mpsc, watch};
 
 fn test_paths(temp: &TempDir) -> ResolvedPaths {
@@ -29,7 +40,7 @@ struct TestWearableSource {
 
 impl TestWearableSource {
     fn new() -> (Self, mpsc::Sender<WearableEvent>) {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(4096);
         (
             Self {
                 rx: tokio::sync::Mutex::new(Some(rx)),
@@ -562,4 +573,254 @@ async fn test_post_trigger_mpris_watch_delivers_rapid_wake_fp() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     daemon.shutdown().await;
+}
+
+fn load_single_session_and_cal(paths: &ResolvedPaths) -> (SessionFullDetail, CalibrationState) {
+    let store = LedgerStore::open_read_only(&db_path_in_data_dir(&paths.data_dir))
+        .unwrap()
+        .expect("ledger database must exist");
+    let page = store.list_sessions(10, 0).unwrap();
+    assert_eq!(page.sessions.len(), 1);
+    let detail = store.get_session(&page.sessions[0].id).unwrap();
+    let cal = store.get_calibration_state().unwrap();
+    (detail, cal)
+}
+
+async fn feed_until_confirmed(
+    wearable_tx: &mpsc::Sender<WearableEvent>,
+    client: &mut IpcClient,
+    base_ts: i64,
+) {
+    let desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:11".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Polar Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    let trace = generate_paired_trace(
+        101,
+        Phenotype::typical(),
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep { duration_sec: 900 },
+        ],
+    );
+    let split_idx = trace.bpm_rr.len() * 2 / 3;
+    for ev in &trace.bpm_rr[..split_idx] {
+        match ev {
+            EngineEvent::StreamState(st) => {
+                let mut shifted = *st;
+                shifted.ts_ms += base_ts;
+                wearable_tx
+                    .send(WearableEvent::StreamState {
+                        wearable: desc.clone(),
+                        state: shifted,
+                    })
+                    .await
+                    .unwrap();
+            }
+            EngineEvent::HrPacket(pkt) => {
+                let mut shifted = pkt.clone();
+                shifted.ts_ms += base_ts;
+                wearable_tx
+                    .send(WearableEvent::HrPacket {
+                        wearable: desc.clone(),
+                        packet: shifted,
+                    })
+                    .await
+                    .unwrap();
+            }
+            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+        }
+    }
+
+    for _ in 0..10_000 {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Confirmed" {
+            return;
+        }
+    }
+    panic!("SleepEngine must reach Confirmed during N1/N2 trace");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_poweroff_race_preserves_trigger_metadata_and_calibration() {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let actions_cfg = ActionsConfig {
+        pause_media: true,
+        power_action: PowerAction::Poweroff,
+        grace_period_sec: Some(10),
+        ..ActionsConfig::default()
+    };
+
+    let (source, wearable_tx) = TestWearableSource::new();
+    let executor = Arc::new(FakeActionExecutor::new());
+    executor.set_playing_players(&["org.mpris.MediaPlayer2.mpv"]);
+    let mut power_rx = executor.subscribe_power_actions();
+    let notifier = Arc::new(FakeNotifier::new());
+
+    let (daemon, paths, _clock) = spawn_test_daemon(
+        &temp,
+        start_utc,
+        actions_cfg,
+        ScheduleConfig::default(),
+        Arc::clone(&executor),
+        notifier,
+        Arc::new(source),
+    )
+    .await;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _ = client.next_event().await.unwrap();
+
+    feed_until_confirmed(&wearable_tx, &mut client, start_utc.timestamp_millis()).await;
+
+    assert_eq!(power_rx.recv().await, Some(PowerAction::Poweroff));
+
+    // Even before daemon shutdown completes, SQLite already holds the pre-poweroff trigger state.
+    let (pre_detail, _) = load_single_session_and_cal(&paths);
+    assert!(pre_detail.session.sleeping_ts_ms.is_some());
+    assert_eq!(
+        pre_detail.session.trigger_power_action,
+        PowerAction::Poweroff
+    );
+
+    daemon.shutdown().await;
+
+    let (detail, cal) = load_single_session_and_cal(&paths);
+    assert!(
+        detail.session.sleeping_ts_ms.is_some(),
+        "sleeping_ts_ms must be persisted when poweroff triggers"
+    );
+    assert_eq!(
+        detail.session.trigger_power_action,
+        PowerAction::Poweroff,
+        "trigger_power_action must be persisted as poweroff"
+    );
+    assert_eq!(
+        cal.valid_sessions, 1,
+        "uncancelled poweroff Monitoring Session must count toward calibration"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_refused_poweroff_reverts_trigger_power_action_and_calibration() {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let actions_cfg = ActionsConfig {
+        pause_media: false,
+        power_action: PowerAction::Poweroff,
+        grace_period_sec: Some(10),
+        ..ActionsConfig::default()
+    };
+
+    let (source, wearable_tx) = TestWearableSource::new();
+    let executor = Arc::new(FakeActionExecutor::new());
+    executor.set_power_action_override(Ok(PowerActionResult::RefusedInhibited(
+        "systemd-inhibit: update".to_string(),
+    )));
+    let mut power_rx = executor.subscribe_power_actions();
+    let notifier = Arc::new(FakeNotifier::new());
+
+    let (daemon, paths, _clock) = spawn_test_daemon(
+        &temp,
+        start_utc,
+        actions_cfg,
+        ScheduleConfig::default(),
+        Arc::clone(&executor),
+        notifier,
+        Arc::new(source),
+    )
+    .await;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _ = client.next_event().await.unwrap();
+
+    feed_until_confirmed(&wearable_tx, &mut client, start_utc.timestamp_millis()).await;
+
+    assert_eq!(power_rx.recv().await, Some(PowerAction::Poweroff));
+
+    // Wait deterministically for the post-revert AlertChanged event published after
+    // trigger_power_action has been reverted in memory and SQLite.
+    for _ in 0..10_000 {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "AlertChanged"
+            && ev.data["alerts"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|al| al["id"] == alert_ids::LOGIND_INHIBITED))
+        {
+            break;
+        }
+    }
+
+    daemon.shutdown().await;
+
+    let (detail, cal) = load_single_session_and_cal(&paths);
+    assert!(detail.session.sleeping_ts_ms.is_some());
+    assert_eq!(
+        detail.session.trigger_power_action,
+        PowerAction::None,
+        "refused poweroff must revert trigger_power_action to none"
+    );
+    assert_eq!(
+        cal.valid_sessions, 0,
+        "refused poweroff without post-trigger sleep must not count as calibration"
+    );
+}
+
+#[test]
+fn test_stale_recovery_preserves_pre_poweroff_trigger_and_calibration() {
+    let temp = TempDir::new().unwrap();
+    let db_path = db_path_in_data_dir(temp.path());
+    let lock_path = lock_path_in_data_dir(temp.path());
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+
+    let wearable_id = store
+        .upsert_wearable(
+            &WearableDescriptor {
+                mac: "AA:BB:CC:DD:EE:11".to_string(),
+                address_type: "public".to_string(),
+                alias: Some("Polar".to_string()),
+                advertised_name: Some("Polar H10".to_string()),
+                supports_rr: true,
+                supports_contact: true,
+            },
+            1_700_000_000_000,
+        )
+        .unwrap();
+
+    let session_id = store
+        .open_session(&OpenSessionRequest {
+            wearable_id,
+            start_ts_ms: 1_700_000_000_000,
+            detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+        })
+        .unwrap();
+
+    store
+        .mark_session_sleep_trigger(&session_id, 1_700_001_000_000, PowerAction::Poweroff)
+        .unwrap();
+
+    let recovered = store.recover_stale_sessions(1_700_002_000_000).unwrap();
+    assert_eq!(recovered, 1);
+
+    let detail = store.get_session(&session_id).unwrap();
+    assert_eq!(
+        detail.session.sleeping_ts_ms,
+        Some(1_700_001_000_000),
+        "stale recovery must preserve pre-poweroff sleeping_ts_ms"
+    );
+    assert_eq!(
+        detail.session.trigger_power_action,
+        PowerAction::Poweroff,
+        "stale recovery must preserve pre-poweroff trigger_power_action"
+    );
+    assert_eq!(store.get_calibration_state().unwrap().valid_sessions, 1);
 }

@@ -24,46 +24,6 @@ use super::recompute_and_persist_in_tx;
 use super::{LedgerStore, resolve_table_id_prefix};
 
 impl LedgerStore {
-    /// Recovers stale `'active'` sessions left behind by an ungraceful daemon termination.
-    pub fn recover_stale_sessions(&mut self, now_ms: i64) -> Result<usize, StorageError> {
-        self.write_tx(|tx| {
-            let mut stmt = tx.prepare(
-                "SELECT id, start_ts_ms, end_ts_ms FROM sessions WHERE status = 'active'",
-            )?;
-            let stale: Vec<(String, i64, i64)> = stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-
-            if stale.is_empty() {
-                return Ok(0);
-            }
-
-            for (id, start_ts, end_ts) in &stale {
-                let max_ep_ts: Option<i64> = tx
-                    .query_row(
-                        "SELECT MAX(ts_ms) FROM session_epochs WHERE session_id = ?1",
-                        params![id],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let final_end_ts = (*end_ts).max(*start_ts).max(max_ep_ts.unwrap_or(*start_ts));
-                tx.execute(
-                    "UPDATE sessions
-                     SET status = 'closed',
-                         end_ts_ms = ?2,
-                         end_reason = COALESCE(end_reason, 'stream_ended')
-                     WHERE id = ?1",
-                    params![id, final_end_ts],
-                )?;
-            }
-
-            recompute_and_persist_in_tx(tx, now_ms)?;
-            Ok(stale.len())
-        })
-    }
-
     /// Persists a newly opened `'active'` `Monitoring Session` and returns its UUIDv7 ID.
     pub fn open_session(&mut self, req: &OpenSessionRequest) -> Result<String, StorageError> {
         let session_id = generate_uuid_v7_with(&self.uuid_ctx, req.start_ts_ms);

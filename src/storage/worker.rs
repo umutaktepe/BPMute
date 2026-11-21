@@ -6,7 +6,7 @@ use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::calibration::{CalibrationBoundaryRecord, CalibrationState};
-use crate::config::RetentionConfig;
+use crate::config::{PowerAction, RetentionConfig};
 use crate::replay::TraceFormat;
 use crate::sleep_engine::{Epoch, HrPacket};
 use crate::storage::{
@@ -141,6 +141,12 @@ enum DbCommand {
         reply: oneshot::Sender<Result<PruneSummary, StorageError>>,
     },
     FlushWal {
+        reply: oneshot::Sender<Result<(), StorageError>>,
+    },
+    MarkSessionSleepTrigger {
+        session_id: String,
+        sleeping_ts_ms: i64,
+        trigger_power_action: PowerAction,
         reply: oneshot::Sender<Result<(), StorageError>>,
     },
 }
@@ -409,12 +415,39 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         DbCommand::FlushWal { reply } => {
             let _ = reply.send(store.flush_wal());
         }
+        DbCommand::MarkSessionSleepTrigger {
+            session_id,
+            sleeping_ts_ms,
+            trigger_power_action,
+            reply,
+        } => {
+            let _ = reply.send(store.mark_session_sleep_trigger(
+                &session_id,
+                sleeping_ts_ms,
+                trigger_power_action,
+            ));
+        }
     }
 }
 
 impl PersistenceHandle {
     pub async fn flush_wal(&self) -> Result<(), StorageError> {
         self.call(|reply| DbCommand::FlushWal { reply }).await
+    }
+
+    pub async fn mark_session_sleep_trigger(
+        &self,
+        session_id: String,
+        sleeping_ts_ms: i64,
+        trigger_power_action: PowerAction,
+    ) -> Result<(), StorageError> {
+        self.call(|reply| DbCommand::MarkSessionSleepTrigger {
+            session_id,
+            sleeping_ts_ms,
+            trigger_power_action,
+            reply,
+        })
+        .await
     }
     async fn call<T>(
         &self,

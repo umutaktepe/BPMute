@@ -380,6 +380,16 @@ impl MonitoringContext {
     }
 }
 
+async fn drain_control_and_close(
+    ctx: &mut MonitoringContext,
+    ctrl_rx: &mut mpsc::Receiver<EngineControlEvent>,
+) {
+    while let Ok(ctrl) = ctrl_rx.try_recv() {
+        ctx.handle_control_event(ctrl).await;
+    }
+    ctx.flush_close_latest(SessionEndReason::StreamEnded).await;
+}
+
 async fn sleep_or_pending(deadline: Option<tokio::time::Instant>) {
     match deadline {
         Some(d) => tokio::time::sleep_until(d).await,
@@ -445,5 +455,141 @@ pub(crate) async fn run_monitoring_loop(
         }
     }
 
-    ctx.flush_close_latest(SessionEndReason::StreamEnded).await;
+    drain_control_and_close(&mut ctx, &mut ctrl_rx).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use tempfile::TempDir;
+
+    use crate::actions::fake::{FakeActionExecutor, FakeNotifier};
+    use crate::config::{CliOverrides, LoadedConfig};
+    use crate::daemon::state::DaemonCoreInit;
+    use crate::daemon::wearable::{NullWearableSource, WearableDescriptor};
+    use crate::daemon::{EventBroker, NoopEnrollmentDriver, VirtualClock};
+    use crate::idle::fake::FakeIdleProbe;
+    use crate::paths::{MapEnv, ResolvedPaths};
+    use crate::sleep_engine::{ContactStatus, GraceOutcome, GraceResult, StreamState};
+    use crate::storage::{
+        LedgerStore, PersistenceWorker, db_path_in_data_dir, lock_path_in_data_dir,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_drains_queued_grace_outcome_before_closing_session() {
+        let temp = TempDir::new().unwrap();
+        let paths = ResolvedPaths {
+            config_file: temp.path().join("cfg/bpmute/config.toml"),
+            data_dir: temp.path().join("data/bpmute"),
+            socket_path: temp.path().join("run/bpmute/daemon.sock"),
+        };
+        let env = Arc::new(MapEnv::new());
+        let cli = CliOverrides::default();
+        let mut loaded = LoadedConfig::load(&paths.config_file, env.as_ref(), &cli).unwrap();
+        loaded.config.actions.pause_media = false;
+        loaded.config.actions.lock_screen = true;
+        loaded.config.actions.grace_period_sec = Some(300);
+        let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+        let base_ts = start_utc.timestamp_millis();
+        let clock = Arc::new(VirtualClock::starting_at(start_utc));
+        let db_path = db_path_in_data_dir(&paths.data_dir);
+        let lock_path = lock_path_in_data_dir(&paths.data_dir);
+        let (worker, persistence, initial_calibration) =
+            PersistenceWorker::spawn(&db_path, &lock_path, base_ts).unwrap();
+
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(32);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let core = Arc::new(DaemonCore::new(DaemonCoreInit {
+            paths: paths.clone(),
+            loaded_config: loaded,
+            env,
+            cli_overrides: cli,
+            clock,
+            broker: Arc::new(EventBroker::default()),
+            shutdown_rx,
+            persistence,
+            initial_calibration,
+            action_executor: Arc::new(FakeActionExecutor::new()),
+            notifier: Arc::new(FakeNotifier::new()),
+            idle_probe: Arc::new(FakeIdleProbe::default()),
+            enrollment_driver: Arc::new(NoopEnrollmentDriver),
+            wearable_source: Arc::new(NullWearableSource),
+            engine_ctrl_tx: ctrl_tx.clone(),
+        }));
+
+        let mut ctx = MonitoringContext::new(
+            Arc::clone(&core),
+            DetectionConfig::default(),
+            RawSamplesRetention::Disabled,
+        );
+        let wearable = WearableDescriptor {
+            mac: "AA:BB:CC:DD:EE:11".to_string(),
+            address_type: "public".to_string(),
+            alias: Some("Polar".to_string()),
+            advertised_name: Some("Polar H10".to_string()),
+            supports_rr: true,
+            supports_contact: true,
+        };
+        ctx.handle_wearable_event(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: base_ts,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await;
+
+        // Drive SleepEngine through warmup (>= 8 min) and sleep onset until Confirmed,
+        // varying BPM/RR slightly each second so flatline detection does not freeze warmup.
+        for sec in 0..(12 * 60) {
+            let bpm = 74.0 + ((sec % 7) as f64 - 3.0) * 0.6;
+            let rr = 810.0 + ((sec % 5) as f64 - 2.0) * 20.0;
+            ctx.handle_wearable_event(WearableEvent::HrPacket {
+                wearable: wearable.clone(),
+                packet: HrPacket {
+                    ts_ms: base_ts + sec * 1_000,
+                    bpm,
+                    rr_ms: vec![rr],
+                    contact_status: ContactStatus::Contact,
+                },
+            })
+            .await;
+        }
+        for sec in (12 * 60)..(25 * 60) {
+            let bpm = 54.0 + ((sec % 7) as f64 - 3.0) * 0.3;
+            let rr = 1_110.0 + ((sec % 5) as f64 - 2.0) * 10.0;
+            ctx.handle_wearable_event(WearableEvent::HrPacket {
+                wearable: wearable.clone(),
+                packet: HrPacket {
+                    ts_ms: base_ts + sec * 1_000,
+                    bpm,
+                    rr_ms: vec![rr],
+                    contact_status: ContactStatus::Contact,
+                },
+            })
+            .await;
+            if ctx.engine.state() == DetectorState::Confirmed {
+                break;
+            }
+        }
+        assert_eq!(ctx.engine.state(), DetectorState::Confirmed);
+
+        let expired_ts = base_ts + 25 * 60 * 1_000;
+        ctrl_tx
+            .send(EngineControlEvent::GraceOutcome(GraceOutcome {
+                ts_ms: expired_ts,
+                outcome: GraceResult::Expired,
+            }))
+            .await
+            .unwrap();
+
+        drain_control_and_close(&mut ctx, &mut ctrl_rx).await;
+        worker.shutdown_async().await;
+
+        let store = LedgerStore::open_read_only(&db_path).unwrap().unwrap();
+        let page = store.list_sessions(10, 0).unwrap();
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(page.sessions[0].sleeping_ts_ms, Some(expired_ts));
+    }
 }

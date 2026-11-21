@@ -20,6 +20,7 @@ struct FakeActionExecutorInner {
     lock_screen_error: Option<String>,
     resume_tx: Option<mpsc::Sender<()>>,
     resume_rx: Option<mpsc::Receiver<()>>,
+    power_action_tx: Option<mpsc::UnboundedSender<PowerAction>>,
 }
 
 #[derive(Clone)]
@@ -40,6 +41,7 @@ impl Default for FakeActionExecutor {
                 lock_screen_error: None,
                 resume_tx: Some(tx),
                 resume_rx: Some(rx),
+                power_action_tx: None,
             })),
         }
     }
@@ -75,6 +77,13 @@ impl FakeActionExecutor {
     pub fn set_power_action_override(&self, res: Result<PowerActionResult, ActionError>) {
         let mut guard = self.inner.lock().expect("mutex poisoned");
         guard.power_action_override = Some(res);
+    }
+
+    pub fn subscribe_power_actions(&self) -> mpsc::UnboundedReceiver<PowerAction> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut guard = self.inner.lock().expect("mutex poisoned");
+        guard.power_action_tx = Some(tx);
+        rx
     }
 
     pub fn set_lock_screen_error(&self, err: Option<String>) {
@@ -178,13 +187,22 @@ impl ActionExecutor for FakeActionExecutor {
         action: PowerAction,
     ) -> BoxFuture<'a, Result<PowerActionResult, ActionError>> {
         Box::pin(async move {
-            let mut guard = self.inner.lock().expect("mutex poisoned");
-            guard.events.push(format!("power_action:{action}"));
-            if let Some(res) = guard.power_action_override.clone() {
-                res
-            } else {
-                Ok(PowerActionResult::Executed)
+            let (res, notify_tx) = {
+                let mut guard = self.inner.lock().expect("mutex poisoned");
+                guard.events.push(format!("power_action:{action}"));
+                let res = if let Some(res) = guard.power_action_override.clone() {
+                    res
+                } else {
+                    Ok(PowerActionResult::Executed)
+                };
+                (res, guard.power_action_tx.clone())
+            };
+            if let Some(tx) = notify_tx {
+                let _ = tx.send(action);
+                // Yield once to mirror an async D-Bus logind roundtrip while listeners react.
+                tokio::task::yield_now().await;
             }
+            res
         })
     }
 
