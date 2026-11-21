@@ -13,7 +13,9 @@ use crate::daemon::wearable::{WearableDescriptor, WearableEvent, WearableSource}
 use crate::sleep_engine::{StreamState, StreamStatus};
 use crate::storage::LedgerStore;
 
-use super::dbus::{GattCharacteristic1Proxy, GattManager1Proxy, HRM_CHAR_UUID};
+use super::dbus::{
+    BATTERY_LEVEL_CHAR_UUID, GattCharacteristic1Proxy, GattManager1Proxy, HRM_CHAR_UUID,
+};
 use super::operations::{
     build_bluez_signal_stream, extract_bool, extract_byte_array, extract_mac_from_path,
     extract_string, extract_u8, find_characteristic_path, inspect_bluez_state, next_stream_msg,
@@ -99,6 +101,7 @@ struct BluezRuntimeCtx<'a> {
     tracker: &'a mut StreamTracker,
     known_descriptors: &'a mut HashMap<String, WearableDescriptor>,
     hrm_char_paths: &'a mut HashMap<String, String>,
+    battery_char_paths: &'a mut HashMap<String, String>,
     event_tx: &'a mpsc::Sender<WearableEvent>,
     system_conn: &'a zbus::Connection,
     session_conn: Option<&'a zbus::Connection>,
@@ -172,6 +175,7 @@ async fn run_bluez_source_task(
     let mut tracker = StreamTracker::new();
     let mut known_descriptors: HashMap<String, WearableDescriptor> = HashMap::new();
     let mut hrm_char_paths: HashMap<String, String> = HashMap::new();
+    let mut battery_char_paths: HashMap<String, String> = HashMap::new();
     let mut last_notification_id: u32 = 0;
 
     let registered_adapters =
@@ -183,6 +187,7 @@ async fn run_bluez_source_task(
             tracker: &mut tracker,
             known_descriptors: &mut known_descriptors,
             hrm_char_paths: &mut hrm_char_paths,
+            battery_char_paths: &mut battery_char_paths,
             event_tx: &event_tx,
             system_conn: &system_conn,
             session_conn: session_conn.as_ref(),
@@ -204,6 +209,7 @@ async fn run_bluez_source_task(
                     tracker: &mut tracker,
                     known_descriptors: &mut known_descriptors,
                     hrm_char_paths: &mut hrm_char_paths,
+                    battery_char_paths: &mut battery_char_paths,
                     event_tx: &event_tx,
                     system_conn: &system_conn,
                     session_conn: session_conn.as_ref(),
@@ -218,6 +224,7 @@ async fn run_bluez_source_task(
                         tracker: &mut tracker,
                         known_descriptors: &mut known_descriptors,
                         hrm_char_paths: &mut hrm_char_paths,
+                        battery_char_paths: &mut battery_char_paths,
                         event_tx: &event_tx,
                         system_conn: &system_conn,
                         session_conn: session_conn.as_ref(),
@@ -233,6 +240,7 @@ async fn run_bluez_source_task(
                         tracker: &mut tracker,
                         known_descriptors: &mut known_descriptors,
                         hrm_char_paths: &mut hrm_char_paths,
+                        battery_char_paths: &mut battery_char_paths,
                         event_tx: &event_tx,
                         system_conn: &system_conn,
                         session_conn: session_conn.as_ref(),
@@ -248,6 +256,7 @@ async fn run_bluez_source_task(
                         tracker: &mut tracker,
                         known_descriptors: &mut known_descriptors,
                         hrm_char_paths: &mut hrm_char_paths,
+                        battery_char_paths: &mut battery_char_paths,
                         event_tx: &event_tx,
                         system_conn: &system_conn,
                         session_conn: session_conn.as_ref(),
@@ -298,6 +307,7 @@ async fn sync_allowlist_and_snapshot(ctx: &mut BluezRuntimeCtx<'_>) {
         ctx.tracker.remove_enrolled(&mac);
         ctx.known_descriptors.remove(&mac);
         ctx.hrm_char_paths.remove(&mac);
+        ctx.battery_char_paths.remove(&mac);
     }
 
     for desc in loaded {
@@ -318,11 +328,24 @@ async fn sync_allowlist_and_snapshot(ctx: &mut BluezRuntimeCtx<'_>) {
         if let Some(char_path) = dev_snap.hrm_char_path {
             ctx.hrm_char_paths.insert(mac.clone(), char_path);
         }
+        if let Some(bat_path) = dev_snap.battery_char_path {
+            ctx.battery_char_paths.insert(mac.clone(), bat_path);
+        }
         if let Some(pct) = dev_snap.battery_pct {
             let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
                 mac: mac.clone(),
                 percentage: pct,
             });
+            if let Some(desc) = ctx.known_descriptors.get(&mac) {
+                let _ = ctx
+                    .event_tx
+                    .send(WearableEvent::Metadata {
+                        wearable: desc.clone(),
+                        battery: Some(pct),
+                        body_location: None,
+                    })
+                    .await;
+            }
         }
         if dev_snap.connected && !ctx.tracker.is_connected(&mac) {
             let actions = ctx
@@ -396,6 +419,7 @@ async fn handle_device_props_changed(
             process_lifecycle_actions(&actions, ctx).await;
         } else {
             ctx.hrm_char_paths.remove(mac);
+            ctx.battery_char_paths.remove(mac);
             let actions = ctx.tracker.handle_event(StreamEvent::Disconnected {
                 mac: mac.to_string(),
                 reason: DisconnectReason::Timeout,
@@ -423,6 +447,40 @@ async fn handle_characteristic_props_changed(
     let Some(bytes) = extract_byte_array(changed.get("Value")) else {
         return;
     };
+
+    let is_battery = match ctx.battery_char_paths.get(mac) {
+        Some(p) => p == path_str,
+        None => {
+            if let Ok(Some(found)) =
+                find_characteristic_path(ctx.system_conn, mac, BATTERY_LEVEL_CHAR_UUID).await
+            {
+                let found_str = found.as_str().to_string();
+                let matches = found_str == path_str;
+                ctx.battery_char_paths.insert(mac.to_string(), found_str);
+                matches
+            } else {
+                false
+            }
+        }
+    };
+    if is_battery && !bytes.is_empty() {
+        let pct = bytes[0];
+        let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
+            mac: mac.to_string(),
+            percentage: pct,
+        });
+        if let Some(desc) = ctx.known_descriptors.get(mac) {
+            let _ = ctx
+                .event_tx
+                .send(WearableEvent::Metadata {
+                    wearable: desc.clone(),
+                    battery: Some(pct),
+                    body_location: None,
+                })
+                .await;
+        }
+        return;
+    }
 
     let known_hrm = match ctx.hrm_char_paths.get(mac) {
         Some(p) => p == path_str,
@@ -483,13 +541,36 @@ async fn handle_interfaces_added_msg(msg: &zbus::Message, ctx: &mut BluezRuntime
 
     if let Some(char_props) = ifaces.get("org.bluez.GattCharacteristic1")
         && let Some(uuid) = extract_string(char_props.get("UUID"))
-        && uuid.eq_ignore_ascii_case(HRM_CHAR_UUID)
     {
-        ctx.hrm_char_paths.insert(mac.clone(), path_str.to_string());
-        if ctx.tracker.active_mac() == Some(mac.as_str())
-            && ctx.tracker.active_stream_status() == Some(StreamStatus::Connecting)
-        {
-            execute_start_notify(&mac, ctx).await;
+        if uuid.eq_ignore_ascii_case(HRM_CHAR_UUID) {
+            ctx.hrm_char_paths.insert(mac.clone(), path_str.to_string());
+            if ctx.tracker.active_mac() == Some(mac.as_str())
+                && ctx.tracker.active_stream_status() == Some(StreamStatus::Connecting)
+            {
+                execute_start_notify(&mac, ctx).await;
+            }
+        } else if uuid.eq_ignore_ascii_case(BATTERY_LEVEL_CHAR_UUID) {
+            ctx.battery_char_paths
+                .insert(mac.clone(), path_str.to_string());
+            if let Some(bytes) = extract_byte_array(char_props.get("Value"))
+                && !bytes.is_empty()
+            {
+                let pct = bytes[0];
+                let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
+                    mac: mac.clone(),
+                    percentage: pct,
+                });
+                if let Some(desc) = ctx.known_descriptors.get(&mac) {
+                    let _ = ctx
+                        .event_tx
+                        .send(WearableEvent::Metadata {
+                            wearable: desc.clone(),
+                            battery: Some(pct),
+                            body_location: None,
+                        })
+                        .await;
+                }
+            }
         }
     }
 }
@@ -607,6 +688,28 @@ async fn execute_start_notify(mac: &str, ctx: &mut BluezRuntimeCtx<'_>) {
             ts_ms: now_ms,
         });
         Box::pin(process_lifecycle_actions(&actions, ctx)).await;
+    }
+
+    let bat_char_path = if let Some(cached) = ctx.battery_char_paths.get(mac) {
+        ObjectPath::try_from(cached.as_str())
+            .ok()
+            .map(OwnedObjectPath::from)
+    } else {
+        let found = find_characteristic_path(ctx.system_conn, mac, BATTERY_LEVEL_CHAR_UUID)
+            .await
+            .ok()
+            .flatten();
+        if let Some(ref p) = found {
+            ctx.battery_char_paths
+                .insert(mac.to_string(), p.as_str().to_string());
+        }
+        found
+    };
+    if let Some(path) = bat_char_path
+        && let Ok(builder) = GattCharacteristic1Proxy::builder(ctx.system_conn).path(path)
+        && let Ok(bat_proxy) = builder.build().await
+    {
+        let _ = bat_proxy.start_notify().await;
     }
 
     let body_location = read_body_sensor_location(ctx.system_conn, mac)

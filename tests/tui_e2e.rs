@@ -3929,7 +3929,7 @@ fn test_mouse_wearables_table_row_click_and_overflow_scroll() {
 }
 
 #[test]
-fn test_mouse_wearables_action_bar_buttons_and_offline_guards() {
+fn test_mouse_wearables_footer_buttons_and_offline_guards() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
     app.active_tab = Tab::Wearables;
@@ -3948,20 +3948,23 @@ fn test_mouse_wearables_action_bar_buttons_and_offline_guards() {
         .unwrap();
     let buf = terminal.backend().buffer();
 
-    let (e_col, bar_row) = find_text_coords(buf, "[e] Enroll new").unwrap();
-    assert!(bar_row < 23, "Action bar should sit above the footer");
-    let (n_col, _) = find_text_coords_in_row(buf, bar_row, "[n] Rename alias").unwrap();
+    let (e_col, bar_row) = find_text_coords(buf, "[e] Enroll").unwrap();
+    assert_eq!(
+        bar_row, 23,
+        "Wearables actions should sit in the global footer"
+    );
+    let (n_col, _) = find_text_coords_in_row(buf, bar_row, "[n] Rename").unwrap();
     let (c_col, _) = find_text_coords_in_row(buf, bar_row, "[c] Reconnect").unwrap();
     let (u_col, _) = find_text_coords_in_row(buf, bar_row, "[u] Unenroll").unwrap();
 
     // [c] Reconnect dispatches WearableConnect for selected wearable
     assert_eq!(
-        app.handle_event(mouse_left_click(c_col + 5, bar_row)),
+        app.handle_event(mouse_left_click(c_col + 2, bar_row)),
         Some(TuiCommand::WearableConnect { id: "w-1".into() })
     );
 
-    // [n] Rename alias opens RenameModal
-    assert_eq!(app.handle_event(mouse_left_click(n_col + 5, bar_row)), None);
+    // [n] Rename opens RenameModal
+    assert_eq!(app.handle_event(mouse_left_click(n_col + 2, bar_row)), None);
     assert!(matches!(
         app.modal,
         ModalState::RenameModal {
@@ -3972,13 +3975,13 @@ fn test_mouse_wearables_action_bar_buttons_and_offline_guards() {
     app.modal = ModalState::None;
 
     // [u] Unenroll opens UnenrollModal
-    assert_eq!(app.handle_event(mouse_left_click(u_col + 4, bar_row)), None);
+    assert_eq!(app.handle_event(mouse_left_click(u_col + 2, bar_row)), None);
     assert!(matches!(app.modal, ModalState::UnenrollModal { .. }));
     app.modal = ModalState::None;
 
-    // [e] Enroll new opens EnrollmentModal and dispatches EnrollStart
+    // [e] Enroll opens EnrollmentModal and dispatches EnrollStart
     assert_eq!(
-        app.handle_event(mouse_left_click(e_col + 4, bar_row)),
+        app.handle_event(mouse_left_click(e_col + 2, bar_row)),
         Some(TuiCommand::EnrollStart(Some(30)))
     );
     assert!(matches!(app.modal, ModalState::EnrollmentModal { .. }));
@@ -4000,7 +4003,7 @@ fn test_mouse_wearables_action_bar_buttons_and_offline_guards() {
     );
     app.modal = ModalState::None;
 
-    // Offline guard: all action bar buttons and offline notice ignore clicks
+    // Offline guard: all footer action buttons ignore clicks
     app.daemon_connected = false;
     app.enrolled_wearables = vec![make_wearable(
         "w-1",
@@ -4013,10 +4016,8 @@ fn test_mouse_wearables_action_bar_buttons_and_offline_guards() {
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
-    let off_buf = terminal.backend().buffer();
-    let (off_col, off_row) = find_text_coords(off_buf, "(offline: read-only)").unwrap();
-    for col in [e_col + 1, n_col + 1, c_col + 1, u_col + 1, off_col + 1] {
-        assert_eq!(app.handle_event(mouse_left_click(col, off_row)), None);
+    for col in [e_col + 1, n_col + 1, c_col + 1, u_col + 1] {
+        assert_eq!(app.handle_event(mouse_left_click(col, bar_row)), None);
         assert_eq!(app.modal, ModalState::None);
     }
 }
@@ -4445,12 +4446,12 @@ async fn test_real_socket_mouse_enrollment_and_agent1_pairing_e2e() {
     app.handle_event(mouse_left_click(tab_col + 1, tab_row));
     assert_eq!(app.active_tab, Tab::Wearables);
 
-    // 2. Click [e] Enroll new in the Wearables action bar
+    // 2. Click [e] Enroll in the footer
     terminal
         .draw(|f| app.render(f.area(), f.buffer_mut()))
         .unwrap();
     let (enroll_btn_col, enroll_btn_row) =
-        find_text_coords(terminal.backend().buffer(), "[e] Enroll new").unwrap();
+        find_text_coords(terminal.backend().buffer(), "[e] Enroll").unwrap();
     let start_cmd = app
         .handle_event(mouse_left_click(enroll_btn_col + 1, enroll_btn_row))
         .unwrap();

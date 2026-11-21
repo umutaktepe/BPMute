@@ -11,6 +11,10 @@ pub const HRS_UUID: &str = "0000180d-0000-1000-8000-00805f9b34fb";
 pub const HRM_CHAR_UUID: &str = "00002a37-0000-1000-8000-00805f9b34fb";
 /// Standard BlueZ 16-bit Body Sensor Location characteristic UUID.
 pub const BODY_SENSOR_LOC_UUID: &str = "00002a38-0000-1000-8000-00805f9b34fb";
+/// Standard BlueZ 16-bit Battery Service UUID in expanded 128-bit form.
+pub const BATTERY_SERVICE_UUID: &str = "0000180f-0000-1000-8000-00805f9b34fb";
+/// Standard BlueZ 16-bit Battery Level characteristic UUID.
+pub const BATTERY_LEVEL_CHAR_UUID: &str = "00002a19-0000-1000-8000-00805f9b34fb";
 
 #[proxy(default_service = "org.bluez", interface = "org.bluez.Adapter1")]
 pub trait Adapter1 {

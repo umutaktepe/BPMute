@@ -10,7 +10,8 @@ use zbus::{MatchRule, MessageStream};
 use crate::ipc::protocol::DiscoveredWearable;
 
 use super::dbus::{
-    Adapter1Proxy, Battery1Proxy, Device1Proxy, GattCharacteristic1Proxy, HRM_CHAR_UUID, HRS_UUID,
+    Adapter1Proxy, BATTERY_LEVEL_CHAR_UUID, Battery1Proxy, Device1Proxy, GattCharacteristic1Proxy,
+    HRM_CHAR_UUID, HRS_UUID,
 };
 use super::packet::{BodySensorLocation, parse_body_sensor_location};
 
@@ -27,6 +28,7 @@ pub(crate) struct BluezSnapshot {
 pub(crate) struct BluezDeviceSnapshot {
     pub connected: bool,
     pub hrm_char_path: Option<String>,
+    pub battery_char_path: Option<String>,
     pub battery_pct: Option<u8>,
 }
 
@@ -59,15 +61,26 @@ pub(crate) async fn inspect_bluez_state(conn: &zbus::Connection) -> zbus::Result
             && let Some(mac) = extract_mac_from_path(path.as_str())
         {
             let entry = snap.devices.entry(mac).or_default();
-            entry.battery_pct = extract_u8(bat_props.get("Percentage"));
+            if let Some(pct) = extract_u8(bat_props.get("Percentage")) {
+                entry.battery_pct = Some(pct);
+            }
         }
         if let Some(char_props) = ifaces.get("org.bluez.GattCharacteristic1")
             && let Some(uuid) = extract_string(char_props.get("UUID"))
-            && uuid.eq_ignore_ascii_case(HRM_CHAR_UUID)
             && let Some(mac) = extract_mac_from_path(path.as_str())
         {
             let entry = snap.devices.entry(mac).or_default();
-            entry.hrm_char_path = Some(path.as_str().to_string());
+            if uuid.eq_ignore_ascii_case(HRM_CHAR_UUID) {
+                entry.hrm_char_path = Some(path.as_str().to_string());
+            } else if uuid.eq_ignore_ascii_case(BATTERY_LEVEL_CHAR_UUID) {
+                entry.battery_char_path = Some(path.as_str().to_string());
+                if entry.battery_pct.is_none()
+                    && let Some(bytes) = extract_byte_array(char_props.get("Value"))
+                    && !bytes.is_empty()
+                {
+                    entry.battery_pct = Some(bytes[0]);
+                }
+            }
         }
     }
 
@@ -442,16 +455,31 @@ pub async fn read_body_sensor_location(
     }
 }
 
-/// Reads the battery percentage from `org.bluez.Battery1` if available.
+/// Reads the battery percentage from `org.bluez.Battery1` if available, or falls back to
+/// standard GATT Battery Level characteristic (`0x2A19`).
 pub async fn read_battery_percentage(
     conn: &zbus::Connection,
     mac: &str,
 ) -> zbus::Result<Option<u8>> {
-    let Some(path) = find_device_object_path(conn, mac).await? else {
-        return Ok(None);
-    };
-    let battery = Battery1Proxy::builder(conn).path(path)?.build().await?;
-    battery.percentage().await.map(Some)
+    if let Some(path) = find_device_object_path(conn, mac).await?
+        && let Ok(builder) = Battery1Proxy::builder(conn).path(path)
+        && let Ok(battery) = builder.build().await
+        && let Ok(pct) = battery.percentage().await
+    {
+        return Ok(Some(pct));
+    }
+
+    if let Some(path) =
+        find_characteristic_path(conn, mac, super::dbus::BATTERY_LEVEL_CHAR_UUID).await?
+        && let Ok(builder) = GattCharacteristic1Proxy::builder(conn).path(path)
+        && let Ok(characteristic) = builder.build().await
+        && let Ok(val) = characteristic.read_value(HashMap::new()).await
+        && !val.is_empty()
+    {
+        return Ok(Some(val[0]));
+    }
+
+    Ok(None)
 }
 
 pub(crate) fn extract_string(val: Option<&OwnedValue>) -> Option<String> {

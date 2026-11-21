@@ -5,9 +5,7 @@ use ratatui::widgets::{Clear, Paragraph, Row, Table, Widget};
 
 use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget, UnenrollCheckbox};
-use super::{
-    build_clickable_row_line, build_modal_clickable_row_line, centered_rect, fit_scroll_offset,
-};
+use super::{build_modal_clickable_row_line, centered_rect, fit_scroll_offset};
 
 pub(crate) struct WearablesScrollOffsets {
     pub(crate) table: usize,
@@ -27,16 +25,7 @@ pub(crate) fn render_wearables(
         };
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(3)])
-        .split(area);
-
-    let table_area = chunks[0];
-    let action_area = chunks[1];
-
-    let table = render_wearables_table(app, table_area, buf, hit_map);
-    render_wearables_actions(app, action_area, buf, hit_map);
+    let table = render_wearables_table(app, area, buf, hit_map);
 
     let enrollment = match app.modal {
         ModalState::EnrollmentModal { .. } => render_enrollment_modal(app, area, buf, hit_map),
@@ -156,53 +145,6 @@ fn render_wearables_table(
     let table = Table::new(rows, widths).header(header).block(block);
     Widget::render(table, area, buf);
     scroll_offset
-}
-
-fn render_wearables_actions(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
-    let block = app.theme.card_block("");
-    let inner = block.inner(area);
-    block.render(area, buf);
-
-    let key_style = if app.daemon_connected {
-        app.theme.key_hint()
-    } else {
-        app.theme.muted()
-    };
-    let text_style = if app.daemon_connected {
-        app.theme.base()
-    } else {
-        app.theme.muted()
-    };
-
-    let enroll_target = app.daemon_connected.then_some(ClickTarget::WearablesEnroll);
-    let can_act = app.can_act_on_selected_wearable();
-    let rename_target = can_act.then_some(ClickTarget::WearablesRename);
-    let reconnect_target = can_act.then_some(ClickTarget::WearablesReconnect);
-    let unenroll_target = can_act.then_some(ClickTarget::WearablesUnenroll);
-
-    let mut items = vec![
-        (Span::styled("  ", text_style), None),
-        (Span::styled("[e]", key_style), enroll_target),
-        (Span::styled(" Enroll new", text_style), enroll_target),
-        (Span::styled("  ", text_style), None),
-        (Span::styled("[n]", key_style), rename_target),
-        (Span::styled(" Rename alias", text_style), rename_target),
-        (Span::styled("  ", text_style), None),
-        (Span::styled("[c]", key_style), reconnect_target),
-        (Span::styled(" Reconnect", text_style), reconnect_target),
-        (Span::styled("  ", text_style), None),
-        (Span::styled("[u]", key_style), unenroll_target),
-        (Span::styled(" Unenroll", text_style), unenroll_target),
-    ];
-    if !app.daemon_connected {
-        items.push((
-            Span::styled("  (offline: read-only)", app.theme.muted()),
-            None,
-        ));
-    }
-
-    let line = build_clickable_row_line(inner, inner.y, items, hit_map);
-    Paragraph::new(vec![line]).render(inner, buf);
 }
 
 fn render_enrollment_modal(

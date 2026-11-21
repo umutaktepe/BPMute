@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::Duration;
 
@@ -23,6 +23,8 @@ const HRM_CHAR_PATH: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0010/c
 const DEVICE2_MAC: &str = "11:22:33:44:55:66";
 const DEVICE2_PATH: &str = "/org/bluez/hci0/dev_11_22_33_44_55_66";
 const HRM_CHAR2_PATH: &str = "/org/bluez/hci0/dev_11_22_33_44_55_66/service0010/char0011";
+const BATTERY_LEVEL_CHAR_UUID: &str = "00002a19-0000-1000-8000-00805f9b34fb";
+const BATTERY_CHAR_PATH: &str = "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF/service0012/char0013";
 
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.bluez.Error")]
@@ -94,6 +96,10 @@ struct MockBluezState {
     expose_second_wearable: Arc<AtomicBool>,
     second_connected: Arc<AtomicBool>,
     second_notify_started: Arc<AtomicBool>,
+    battery_char_path: String,
+    expose_battery_char: Arc<AtomicBool>,
+    battery_level: Arc<AtomicU8>,
+    battery_notify_started: Arc<AtomicBool>,
 }
 
 struct MockBluezOptions<'a> {
@@ -106,6 +112,8 @@ struct MockBluezOptions<'a> {
     fail_start_discovery: bool,
     fail_connect: bool,
     expose_second_wearable: bool,
+    expose_battery_char: bool,
+    battery_level: u8,
 }
 
 impl Default for MockBluezOptions<'_> {
@@ -120,6 +128,8 @@ impl Default for MockBluezOptions<'_> {
             fail_start_discovery: false,
             fail_connect: false,
             expose_second_wearable: false,
+            expose_battery_char: false,
+            battery_level: 85,
         }
     }
 }
@@ -190,6 +200,25 @@ impl MockObjectManager {
             objects.insert(
                 OwnedObjectPath::try_from(self.state.hrm_char_path.as_str()).unwrap(),
                 char_ifaces,
+            );
+        }
+
+        if self.state.expose_battery_char.load(Ordering::SeqCst) {
+            let mut bat_ifaces = HashMap::new();
+            let mut bat_props = HashMap::new();
+            bat_props.insert("UUID".to_string(), owned(BATTERY_LEVEL_CHAR_UUID));
+            bat_props.insert(
+                "Notifying".to_string(),
+                owned(self.state.battery_notify_started.load(Ordering::SeqCst)),
+            );
+            bat_props.insert(
+                "Value".to_string(),
+                owned(vec![self.state.battery_level.load(Ordering::SeqCst)]),
+            );
+            bat_ifaces.insert("org.bluez.GattCharacteristic1".to_string(), bat_props);
+            objects.insert(
+                OwnedObjectPath::try_from(self.state.battery_char_path.as_str()).unwrap(),
+                bat_ifaces,
             );
         }
 
@@ -396,6 +425,48 @@ impl MockHrmCharacteristic {
     }
 }
 
+struct MockBatteryCharacteristic {
+    state: MockBluezState,
+}
+
+#[interface(name = "org.bluez.GattCharacteristic1")]
+impl MockBatteryCharacteristic {
+    async fn read_value(
+        &self,
+        _options: HashMap<String, Value<'_>>,
+    ) -> Result<Vec<u8>, MockBluezError> {
+        Ok(vec![self.state.battery_level.load(Ordering::SeqCst)])
+    }
+
+    async fn start_notify(&self, #[zbus(signal_context)] ctxt: SignalContext<'_>) {
+        self.state
+            .battery_notify_started
+            .store(true, Ordering::SeqCst);
+        let _ = self.value_changed(&ctxt).await;
+    }
+
+    fn stop_notify(&self) {
+        self.state
+            .battery_notify_started
+            .store(false, Ordering::SeqCst);
+    }
+
+    #[zbus(property)]
+    fn uuid(&self) -> String {
+        BATTERY_LEVEL_CHAR_UUID.to_string()
+    }
+
+    #[zbus(property)]
+    fn notifying(&self) -> bool {
+        self.state.battery_notify_started.load(Ordering::SeqCst)
+    }
+
+    #[zbus(property)]
+    fn value(&self) -> Vec<u8> {
+        vec![self.state.battery_level.load(Ordering::SeqCst)]
+    }
+}
+
 struct MockDevice2 {
     state: MockBluezState,
 }
@@ -507,6 +578,7 @@ async fn start_mock_bluez_with_options(
 ) -> (zbus::Connection, MockBluezState) {
     let device_path = format!("{}/dev_AA_BB_CC_DD_EE_FF", opts.adapter_path);
     let hrm_char_path = format!("{device_path}/service0010/char0011");
+    let battery_char_path = format!("{device_path}/service0012/char0013");
     let state = MockBluezState {
         adapter_path: opts.adapter_path.to_string(),
         device_path: device_path.clone(),
@@ -525,6 +597,10 @@ async fn start_mock_bluez_with_options(
         expose_second_wearable: Arc::new(AtomicBool::new(opts.expose_second_wearable)),
         second_connected: Arc::new(AtomicBool::new(false)),
         second_notify_started: Arc::new(AtomicBool::new(false)),
+        battery_char_path: battery_char_path.clone(),
+        expose_battery_char: Arc::new(AtomicBool::new(opts.expose_battery_char)),
+        battery_level: Arc::new(AtomicU8::new(opts.battery_level)),
+        battery_notify_started: Arc::new(AtomicBool::new(false)),
     };
     let conn = zbus::connection::Builder::address(bus_addr)
         .expect("valid private dbus addr")
@@ -561,6 +637,13 @@ async fn start_mock_bluez_with_options(
         .serve_at(
             hrm_char_path.as_str(),
             MockHrmCharacteristic {
+                state: state.clone(),
+            },
+        )
+        .unwrap()
+        .serve_at(
+            battery_char_path.as_str(),
+            MockBatteryCharacteristic {
                 state: state.clone(),
             },
         )
@@ -653,6 +736,24 @@ async fn wait_for_wearable_status(client: &mut IpcClient, expected_status: &str)
                 && arr
                     .iter()
                     .any(|w| w["status"].as_str() == Some(expected_status))
+            {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn wait_for_wearable_battery(client: &mut IpcClient, expected_pct: u8) -> bool {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(res) = client.request("wearable.list", json!({})).await
+                && let Some(arr) = res["wearables"].as_array()
+                && arr
+                    .iter()
+                    .any(|w| w["battery"].as_u64() == Some(u64::from(expected_pct)))
             {
                 return true;
             }
@@ -1494,4 +1595,100 @@ async fn tui_enroll_select_second_reachable_wearable_enters_passive_standby() {
     );
     assert!(bluez_state.second_connected.load(Ordering::SeqCst));
     assert!(!bluez_state.second_notify_started.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn read_battery_percentage_reads_gatt_2a19_when_battery1_missing() {
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    let (conn, _state) = start_mock_bluez_with_options(
+        &bus_addr,
+        MockBluezOptions {
+            expose_wearable: true,
+            expose_hrs_uuid: true,
+            initial_connected: true,
+            initial_gatt: true,
+            expose_battery_char: true,
+            battery_level: 85,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let res = bpmute::bluetooth::operations::read_battery_percentage(&conn, DEVICE_MAC).await;
+    assert_eq!(res.unwrap(), Some(85));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bluez_daemon_reads_and_updates_battery_from_gatt_2a19() {
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    let (bluez_conn, _bluez_state) = start_mock_bluez_with_options(
+        &bus_addr,
+        MockBluezOptions {
+            expose_wearable: true,
+            expose_hrs_uuid: true,
+            initial_connected: true,
+            initial_gatt: true,
+            expose_battery_char: true,
+            battery_level: 85,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (_daemon_guard, mut client, socket_path) = spawn_daemon_and_connect(&temp, &bus_addr).await;
+
+    client
+        .request("daemon.subscribe", json!({}))
+        .await
+        .expect("subscribe succeeds");
+
+    let enroll_out = tokio::process::Command::new(env!("CARGO_BIN_EXE_bpmute"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "enroll",
+            "--address",
+            DEVICE_MAC,
+            "--alias",
+            "Watch",
+        ])
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &bus_addr)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null")
+        .output()
+        .await
+        .expect("bpmute enroll runs");
+    assert!(enroll_out.status.success());
+
+    assert!(
+        wait_for_wearable_status(&mut client, "acquiring").await
+            || wait_for_wearable_status(&mut client, "streaming").await
+    );
+
+    // Initial battery percentage from GATT 0x2A19 must be read into wearable status
+    assert!(
+        wait_for_wearable_battery(&mut client, 85).await,
+        "battery percentage 85% must be reflected in wearable.list"
+    );
+
+    // When GATT 0x2A19 emits PropertiesChanged with new battery level 79%
+    let mut changed: HashMap<&str, Value<'_>> = HashMap::new();
+    changed.insert("Value", Value::from(vec![79u8]));
+    let invalidated: Vec<&str> = Vec::new();
+    bluez_conn
+        .emit_signal(
+            Option::<zbus::names::BusName>::None,
+            BATTERY_CHAR_PATH,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("org.bluez.GattCharacteristic1", changed, invalidated),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        wait_for_wearable_battery(&mut client, 79).await,
+        "battery percentage 79% must be reflected in wearable.list after PropertiesChanged"
+    );
 }
