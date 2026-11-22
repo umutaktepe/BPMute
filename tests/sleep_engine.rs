@@ -1642,3 +1642,296 @@ fn tier1_calibrated_and_cold_start_post_workout_recovery_zero_false_positives() 
         }
     }
 }
+
+fn push_rsa_sleep(
+    engine: &mut SleepEngine,
+    start_sec: i64,
+    end_sec: i64,
+    target_bpm: f64,
+    rsa_amp_ms: f64,
+) -> Vec<EngineOutput> {
+    let mut out = Vec::new();
+    for sec in start_sec..=end_sec {
+        let bpm = target_bpm + 0.3 * (sec as f64 * 0.4).sin();
+        let phase = (sec as f64) * std::f64::consts::TAU / 6.0;
+        let rr_ms = vec![60_000.0 / bpm + rsa_amp_ms * phase.sin()];
+        out.extend(engine.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms,
+            contact_status: ContactStatus::Contact,
+        })));
+    }
+    out
+}
+
+fn enter_sleeping_engine() -> (SleepEngine, i64) {
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 600, 68.0, true);
+    let (_, t_conf_sec) = push_sleep_until_state(
+        &mut eng,
+        601,
+        1800,
+        68.0,
+        56.0,
+        true,
+        DetectorState::Confirmed,
+    );
+    assert_eq!(eng.state(), DetectorState::Confirmed);
+    let g_out = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: (t_conf_sec + 1) * 1000,
+        outcome: GraceResult::Expired,
+    }));
+    assert!(g_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            to: DetectorState::Sleeping,
+            ..
+        }
+    )));
+    (eng, t_conf_sec + 2)
+}
+
+fn extract_session_ended(outputs: &[EngineOutput]) -> &bpmute::sleep_engine::SessionSummary {
+    outputs
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::SessionEnded(s) => Some(s),
+            _ => None,
+        })
+        .expect("Monitoring Session must emit SessionEnded")
+}
+
+fn push_wake_arousal(
+    engine: &mut SleepEngine,
+    start_sec: i64,
+    max_end_sec: i64,
+    base_bpm: f64,
+) -> (Vec<EngineOutput>, i64) {
+    let mut out = Vec::new();
+    for sec in start_sec..=max_end_sec {
+        let bpm = base_bpm + 8.0 * (sec as f64 * 0.35).sin();
+        let phase = (sec as f64) * std::f64::consts::TAU / 6.0;
+        let rr_ms = vec![60_000.0 / bpm + 4.0 * phase.sin()];
+        let step_out = engine.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms,
+            contact_status: ContactStatus::Contact,
+        }));
+        let ended = step_out
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SessionEnded(_)));
+        out.extend(step_out);
+        if ended {
+            return (out, sec);
+        }
+    }
+    (out, max_end_sec)
+}
+
+#[test]
+fn wake_tail_excluded_on_sustained_wakefulness_session_close() {
+    use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
+
+    // Real physiological BPM+RR trace: 15 min QuietWake -> 7 min N1 -> 12 min N2 (~60 bpm) -> 12 min PostSleepWake (~86 bpm).
+    let pheno = Phenotype::typical();
+    let trace = generate_paired_trace(
+        42,
+        pheno,
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep { duration_sec: 720 },
+            StageKind::PostSleepWake {
+                duration_sec: 900,
+                elevation_bpm: 18.0,
+            },
+        ],
+    );
+
+    let mut eng = default_engine();
+    let mut summary = None;
+    let mut grace_delivered = false;
+    for ev in &trace.bpm_rr {
+        let out = eng.handle_event(ev.clone());
+        for o in &out {
+            if let EngineOutput::StateChanged {
+                ts_ms,
+                to: DetectorState::Confirmed,
+                ..
+            } = o
+                && !grace_delivered
+            {
+                grace_delivered = true;
+                let _ = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+                    ts_ms: ts_ms + 1_000,
+                    outcome: GraceResult::Expired,
+                }));
+            }
+            if let EngineOutput::SessionEnded(s) = o {
+                summary = Some(s.clone());
+            }
+        }
+        if summary.is_some() {
+            break;
+        }
+    }
+
+    let summary = summary.expect("PostSleepWake must close the Monitoring Session");
+    assert_eq!(summary.end_reason, SessionEndReason::SustainedWakefulness);
+    let sleep_mu = summary.sleep_mu_hr.expect("sleep_mu_hr must be present");
+    let target_sleep_hr = pheno.quiet_wake_hr - pheno.sleep_drop_bpm;
+    assert!(
+        (target_sleep_hr - 2.0..=target_sleep_hr + 2.5).contains(&sleep_mu),
+        "trailing PostSleepWake tail must be excluded from sleep_mu_hr (expected ~{target_sleep_hr:.1}, got {sleep_mu:.2})",
+    );
+    let var_ratio = summary
+        .observed_hr_var_ratio
+        .expect("observed_hr_var_ratio must be present");
+    assert!(
+        var_ratio < 0.65,
+        "trailing wake tail must not inflate observed_hr_var_ratio (got {var_ratio:.3})"
+    );
+    let ln_rmssd = summary
+        .sleep_ln_rmssd
+        .expect("sleep_ln_rmssd must be present");
+    assert!(
+        ln_rmssd > 3.2,
+        "trailing wake tail must not depress sleep_ln_rmssd (got {ln_rmssd:.3})"
+    );
+}
+
+#[test]
+fn wake_tail_rejoined_on_sleep_resume_and_excluded_on_gap_close() {
+    let (mut eng, t0) = enter_sleeping_engine();
+
+    // 3 min sleep (56 bpm) -> 4 min light/excursion (67 bpm, p_sleep < 0.30) -> 3 min sleep (56 bpm)
+    // -> 5 min wake tail (88 bpm) -> >15 min disconnection (GapExceeded).
+    let t1 = t0 + 180;
+    let _ = push_rsa_sleep(&mut eng, t0, t1, 56.0, 25.0);
+    let t2 = t1 + 240;
+    let exc_out = push_rsa_sleep(&mut eng, t1 + 1, t2, 67.0, 20.0);
+    assert!(
+        exc_out.iter().any(|o| matches!(
+            o,
+            EngineOutput::EpochEmitted(ep) if ep.p_sleep < 0.30
+        )),
+        "mid-sleep 67 bpm excursion must drop below 0.30"
+    );
+    let t3 = t2 + 180;
+    let _ = push_rsa_sleep(&mut eng, t2 + 1, t3, 56.0, 25.0);
+    let t4 = t3 + 300;
+    let _ = push_rsa_sleep(&mut eng, t3 + 1, t4, 88.0, 4.0);
+
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: (t4 + 1) * 1000,
+        status: StreamStatus::Disconnected,
+    }));
+    let gap_out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: (t4 + 960) * 1000,
+        status: StreamStatus::Streaming,
+    }));
+    let gap_summary = extract_session_ended(&gap_out);
+    assert_eq!(gap_summary.end_reason, SessionEndReason::GapExceeded);
+    let gap_mu = gap_summary.sleep_mu_hr.unwrap();
+    assert!(
+        (56.5..=67.5).contains(&gap_mu),
+        "rejoined mid-sleep excursion must lift median above 56.5 while final 88 bpm wake tail is dropped (got {gap_mu:.2})"
+    );
+}
+
+#[test]
+fn wake_tail_excluded_on_rebound_and_promoted_when_committed_empty() {
+    let (mut eng, s_start) = enter_sleeping_engine();
+    let s_end = s_start + 300;
+    let _ = push_rsa_sleep(&mut eng, s_start, s_end, 56.0, 25.0);
+    eng.handle_event(EngineEvent::DesktopActivity(DesktopActivity {
+        ts_ms: (s_end + 1) * 1000,
+        kind: DesktopActivityKind::UserInput,
+    }));
+    let (reb_out, _) = push_wake_arousal(&mut eng, s_end + 2, s_end + 400, 88.0);
+    let reb_summary = extract_session_ended(&reb_out);
+    assert_eq!(reb_summary.end_reason, SessionEndReason::DesktopWakeRebound);
+    let reb_mu = reb_summary.sleep_mu_hr.unwrap();
+    assert!(
+        (54.5..=57.5).contains(&reb_mu),
+        "DesktopWakeRebound must exclude trailing wake tail from sleep_mu_hr (got {reb_mu:.2})"
+    );
+    assert!(
+        reb_summary.observed_hr_var_ratio.unwrap() < 0.65,
+        "DesktopWakeRebound must exclude trailing wake tail from observed_hr_var_ratio"
+    );
+
+    // Fallback: if Sleeping closes with only p_sleep < 0.30 wake_tail epochs (empty committed buffer),
+    // finalize_medians promotes wake_tail rather than returning None.
+    use bpmute::sleep_engine::EpochFeatures;
+    let mut eng_fb = default_engine();
+    eng_fb.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let mut ts = 15_000_i64;
+    let wake_feat = EpochFeatures {
+        hr_bpm_60s: 68.0,
+        z_hr: 0.0,
+        hr_slope_4m: 0.0,
+        r_var_120s: 0.95,
+        ln_rmssd_60s: None,
+        delta_ln_rmssd_60s: None,
+        rmssd_sdnn_120s: None,
+    };
+    for _ in 0..32 {
+        eng_fb.feed_epoch_features(ts, wake_feat.clone(), false, 1.0, false);
+        ts += 15_000;
+    }
+    let sleep_feat = EpochFeatures {
+        hr_bpm_60s: 54.0,
+        z_hr: -2.6,
+        hr_slope_4m: -0.3,
+        r_var_120s: 0.35,
+        ln_rmssd_60s: None,
+        delta_ln_rmssd_60s: None,
+        rmssd_sdnn_120s: None,
+    };
+    while eng_fb.state() != DetectorState::Confirmed {
+        eng_fb.feed_epoch_features(ts, sleep_feat.clone(), false, 1.0, false);
+        ts += 15_000;
+    }
+    eng_fb.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: ts,
+        outcome: GraceResult::Expired,
+    }));
+    assert_eq!(eng_fb.state(), DetectorState::Sleeping);
+
+    let high_wake_feat = EpochFeatures {
+        hr_bpm_60s: 88.0,
+        z_hr: 5.0,
+        hr_slope_4m: 0.8,
+        r_var_120s: 1.8,
+        ln_rmssd_60s: None,
+        delta_ln_rmssd_60s: None,
+        rmssd_sdnn_120s: None,
+    };
+    let mut fb_summary = None;
+    for _ in 0..45 {
+        ts += 15_000;
+        for o in eng_fb.feed_epoch_features(ts, high_wake_feat.clone(), false, 1.0, false) {
+            if let EngineOutput::SessionEnded(s) = o {
+                fb_summary = Some(s);
+            }
+        }
+        if fb_summary.is_some() {
+            break;
+        }
+    }
+    let fb_summary = fb_summary.expect("SustainedWakefulness must close fallback session");
+    assert!(
+        fb_summary.sleep_mu_hr.is_some_and(|hr| hr > 80.0),
+        "empty committed buffer must promote wake_tail fallback on close"
+    );
+}

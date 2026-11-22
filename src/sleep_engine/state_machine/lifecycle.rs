@@ -3,7 +3,7 @@
 use crate::config::DetectionConfig;
 use crate::sleep_engine::baseline::QuietWakeBaseline;
 use crate::sleep_engine::hmm::STATE_SLEEP_NREM;
-use crate::sleep_engine::ppg::{PpgPipeline, SIGMA_MIN_BPM, quantile};
+use crate::sleep_engine::ppg::{PpgPipeline, SIGMA_MIN_BPM};
 use crate::sleep_engine::state_machine::{
     CANCEL_COOLDOWN_MS, DEFAULT_EXPECTED_Z_SLEEP, MEDIUM_GAP_MAX_MS,
     MEDIUM_GAP_STABILIZATION_EPOCHS, SHORT_GAP_MAX_MS, SleepEngine, WARMUP_EPOCHS_CALIBRATED,
@@ -288,9 +288,7 @@ impl SleepEngine {
         self.sleeping_hr_anchor = None;
         self.last_sleeping_desktop_activity_ms = None;
         self.post_trigger_sleep_sec = 0;
-        self.sleep_hr_samples.clear();
-        self.sleep_ln_rmssd_samples.clear();
-        self.sleep_var_ratio_samples.clear();
+        self.sleep_samples.clear();
     }
 
     pub(super) fn reset_session_accumulators(&mut self, ts_ms: i64) {
@@ -388,9 +386,8 @@ impl SleepEngine {
         let Some(session_index) = self.session_index else {
             return;
         };
-        let sleep_mu_hr = quantile(&self.sleep_hr_samples, 0.5);
-        let sleep_ln_rmssd = quantile(&self.sleep_ln_rmssd_samples, 0.5);
-        let observed_hr_var_ratio = quantile(&self.sleep_var_ratio_samples, 0.5);
+        let (sleep_mu_hr, sleep_ln_rmssd, observed_hr_var_ratio) =
+            self.sleep_samples.finalize_medians();
         let typical_sqi = (self.sqi_count > 0).then(|| self.sqi_sum / self.sqi_count as f64);
         let summary = SessionSummary {
             session_index,

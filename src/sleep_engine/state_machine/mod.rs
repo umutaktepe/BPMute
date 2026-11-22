@@ -36,6 +36,79 @@ struct EpochStepInput<'a> {
     accumulators_frozen: bool,
 }
 
+#[derive(Debug, Default)]
+struct SleepSampleVecs {
+    hr: Vec<f64>,
+    ln_rmssd: Vec<f64>,
+    var_ratio: Vec<f64>,
+}
+
+impl SleepSampleVecs {
+    fn push(&mut self, hr: f64, ln_rmssd: Option<f64>, var_ratio: f64) {
+        self.hr.push(hr);
+        if let Some(ln_r) = ln_rmssd {
+            self.ln_rmssd.push(ln_r);
+        }
+        if var_ratio.is_finite() {
+            self.var_ratio.push(var_ratio);
+        }
+    }
+
+    fn append_from(&mut self, other: &mut Self) {
+        self.hr.append(&mut other.hr);
+        self.ln_rmssd.append(&mut other.ln_rmssd);
+        self.var_ratio.append(&mut other.var_ratio);
+    }
+
+    fn clear(&mut self) {
+        self.hr.clear();
+        self.ln_rmssd.clear();
+        self.var_ratio.clear();
+    }
+}
+
+#[derive(Debug, Default)]
+struct SleepSampleBuffers {
+    committed: SleepSampleVecs,
+    wake_tail: SleepSampleVecs,
+}
+
+impl SleepSampleBuffers {
+    fn record_epoch(
+        &mut self,
+        is_wake_epoch: bool,
+        hr: f64,
+        ln_rmssd: Option<f64>,
+        var_ratio: f64,
+    ) {
+        if is_wake_epoch {
+            self.wake_tail.push(hr, ln_rmssd, var_ratio);
+        } else {
+            // Rejoin buffered brief wake/REM intervals when consolidated sleep resumes.
+            self.committed.append_from(&mut self.wake_tail);
+            self.committed.push(hr, ln_rmssd, var_ratio);
+        }
+    }
+
+    fn finalize_medians(&mut self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        if self.committed.hr.is_empty() {
+            self.committed.append_from(&mut self.wake_tail);
+        } else {
+            self.wake_tail.clear();
+        }
+        (
+            crate::sleep_engine::ppg::quantile(&self.committed.hr, 0.5),
+            crate::sleep_engine::ppg::quantile(&self.committed.ln_rmssd, 0.5),
+            crate::sleep_engine::ppg::quantile(&self.committed.var_ratio, 0.5),
+        )
+    }
+
+    fn clear(&mut self) {
+        self.committed.clear();
+        self.wake_tail.clear();
+    }
+}
+
 /// Pure-synchronous sleep-onset detection engine.
 pub struct SleepEngine {
     config: EngineConfig,
@@ -61,9 +134,7 @@ pub struct SleepEngine {
     snooze_count: u8,
     had_rr: bool,
     post_trigger_sleep_sec: u32,
-    sleep_hr_samples: Vec<f64>,
-    sleep_ln_rmssd_samples: Vec<f64>,
-    sleep_var_ratio_samples: Vec<f64>,
+    sleep_samples: SleepSampleBuffers,
     sqi_sum: f64,
     sqi_count: usize,
 
@@ -120,9 +191,7 @@ impl SleepEngine {
             snooze_count: 0,
             had_rr: false,
             post_trigger_sleep_sec: 0,
-            sleep_hr_samples: Vec::new(),
-            sleep_ln_rmssd_samples: Vec::new(),
-            sleep_var_ratio_samples: Vec::new(),
+            sleep_samples: SleepSampleBuffers::default(),
             sqi_sum: 0.0,
             sqi_count: 0,
             suppress_candidate_until_ms: None,
@@ -388,14 +457,15 @@ impl SleepEngine {
                 }
                 DetectorState::Sleeping => {
                     self.baseline.set_frozen(true);
-                    self.sleep_hr_samples.push(features.hr_bpm_60s);
-                    if hrv_valid && let Some(ln_r) = features.ln_rmssd_60s {
-                        self.sleep_ln_rmssd_samples.push(ln_r);
-                    }
-                    if unclamped_var_ratio.is_finite() {
-                        self.sleep_var_ratio_samples.push(unclamped_var_ratio);
-                    }
-                    if p_sleep < 0.30 {
+                    let is_wake_epoch = p_sleep < 0.30;
+                    let ln_r = hrv_valid.then_some(features.ln_rmssd_60s).flatten();
+                    self.sleep_samples.record_epoch(
+                        is_wake_epoch,
+                        features.hr_bpm_60s,
+                        ln_r,
+                        unclamped_var_ratio,
+                    );
+                    if is_wake_epoch {
                         self.post_sleep_wake_sec += 15;
                     } else {
                         self.post_sleep_wake_sec = 0;
