@@ -20,9 +20,7 @@ use bpmute::actions::traits::{ActionExecutor, GracePhase, PowerActionResult};
 use bpmute::calibration::{BoundaryReason, CalibrationBoundaryRecord, FeedbackVerdict};
 use bpmute::cli::args::Cli;
 use bpmute::cli::execute_cli;
-use bpmute::config::{
-    ActionsConfig, CliOverrides, LoadedConfig, PowerAction, ScheduleConfig, Sensitivity,
-};
+use bpmute::config::{ActionsConfig, CliOverrides, LoadedConfig, PowerAction, ScheduleConfig};
 use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
@@ -35,7 +33,7 @@ use bpmute::sleep_engine::{
     CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, SessionEndReason,
     SessionSummary, StreamStatus,
 };
-use bpmute::storage::{SessionListEntry, SessionStatus};
+use bpmute::storage::SessionStatus;
 use bpmute::tui::{
     GraceState, IpcEvent, ModalState, PairingPromptModalState, Tab, Theme, TuiApp, TuiCommand,
     TuiEvent, TuiIpcBridge, UnenrollButton,
@@ -1212,27 +1210,19 @@ fn test_mouse_footer_tab_actions_and_navigation_hint_ignores() {
         message: "Persistent baseline shift detected".into(),
         dismissible: true,
     }];
-    app.history_sessions = vec![SessionListEntry {
-        id: "hist-1".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:01".into(),
-        status: SessionStatus::Closed,
-        start_ts_ms: 1_700_000_000_000,
-        end_ts_ms: 1_700_003_600_000,
-        end_reason: Some(SessionEndReason::StreamEnded),
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(72.0),
-        sleep_mu_hr: Some(58.0),
-        onset_confirmed_ts_ms: Some(1_700_001_200_000),
-        sleeping_ts_ms: None,
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 10,
-        raw_samples_count: 100,
-        feedback: None,
-    }];
+    let mut hist_session = make_history_session(
+        "hist-1",
+        "Polar H10",
+        1_700_000_000_000,
+        1_700_003_600_000,
+        SessionStatus::Closed,
+        10,
+    );
+    hist_session.wearable_mac_masked = "..:22:01".into();
+    hist_session.warmup_mu_hr = Some(72.0);
+    hist_session.sleep_mu_hr = Some(58.0);
+    hist_session.onset_confirmed_ts_ms = Some(1_700_001_200_000);
+    app.history_sessions = vec![hist_session];
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 1024,
         wal_size_bytes: 0,
@@ -1515,27 +1505,16 @@ fn test_mouse_footer_disabled_and_muted_guards() {
         Some(90),
         None,
     )];
-    let active_session = SessionListEntry {
-        id: "hist-active".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:01".into(),
-        status: SessionStatus::Active,
-        start_ts_ms: 1_700_000_000_000,
-        end_ts_ms: 1_700_000_600_000,
-        end_reason: None,
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(72.0),
-        sleep_mu_hr: None,
-        onset_confirmed_ts_ms: None,
-        sleeping_ts_ms: None,
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 5,
-        raw_samples_count: 100,
-        feedback: None,
-    };
+    let mut active_session = make_history_session(
+        "hist-active",
+        "Polar H10",
+        1_700_000_000_000,
+        1_700_000_600_000,
+        SessionStatus::Active,
+        5,
+    );
+    active_session.wearable_mac_masked = "..:22:01".into();
+    active_session.warmup_mu_hr = Some(72.0);
     app.history_sessions = vec![active_session.clone()];
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 1024,

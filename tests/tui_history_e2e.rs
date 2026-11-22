@@ -27,7 +27,7 @@ use bpmute::sleep_engine::{
     ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason, SessionSummary,
     StreamState, StreamStatus,
 };
-use bpmute::storage::{SessionFullDetail, SessionListEntry, SessionStatus, WearableInfo};
+use bpmute::storage::{SessionFullDetail, SessionStatus, WearableInfo};
 use bpmute::tui::{IpcEvent, ModalState, Tab, TuiApp, TuiCommand, TuiEvent, TuiIpcBridge};
 
 #[test]
@@ -36,27 +36,20 @@ fn test_history_tab_master_detail_chart_and_boundary_dividers() {
     app.daemon_connected = true;
     app.active_tab = Tab::History;
 
-    let s1 = SessionListEntry {
-        id: "sess-001".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:33".into(),
-        status: SessionStatus::Closed,
-        start_ts_ms: 1_700_100_000_000,
-        end_ts_ms: 1_700_102_700_000, // 45 min
-        end_reason: Some(SessionEndReason::HostSuspend),
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(72.0),
-        sleep_mu_hr: Some(58.0),
-        onset_confirmed_ts_ms: Some(1_700_100_900_000), // 15m in
-        sleeping_ts_ms: Some(1_700_101_800_000),        // 30m in
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 30,
-        raw_samples_count: 2700,
-        feedback: None,
-    };
+    let mut s1 = make_history_session(
+        "sess-001",
+        "Polar H10",
+        1_700_100_000_000,
+        1_700_102_700_000, // 45 min
+        SessionStatus::Closed,
+        30,
+    );
+    s1.end_reason = Some(SessionEndReason::HostSuspend);
+    s1.warmup_mu_hr = Some(72.0);
+    s1.sleep_mu_hr = Some(58.0);
+    s1.onset_confirmed_ts_ms = Some(1_700_100_900_000); // 15m in
+    s1.sleeping_ts_ms = Some(1_700_101_800_000); // 30m in
+    s1.raw_samples_count = 2700;
 
     let boundary = CalibrationBoundaryRecord {
         id: "bnd-001".into(),
@@ -68,35 +61,30 @@ fn test_history_tab_master_detail_chart_and_boundary_dividers() {
         reverted_at_ms: None,
     };
 
-    let s2 = SessionListEntry {
-        id: "sess-002".into(),
-        wearable_id: "w-2".into(),
-        wearable_alias: Some("GT 5".into()),
-        wearable_mac_masked: "..:44:55".into(),
-        status: SessionStatus::Closed,
-        start_ts_ms: 1_700_000_000_000,
-        end_ts_ms: 1_700_003_600_000, // 60 min
-        end_reason: Some(SessionEndReason::StreamEnded),
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: false,
-        warmup_mu_hr: Some(68.0),
-        sleep_mu_hr: Some(56.0),
-        onset_confirmed_ts_ms: None,
-        sleeping_ts_ms: None,
-        auto_anomalous: true,
-        fp_count: 1,
-        epochs_count: 40,
-        raw_samples_count: 0,
-        feedback: Some(SessionFeedbackRecord {
-            id: "fb-002".into(),
-            session_id: "sess-002".into(),
-            verdict: Some(FeedbackVerdict::FalsePositive),
-            manual_onset_ts_ms: None,
-            manual_avg_sleep_hr: None,
-            notes: None,
-            updated_at_ms: 1_700_004_000_000,
-        }),
-    };
+    let mut s2 = make_history_session(
+        "sess-002",
+        "GT 5",
+        1_700_000_000_000,
+        1_700_003_600_000, // 60 min
+        SessionStatus::Closed,
+        40,
+    );
+    s2.wearable_id = "w-2".into();
+    s2.wearable_mac_masked = "..:44:55".into();
+    s2.had_rr = false;
+    s2.warmup_mu_hr = Some(68.0);
+    s2.auto_anomalous = true;
+    s2.fp_count = 1;
+    s2.raw_samples_count = 0;
+    s2.feedback = Some(SessionFeedbackRecord {
+        id: "fb-002".into(),
+        session_id: "sess-002".into(),
+        verdict: Some(FeedbackVerdict::FalsePositive),
+        manual_onset_ts_ms: None,
+        manual_avg_sleep_hr: None,
+        notes: None,
+        updated_at_ms: 1_700_004_000_000,
+    });
 
     app.history_sessions = vec![s1.clone(), s2.clone()];
     app.history_boundaries = vec![boundary.clone()];
@@ -236,49 +224,30 @@ fn test_history_session_modals_and_mutating_guards() {
     app.daemon_connected = true;
     app.active_tab = Tab::History;
 
-    let active_session = SessionListEntry {
-        id: "sess-active".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:33".into(),
-        status: SessionStatus::Active,
-        start_ts_ms: 1_700_200_000_000,
-        end_ts_ms: 1_700_201_000_000,
-        end_reason: None,
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(70.0),
-        sleep_mu_hr: None,
-        onset_confirmed_ts_ms: None,
-        sleeping_ts_ms: None,
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 10,
-        raw_samples_count: 1000,
-        feedback: None,
-    };
+    let mut active_session = make_history_session(
+        "sess-active",
+        "Polar H10",
+        1_700_200_000_000,
+        1_700_201_000_000,
+        SessionStatus::Active,
+        10,
+    );
+    active_session.raw_samples_count = 1000;
 
-    let closed_session = SessionListEntry {
-        id: "sess-closed".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:33".into(),
-        status: SessionStatus::Closed,
-        start_ts_ms: 1_700_100_000_000,
-        end_ts_ms: 1_700_103_600_000, // 1 hour
-        end_reason: Some(SessionEndReason::HostSuspend),
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(72.0),
-        sleep_mu_hr: Some(58.0),
-        onset_confirmed_ts_ms: Some(1_700_101_800_000),
-        sleeping_ts_ms: Some(1_700_102_400_000),
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 30,
-        raw_samples_count: 2700,
-        feedback: None,
-    };
+    let mut closed_session = make_history_session(
+        "sess-closed",
+        "Polar H10",
+        1_700_100_000_000,
+        1_700_103_600_000, // 1 hour
+        SessionStatus::Closed,
+        30,
+    );
+    closed_session.end_reason = Some(SessionEndReason::HostSuspend);
+    closed_session.warmup_mu_hr = Some(72.0);
+    closed_session.sleep_mu_hr = Some(58.0);
+    closed_session.onset_confirmed_ts_ms = Some(1_700_101_800_000);
+    closed_session.sleeping_ts_ms = Some(1_700_102_400_000);
+    closed_session.raw_samples_count = 2700;
 
     app.history_sessions = vec![active_session, closed_session.clone()];
     app.selected_session_idx = 0; // On active session!
@@ -1283,27 +1252,20 @@ fn test_history_braille_trace_overlay_gaps_and_markers() {
     let trigger_ts = start_ts + 30 * 60_000; // 75% across
     let manual_ts = start_ts + 20 * 60_000; // 50% across (inside the gap so marker stands clear)
 
-    let entry = SessionListEntry {
-        id: "sess-hist-trace".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:33".into(),
-        status: SessionStatus::Closed,
-        start_ts_ms: start_ts,
-        end_ts_ms: end_ts,
-        end_reason: Some(SessionEndReason::HostSuspend),
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(64.0),
-        sleep_mu_hr: Some(56.0),
-        onset_confirmed_ts_ms: Some(onset_ts),
-        sleeping_ts_ms: Some(trigger_ts),
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 100,
-        raw_samples_count: 0,
-        feedback: None,
-    };
+    let mut entry = make_history_session(
+        "sess-hist-trace",
+        "Polar H10",
+        start_ts,
+        end_ts,
+        SessionStatus::Closed,
+        100,
+    );
+    entry.end_reason = Some(SessionEndReason::HostSuspend);
+    entry.warmup_mu_hr = Some(64.0);
+    entry.sleep_mu_hr = Some(56.0);
+    entry.onset_confirmed_ts_ms = Some(onset_ts);
+    entry.sleeping_ts_ms = Some(trigger_ts);
+    entry.raw_samples_count = 0;
 
     // Build epochs at 15s cadence:
     // - 0..14m: HR drops 64 -> 56 (P(Sleep) rises 0.0 -> 0.8), crossing around midpoint
@@ -1566,27 +1528,18 @@ fn test_trace_ascii_fallback_no_color_modifiers_and_braille_compositing() {
     comp_app.active_tab = Tab::History;
     let start_ts = 1_700_100_000_000i64;
     let end_ts = start_ts + 10 * 60_000;
-    let comp_entry = SessionListEntry {
-        id: "sess-comp".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Polar H10".into()),
-        wearable_mac_masked: "..:22:33".into(),
-        status: SessionStatus::Closed,
-        start_ts_ms: start_ts,
-        end_ts_ms: end_ts,
-        end_reason: Some(SessionEndReason::HostSuspend),
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(64.0),
-        sleep_mu_hr: Some(56.0),
-        onset_confirmed_ts_ms: None,
-        sleeping_ts_ms: None,
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 41,
-        raw_samples_count: 0,
-        feedback: None,
-    };
+    let mut comp_entry = make_history_session(
+        "sess-comp",
+        "Polar H10",
+        start_ts,
+        end_ts,
+        SessionStatus::Closed,
+        41,
+    );
+    comp_entry.end_reason = Some(SessionEndReason::HostSuspend);
+    comp_entry.warmup_mu_hr = Some(64.0);
+    comp_entry.sleep_mu_hr = Some(56.0);
+    comp_entry.raw_samples_count = 0;
     let comp_epochs: Vec<Epoch> = (0..=40)
         .map(|i| Epoch {
             session_index: i as u64,

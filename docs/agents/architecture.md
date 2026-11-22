@@ -19,6 +19,13 @@ TuiApp (src/tui/app.rs)
 - **`PersistenceWorker` / `LedgerStore` owns SQLite WAL durability**: runs on the dedicated `bpmute-ledger` OS thread under `flock`. Every discrete lifecycle, calibration, import, or storage-reclaiming mutation (`calibration.rs`, `maintenance.rs`, `session.rs`, `session_lifecycle.rs`, `wearable.rs`, `mod.rs`) and `PersistenceWorker` shutdown must flush/truncate WAL via `write_tx_and_flush` / `flush_wal` (or `VACUUM` + `wal_checkpoint(TRUNCATE)`), while only `15 s` streaming (`append_epoch_and_raw`) stays un-flushed under `WAL_RUNTIME_PRAGMAS` (`PRAGMA journal_size_limit = 1048576`).
 - **Cross-actor resets**: Any IPC operation mutating or wiping persisted session/calibration state while monitoring may be active must abort active grace (`signal_arousal_abort`), synchronize `MonitoringContext` via `EngineControlEvent`, and propagate the SQLite-recomputed `CalibrationState` through `apply_calibration_update`.
 
+## TUI Submodule Layout
+
+- **`src/tui/views/`**: Tab and chrome rendering (`dashboard.rs`, `history.rs`, `wearables.rs`, `settings.rs`, `footer.rs`, `history_modals.rs`, `wearables_modals.rs`).
+- **`src/tui/input/`**: Keyboard and mouse event routers (`mod.rs`, `mouse.rs`).
+- **`src/tui/app_ipc.rs`**: Incoming daemon IPC event handling and `TuiApp` state synchronization.
+- **`src/tui/client_commands.rs`**: Outgoing `TuiCommand` translation into socket RPC requests.
+
 ## File Size & Submodule Boundaries
 
 All Rust source files in `src/` must remain strictly under 1000 lines (enforced deterministically by `./scripts/check.sh`). When a module approaches 900+ lines, decompose its internal responsibilities into sibling submodules (for example, extracting IPC dispatch from `src/tui/app.rs` into `src/tui/app_ipc.rs`).

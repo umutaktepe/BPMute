@@ -62,6 +62,11 @@ if grep -Eq 'DaemonStatus\s*\{' tests/*.rs; then
   exit 1
 fi
 
+if grep -Eq 'SessionListEntry\s*\{' tests/*.rs; then
+  echo "error: direct SessionListEntry struct literal forbidden in tests; use tests/common/tui.rs::make_history_session(...) (docs/agents/testing.md)" >&2
+  exit 1
+fi
+
 if grep -En '#!/usr/bin/env[[:space:]]' tests/*.rs; then
   echo "error: #!/usr/bin/env shebang forbidden in fake test scripts (stripped MapEnv PATH omits /usr/bin); use POSIX #!/bin/sh" >&2
   exit 1
