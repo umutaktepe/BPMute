@@ -20,6 +20,10 @@ Testing conventions, concurrency pitfalls, and virtual-time execution. See `docs
 
 Runtime actor ownership (`DaemonCore`, `MonitoringContext`, `GraceCoordinator`, `LedgerStore`) and cross-actor reset boundaries. See `docs/agents/architecture.md`.
 
+### Coding standards
+
+Read `CODING_STANDARDS.md` during code review.
+
 ## Verification
 
 Run targeted iterative tests with `./scripts/test.sh --test <target> [filter]` (compiles first, then enforces 30 s execution timeout and hermetic D-Bus isolation), fast format/static/clippy checks with `./scripts/check.sh --lint` (or `--fix`), and `./scripts/check.sh` (or `./scripts/check.sh --staged` when unrelated dirty files remain in the working tree) before finishing any change.
