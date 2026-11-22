@@ -2,6 +2,7 @@ pub mod fake;
 pub mod jitter;
 pub mod system;
 pub mod traits;
+mod wayland;
 
 pub use fake::FakeIdleProbe;
 pub use jitter::{InputEvent, PointerJitterFilter};

@@ -76,7 +76,7 @@ impl HmmFilter {
         // 2. Emission log-likelihoods in log space
         let z_params = [(2.2, 1.6), (0.0, 1.0), (expected_z_sleep, 1.0)];
         let slope_params = [(0.0, 1.60), (0.0, 0.55), (-0.20, 0.28)];
-        let rvar_params = [(1.75, 0.55), (0.95, 0.22), (0.40, 0.14)];
+        let rvar_params = [(1.75, 0.55), (0.85, 0.30), (0.40, 0.14)];
         let d_rmssd_params = [(-0.25, 0.55), (0.0, 0.55), (0.20, 0.55)];
         let ratio_params = [(0.45, 0.50), (0.62, 0.50), (1.05, 0.52)];
 
@@ -148,14 +148,14 @@ mod tests {
 
         let mut filter_bpm_only = HmmFilter::new();
         let p_bpm_only = filter_bpm_only.step(&features, false, -2.4);
-        let expected_bpm_only = [0.000_962_618_270, 0.062_025_906_248, 0.937_011_475_482];
+        let expected_bpm_only = [0.000_856_425_893, 0.165_499_631_394, 0.833_643_942_713];
         for (got, exp) in p_bpm_only.iter().zip(expected_bpm_only) {
             assert!((got - exp).abs() < 1e-11, "got {got}, expected {exp}");
         }
 
         let mut filter_bpm_rr = HmmFilter::new();
         let p_bpm_rr = filter_bpm_rr.step(&features, true, -2.4);
-        let expected_bpm_rr = [0.000_287_220_803, 0.036_548_301_175, 0.963_164_478_022];
+        let expected_bpm_rr = [0.000_267_664_431, 0.102_148_075_602, 0.897_584_259_967];
         for (got, exp) in p_bpm_rr.iter().zip(expected_bpm_rr) {
             assert!((got - exp).abs() < 1e-11, "got {got}, expected {exp}");
         }

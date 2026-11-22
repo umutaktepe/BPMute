@@ -23,6 +23,8 @@ const MEDIUM_GAP_MAX_MS: i64 = 900_000; // 2-15 min
 const MEDIUM_GAP_STABILIZATION_EPOCHS: u32 = 8; // 2 min
 const CANCEL_COOLDOWN_MS: i64 = 900_000; // 15 min
 const POST_SLEEP_WAKE_SPLIT_SEC: u32 = 600; // 10 min
+const POST_SLEEP_ACTIVE_WAKE_THRESHOLD: f64 = 0.50;
+const POST_SLEEP_WAKE_Z_THRESHOLD: f64 = 2.0;
 const DESKTOP_REBOUND_WINDOW_MS: i64 = 300_000; // 5 min
 
 struct EpochStepInput<'a> {
@@ -457,20 +459,25 @@ impl SleepEngine {
                 }
                 DetectorState::Sleeping => {
                     self.baseline.set_frozen(true);
-                    let is_wake_epoch = p_sleep < 0.30;
+                    let is_non_sleep_epoch = p_sleep < 0.30;
+                    let is_sustained_wake_epoch = probs[STATE_ACTIVE_WAKE]
+                        >= POST_SLEEP_ACTIVE_WAKE_THRESHOLD
+                        || (is_non_sleep_epoch && features.z_hr >= POST_SLEEP_WAKE_Z_THRESHOLD);
                     let ln_r = hrv_valid.then_some(features.ln_rmssd_60s).flatten();
                     self.sleep_samples.record_epoch(
-                        is_wake_epoch,
+                        is_non_sleep_epoch,
                         features.hr_bpm_60s,
                         ln_r,
                         unclamped_var_ratio,
                     );
-                    if is_wake_epoch {
+                    if !is_non_sleep_epoch {
+                        self.post_trigger_sleep_sec =
+                            self.post_trigger_sleep_sec.saturating_add(15);
+                    }
+                    if is_sustained_wake_epoch {
                         self.post_sleep_wake_sec += 15;
                     } else {
                         self.post_sleep_wake_sec = 0;
-                        self.post_trigger_sleep_sec =
-                            self.post_trigger_sleep_sec.saturating_add(15);
                     }
 
                     if self

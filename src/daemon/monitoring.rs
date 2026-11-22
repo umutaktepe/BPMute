@@ -540,11 +540,11 @@ mod tests {
         })
         .await;
 
-        // Drive SleepEngine through warmup (>= 8 min) and sleep onset until Confirmed,
-        // varying BPM/RR slightly each second so flatline detection does not freeze warmup.
-        for sec in 0..(12 * 60) {
-            let bpm = 74.0 + ((sec % 7) as f64 - 3.0) * 0.6;
-            let rr = 810.0 + ((sec % 5) as f64 - 2.0) * 20.0;
+        // Drive SleepEngine through warmup (>= 8 min) and sleep onset until Confirmed.
+        for sec in 0..(10 * 60) {
+            let wave = 2.6 * (sec as f64 * 0.11).sin() + 1.1 * (sec as f64 * 0.31).cos();
+            let bpm = 68.0 + wave;
+            let rr = 60_000.0 / bpm + 14.0 * (sec as f64 * 1.5).sin();
             ctx.handle_wearable_event(WearableEvent::HrPacket {
                 wearable: wearable.clone(),
                 packet: HrPacket {
@@ -556,9 +556,11 @@ mod tests {
             })
             .await;
         }
-        for sec in (12 * 60)..(25 * 60) {
-            let bpm = 54.0 + ((sec % 7) as f64 - 3.0) * 0.3;
-            let rr = 1_110.0 + ((sec % 5) as f64 - 2.0) * 10.0;
+        for sec in (10 * 60)..(30 * 60) {
+            let mins = (sec - 10 * 60) as f64 / 60.0;
+            let target = (68.0 - 0.8 * mins).max(56.0);
+            let bpm = target + 0.35 * (sec as f64 * 0.4).sin();
+            let rr = 60_000.0 / bpm + 26.0 * (sec as f64 * 1.5).sin();
             ctx.handle_wearable_event(WearableEvent::HrPacket {
                 wearable: wearable.clone(),
                 packet: HrPacket {
@@ -575,7 +577,7 @@ mod tests {
         }
         assert_eq!(ctx.engine.state(), DetectorState::Confirmed);
 
-        let expired_ts = base_ts + 25 * 60 * 1_000;
+        let expired_ts = base_ts + 30 * 60 * 1_000;
         ctrl_tx
             .send(EngineControlEvent::GraceOutcome(GraceOutcome {
                 ts_ms: expired_ts,

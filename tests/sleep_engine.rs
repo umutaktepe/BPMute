@@ -1935,3 +1935,150 @@ fn wake_tail_excluded_on_rebound_and_promoted_when_committed_empty() {
         "empty committed buffer must promote wake_tail fallback on close"
     );
 }
+
+#[test]
+fn bpm_only_low_rvar_above_baseline_does_not_spike_to_sleep() {
+    use bpmute::sleep_engine::EpochFeatures;
+
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+
+    let mut ts = 15_000_i64;
+    let wake_feat = EpochFeatures {
+        hr_bpm_60s: 64.0,
+        z_hr: 0.0,
+        hr_slope_4m: 0.0,
+        r_var_120s: 0.90,
+        ln_rmssd_60s: None,
+        delta_ln_rmssd_60s: None,
+        rmssd_sdnn_120s: None,
+    };
+    for _ in 0..32 {
+        eng.feed_epoch_features(ts, wake_feat.clone(), false, 1.0, false);
+        ts += 15_000;
+    }
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    // Exact Watch GT5 failure point: elevated HR above Quiet-Wake Baseline (z_hr = +1.35)
+    // paired with low firmware-smoothed variability (r_var_120s = 0.38, BPM-only).
+    let low_rvar_above_baseline = EpochFeatures {
+        hr_bpm_60s: 66.7,
+        z_hr: 1.35,
+        hr_slope_4m: 0.04,
+        r_var_120s: 0.38,
+        ln_rmssd_60s: None,
+        delta_ln_rmssd_60s: None,
+        rmssd_sdnn_120s: None,
+    };
+    for _ in 0..10 {
+        let out = eng.feed_epoch_features(ts, low_rvar_above_baseline.clone(), false, 1.0, false);
+        ts += 15_000;
+        let ep = out
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::EpochEmitted(e) => Some(e),
+                _ => None,
+            })
+            .expect("epoch emitted");
+        assert!(
+            ep.p_sleep < 0.50,
+            "low r_var with z_hr=+1.35 must not spike p_sleep >= 0.50 (got {:.3})",
+            ep.p_sleep
+        );
+        assert_eq!(eng.state(), DetectorState::Monitoring);
+    }
+}
+
+#[test]
+fn rem_cycle_quiet_wake_plateau_does_not_split_sleeping_session() {
+    use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
+
+    let pheno = Phenotype::typical(); // quiet_wake_hr = 66.0, sleep_drop_bpm = 7.5
+    let trace = generate_paired_trace(
+        777,
+        pheno,
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep { duration_sec: 900 },
+            // 25-min REM / light-sleep plateau slightly above quiet_wake_hr (z_hr < 2.0)
+            StageKind::PostSleepWake {
+                duration_sec: 1500,
+                elevation_bpm: 2.0,
+            },
+            StageKind::N2Sleep { duration_sec: 900 },
+            // 15-min real morning active wake-up
+            StageKind::PostSleepWake {
+                duration_sec: 900,
+                elevation_bpm: 16.0,
+            },
+        ],
+    );
+
+    let mut eng = default_engine();
+    let mut confirmed_count = 0_usize;
+    let mut rem_quiet_wake_epochs = 0_usize;
+    let mut closed_summaries = Vec::new();
+    let mut grace_delivered = false;
+
+    let rem_start_ms = (900 + 420 + 900) * 1000_i64;
+    let rem_end_ms = rem_start_ms + 1500 * 1000_i64;
+
+    for ev in &trace.bpm_only_gt5 {
+        for o in eng.handle_event(ev.clone()) {
+            match o {
+                EngineOutput::StateChanged {
+                    ts_ms,
+                    to: DetectorState::Confirmed,
+                    ..
+                } => {
+                    confirmed_count += 1;
+                    if !grace_delivered {
+                        grace_delivered = true;
+                        let _ = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+                            ts_ms: ts_ms + 1_000,
+                            outcome: GraceResult::Expired,
+                        }));
+                    }
+                }
+                EngineOutput::EpochEmitted(ep)
+                    if (rem_start_ms..rem_end_ms).contains(&ep.ts_ms)
+                        && ep.p_sleep < 0.30
+                        && ep.p_active_wake < 0.50 =>
+                {
+                    rem_quiet_wake_epochs += 1;
+                }
+                EngineOutput::SessionEnded(s) => {
+                    assert!(
+                        s.end_ts_ms >= rem_end_ms,
+                        "REM QuietWake plateau must not split Sleeping session early (ended at {} ms)",
+                        s.end_ts_ms
+                    );
+                    closed_summaries.push(s);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        rem_quiet_wake_epochs >= 40,
+        "expected >= 10 min of QuietWake epochs during REM plateau, got {rem_quiet_wake_epochs}"
+    );
+    assert_eq!(
+        confirmed_count, 1,
+        "overnight REM plateau must produce exactly 1 Confirmed onset"
+    );
+    assert_eq!(closed_summaries.len(), 1);
+    let summary = &closed_summaries[0];
+    assert_eq!(summary.end_reason, SessionEndReason::SustainedWakefulness);
+    let sleep_mu = summary.sleep_mu_hr.expect("sleep_mu_hr must be recorded");
+    let target_sleep_hr = pheno.quiet_wake_hr - pheno.sleep_drop_bpm;
+    assert!(
+        sleep_mu <= target_sleep_hr + 4.0,
+        "morning wake tail must be excluded from sleep_mu_hr (got {sleep_mu:.2})"
+    );
+}
