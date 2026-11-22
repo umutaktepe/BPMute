@@ -15,6 +15,7 @@ How the engineering skills should consume this repo's domain documentation when 
   - `0007-deterministic-clock-injected-engine-and-replay-harness.md`
   - `0008-local-privacy-rolling-retention-and-calibration-boundaries.md`
   - `0009-declarative-config-semantic-cli-and-biometric-redacted-logging.md`
+  - `0012-disconnect-session-closure-and-manual-end.md`
 - **`docs/research/`**: read only when exact numeric constants, protocol details, or empirical justification are needed:
   - `ble-hrs-bluez-dbus.md`
   - `linux-daemon-actions-stack.md`

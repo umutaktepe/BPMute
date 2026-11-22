@@ -327,10 +327,12 @@ impl DaemonCore {
 
     /// Updates the live stream status for a wearable keyed by normalized MAC address.
     pub fn set_wearable_status(&self, mac: &str, status: StreamStatus) {
+        let norm = mac.trim().to_ascii_uppercase();
         let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-        guard
-            .wearable_statuses
-            .insert(mac.trim().to_ascii_uppercase(), status);
+        guard.wearable_statuses.insert(norm.clone(), status);
+        if !status.is_connected() {
+            guard.wearable_batteries.remove(&norm);
+        }
     }
 
     /// Updates cached battery and body sensor location metadata for a wearable.
@@ -342,7 +344,13 @@ impl DaemonCore {
     ) {
         let norm = mac.trim().to_ascii_uppercase();
         let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
-        if let Some(pct) = battery {
+        let connected = guard
+            .wearable_statuses
+            .get(&norm)
+            .copied()
+            .unwrap_or(StreamStatus::Disconnected)
+            .is_connected();
+        if connected && let Some(pct) = battery {
             guard.wearable_batteries.insert(norm.clone(), pct);
         }
         if let Some(loc) = body_location {
@@ -365,7 +373,11 @@ impl DaemonCore {
                     .get(&norm)
                     .copied()
                     .unwrap_or(StreamStatus::Disconnected);
-                let battery = guard.wearable_batteries.get(&norm).copied();
+                let battery = if status.is_connected() {
+                    guard.wearable_batteries.get(&norm).copied()
+                } else {
+                    None
+                };
                 let body_location = guard.wearable_body_locations.get(&norm).cloned();
                 EnrolledWearableStatus {
                     wearable: w,

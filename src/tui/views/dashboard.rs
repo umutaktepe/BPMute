@@ -6,7 +6,7 @@ use ratatui::widgets::{Clear, Gauge, Paragraph, Widget};
 use super::super::app::{Tab, TuiApp};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::super::sparkline::HrSparklineWidget;
-use super::{build_clickable_row_line, centered_rect};
+use super::{build_clickable_row_line, centered_rect, format_wearable_battery};
 use crate::ipc::protocol::alert_ids;
 
 pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
@@ -260,11 +260,7 @@ fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
         })
         .unwrap_or("None");
 
-    let battery_str = active_w
-        .as_ref()
-        .and_then(|w| w.battery)
-        .map(|b| format!("{b}%"))
-        .unwrap_or_else(|| "--".to_string());
+    let battery_str = format_wearable_battery(app.daemon_connected, active_w);
 
     let bat_suffix = format!(" ({battery_str})");
     let label_prefix = " Wearable: ";

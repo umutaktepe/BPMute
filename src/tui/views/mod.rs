@@ -2,6 +2,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use super::hit_map::{ClickTarget, HitMap};
+use crate::ipc::protocol::EnrolledWearableStatus;
 
 pub mod dashboard;
 pub mod footer;
@@ -86,4 +87,16 @@ fn build_clickable_line<'a>(
         spans.push(span);
     }
     Line::from(spans)
+}
+
+/// Formats a wearable battery percentage when the daemon and wearable are connected, otherwise `"--"`.
+pub(crate) fn format_wearable_battery(
+    daemon_connected: bool,
+    wearable: Option<&EnrolledWearableStatus>,
+) -> String {
+    wearable
+        .filter(|w| daemon_connected && w.status.is_connected())
+        .and_then(|w| w.battery)
+        .map(|b| format!("{b}%"))
+        .unwrap_or_else(|| "--".to_string())
 }

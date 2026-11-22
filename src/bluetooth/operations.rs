@@ -14,6 +14,17 @@ use super::dbus::{
     HRM_CHAR_UUID, HRS_UUID,
 };
 use super::packet::{BodySensorLocation, parse_body_sensor_location};
+use super::stream::DisconnectReason;
+
+/// Maps a BlueZ `org.bluez.Device1.Disconnected` reason string onto [`DisconnectReason`].
+pub fn parse_bluez_disconnect_reason(reason: &str) -> DisconnectReason {
+    match reason {
+        "org.bluez.Reason.Remote" => DisconnectReason::Remote,
+        "org.bluez.Reason.Timeout" => DisconnectReason::Timeout,
+        "org.bluez.Reason.Authentication" => DisconnectReason::Authentication,
+        other => DisconnectReason::Other(other.to_string()),
+    }
+}
 
 /// Live BlueZ adapter and device state snapshot queried from `ObjectManager`.
 #[derive(Debug, Default)]

@@ -19,7 +19,8 @@ use super::dbus::{
 use super::operations::{
     build_bluez_signal_stream, extract_bool, extract_byte_array, extract_mac_from_path,
     extract_string, extract_u8, find_characteristic_path, inspect_bluez_state, next_stream_msg,
-    read_battery_percentage, read_body_sensor_location, resolve_target_adapters,
+    parse_bluez_disconnect_reason, read_battery_percentage, read_body_sensor_location,
+    resolve_target_adapters,
 };
 use super::packet::parse_hr_measurement;
 use super::profile::{GATT_HRS_PROFILE_PATH, GATT_PROFILE_APP_PATH, GattProfileHrs};
@@ -93,6 +94,34 @@ impl WearableSource for BluezWearableSource {
         self.allowlist_tx.send_modify(|seq| {
             *seq = seq.wrapping_add(1);
         });
+    }
+}
+
+struct BluezRuntimeState {
+    source: BluezWearableSource,
+    tracker: StreamTracker,
+    known_descriptors: HashMap<String, WearableDescriptor>,
+    hrm_char_paths: HashMap<String, String>,
+    battery_char_paths: HashMap<String, String>,
+    event_tx: mpsc::Sender<WearableEvent>,
+    system_conn: zbus::Connection,
+    session_conn: Option<zbus::Connection>,
+    last_notification_id: u32,
+}
+
+impl BluezRuntimeState {
+    fn as_ctx(&mut self) -> BluezRuntimeCtx<'_> {
+        BluezRuntimeCtx {
+            source: &self.source,
+            tracker: &mut self.tracker,
+            known_descriptors: &mut self.known_descriptors,
+            hrm_char_paths: &mut self.hrm_char_paths,
+            battery_char_paths: &mut self.battery_char_paths,
+            event_tx: &self.event_tx,
+            system_conn: &self.system_conn,
+            session_conn: self.session_conn.as_ref(),
+            last_notification_id: &mut self.last_notification_id,
+        }
     }
 }
 
@@ -171,98 +200,62 @@ async fn run_bluez_source_task(
         "InterfacesAdded",
     )
     .await;
-
-    let mut tracker = StreamTracker::new();
-    let mut known_descriptors: HashMap<String, WearableDescriptor> = HashMap::new();
-    let mut hrm_char_paths: HashMap<String, String> = HashMap::new();
-    let mut battery_char_paths: HashMap<String, String> = HashMap::new();
-    let mut last_notification_id: u32 = 0;
+    let mut disconnected_stream =
+        build_bluez_signal_stream(&system_conn, "org.bluez.Device1", "Disconnected").await;
 
     let registered_adapters =
         register_profiles_from_snapshot(&system_conn, source.pinned_adapter.as_deref()).await;
 
-    {
-        let mut ctx = BluezRuntimeCtx {
-            source: &source,
-            tracker: &mut tracker,
-            known_descriptors: &mut known_descriptors,
-            hrm_char_paths: &mut hrm_char_paths,
-            battery_char_paths: &mut battery_char_paths,
-            event_tx: &event_tx,
-            system_conn: &system_conn,
-            session_conn: session_conn.as_ref(),
-            last_notification_id: &mut last_notification_id,
-        };
-        sync_allowlist_and_snapshot(&mut ctx).await;
-    }
-
     let mut allowlist_rx = source.allowlist_tx.subscribe();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(1000));
+
+    let mut runtime = BluezRuntimeState {
+        source,
+        tracker: StreamTracker::new(),
+        known_descriptors: HashMap::new(),
+        hrm_char_paths: HashMap::new(),
+        battery_char_paths: HashMap::new(),
+        event_tx,
+        system_conn,
+        session_conn,
+        last_notification_id: 0,
+    };
+
+    {
+        let mut ctx = runtime.as_ctx();
+        sync_allowlist_and_snapshot(&mut ctx).await;
+    }
 
     loop {
         tokio::select! {
             _ = tick_interval.tick() => {
-                let now_ms = source.clock.now_utc().timestamp_millis();
-                let actions = tracker.handle_event(StreamEvent::Tick { ts_ms: now_ms });
-                let mut ctx = BluezRuntimeCtx {
-                    source: &source,
-                    tracker: &mut tracker,
-                    known_descriptors: &mut known_descriptors,
-                    hrm_char_paths: &mut hrm_char_paths,
-                    battery_char_paths: &mut battery_char_paths,
-                    event_tx: &event_tx,
-                    system_conn: &system_conn,
-                    session_conn: session_conn.as_ref(),
-                    last_notification_id: &mut last_notification_id,
-                };
+                let now_ms = runtime.source.clock.now_utc().timestamp_millis();
+                let actions = runtime.tracker.handle_event(StreamEvent::Tick { ts_ms: now_ms });
+                let mut ctx = runtime.as_ctx();
                 process_lifecycle_actions(&actions, &mut ctx).await;
             }
             changed = allowlist_rx.changed() => {
                 if changed.is_ok() {
-                    let mut ctx = BluezRuntimeCtx {
-                        source: &source,
-                        tracker: &mut tracker,
-                        known_descriptors: &mut known_descriptors,
-                        hrm_char_paths: &mut hrm_char_paths,
-                        battery_char_paths: &mut battery_char_paths,
-                        event_tx: &event_tx,
-                        system_conn: &system_conn,
-                        session_conn: session_conn.as_ref(),
-                        last_notification_id: &mut last_notification_id,
-                    };
+                    let mut ctx = runtime.as_ctx();
                     sync_allowlist_and_snapshot(&mut ctx).await;
                 }
             }
             Some(msg_res) = next_stream_msg(&mut props_stream) => {
                 if let Ok(msg) = msg_res {
-                    let mut ctx = BluezRuntimeCtx {
-                        source: &source,
-                        tracker: &mut tracker,
-                        known_descriptors: &mut known_descriptors,
-                        hrm_char_paths: &mut hrm_char_paths,
-                        battery_char_paths: &mut battery_char_paths,
-                        event_tx: &event_tx,
-                        system_conn: &system_conn,
-                        session_conn: session_conn.as_ref(),
-                        last_notification_id: &mut last_notification_id,
-                    };
+                    let mut ctx = runtime.as_ctx();
                     handle_properties_changed_msg(&msg, &mut ctx).await;
                 }
             }
             Some(msg_res) = next_stream_msg(&mut iface_added_stream) => {
                 if let Ok(msg) = msg_res {
-                    let mut ctx = BluezRuntimeCtx {
-                        source: &source,
-                        tracker: &mut tracker,
-                        known_descriptors: &mut known_descriptors,
-                        hrm_char_paths: &mut hrm_char_paths,
-                        battery_char_paths: &mut battery_char_paths,
-                        event_tx: &event_tx,
-                        system_conn: &system_conn,
-                        session_conn: session_conn.as_ref(),
-                        last_notification_id: &mut last_notification_id,
-                    };
+                    let mut ctx = runtime.as_ctx();
                     handle_interfaces_added_msg(&msg, &mut ctx).await;
+                }
+            }
+            Some(msg_res) = next_stream_msg(&mut disconnected_stream) => {
+                if let Ok(msg) = msg_res {
+                    let mut ctx = runtime.as_ctx();
+                    handle_device_disconnected_msg(&msg, &mut ctx).await;
                 }
             }
             res = shutdown_rx.changed() => {
@@ -274,7 +267,7 @@ async fn run_bluez_source_task(
     }
 
     for adapter_path in &registered_adapters {
-        unregister_hrs_profile(&system_conn, adapter_path).await;
+        unregister_hrs_profile(&runtime.system_conn, adapter_path).await;
     }
 }
 
@@ -291,6 +284,26 @@ async fn register_profiles_from_snapshot(
         register_hrs_profile(conn, adapter_path).await;
     }
     targets
+}
+
+async fn emit_connected_battery_update(mac: &str, pct: u8, ctx: &mut BluezRuntimeCtx<'_>) {
+    if !ctx.tracker.is_connected(mac) {
+        return;
+    }
+    let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
+        mac: mac.to_string(),
+        percentage: pct,
+    });
+    if let Some(desc) = ctx.known_descriptors.get(mac) {
+        let _ = ctx
+            .event_tx
+            .send(WearableEvent::Metadata {
+                wearable: desc.clone(),
+                battery: Some(pct),
+                body_location: None,
+            })
+            .await;
+    }
 }
 
 async fn sync_allowlist_and_snapshot(ctx: &mut BluezRuntimeCtx<'_>) {
@@ -331,29 +344,49 @@ async fn sync_allowlist_and_snapshot(ctx: &mut BluezRuntimeCtx<'_>) {
         if let Some(bat_path) = dev_snap.battery_char_path {
             ctx.battery_char_paths.insert(mac.clone(), bat_path);
         }
-        if let Some(pct) = dev_snap.battery_pct {
-            let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
-                mac: mac.clone(),
-                percentage: pct,
-            });
-            if let Some(desc) = ctx.known_descriptors.get(&mac) {
-                let _ = ctx
-                    .event_tx
-                    .send(WearableEvent::Metadata {
-                        wearable: desc.clone(),
-                        battery: Some(pct),
-                        body_location: None,
-                    })
-                    .await;
-            }
-        }
         if dev_snap.connected && !ctx.tracker.is_connected(&mac) {
-            let actions = ctx
-                .tracker
-                .handle_event(StreamEvent::Connected { mac, ts_ms: now_ms });
+            let actions = ctx.tracker.handle_event(StreamEvent::Connected {
+                mac: mac.clone(),
+                ts_ms: now_ms,
+            });
             process_lifecycle_actions(&actions, ctx).await;
         }
+        if let Some(pct) = dev_snap.battery_pct {
+            emit_connected_battery_update(&mac, pct, ctx).await;
+        }
     }
+}
+
+async fn handle_device_disconnected_msg(msg: &zbus::Message, ctx: &mut BluezRuntimeCtx<'_>) {
+    let header = msg.header();
+    let Some(path) = header.path() else {
+        return;
+    };
+    let Some(mac) = extract_mac_from_path(path.as_str()) else {
+        return;
+    };
+    if !ctx.known_descriptors.contains_key(&mac) {
+        return;
+    }
+    let Ok((reason_str, message)) = msg.body().deserialize::<(String, String)>() else {
+        return;
+    };
+    tracing::debug!(
+        mac = %mac,
+        reason = %reason_str,
+        message = %message,
+        "received BlueZ Device1.Disconnected signal"
+    );
+    ctx.hrm_char_paths.remove(&mac);
+    ctx.battery_char_paths.remove(&mac);
+    let reason = parse_bluez_disconnect_reason(&reason_str);
+    let now_ms = ctx.source.clock.now_utc().timestamp_millis();
+    let actions = ctx.tracker.handle_event(StreamEvent::Disconnected {
+        mac,
+        reason,
+        ts_ms: now_ms,
+    });
+    process_lifecycle_actions(&actions, ctx).await;
 }
 
 async fn handle_properties_changed_msg(msg: &zbus::Message, ctx: &mut BluezRuntimeCtx<'_>) {
@@ -384,20 +417,7 @@ async fn handle_properties_changed_msg(msg: &zbus::Message, ctx: &mut BluezRunti
         }
         "org.bluez.Battery1" => {
             if let Some(pct) = extract_u8(changed.get("Percentage")) {
-                let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
-                    mac: mac.clone(),
-                    percentage: pct,
-                });
-                if let Some(desc) = ctx.known_descriptors.get(&mac) {
-                    let _ = ctx
-                        .event_tx
-                        .send(WearableEvent::Metadata {
-                            wearable: desc.clone(),
-                            battery: Some(pct),
-                            body_location: None,
-                        })
-                        .await;
-                }
+                emit_connected_battery_update(&mac, pct, ctx).await;
             }
         }
         _ => {}
@@ -464,21 +484,7 @@ async fn handle_characteristic_props_changed(
         }
     };
     if is_battery && !bytes.is_empty() {
-        let pct = bytes[0];
-        let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
-            mac: mac.to_string(),
-            percentage: pct,
-        });
-        if let Some(desc) = ctx.known_descriptors.get(mac) {
-            let _ = ctx
-                .event_tx
-                .send(WearableEvent::Metadata {
-                    wearable: desc.clone(),
-                    battery: Some(pct),
-                    body_location: None,
-                })
-                .await;
-        }
+        emit_connected_battery_update(mac, bytes[0], ctx).await;
         return;
     }
 
@@ -555,21 +561,7 @@ async fn handle_interfaces_added_msg(msg: &zbus::Message, ctx: &mut BluezRuntime
             if let Some(bytes) = extract_byte_array(char_props.get("Value"))
                 && !bytes.is_empty()
             {
-                let pct = bytes[0];
-                let _ = ctx.tracker.handle_event(StreamEvent::BatteryUpdated {
-                    mac: mac.clone(),
-                    percentage: pct,
-                });
-                if let Some(desc) = ctx.known_descriptors.get(&mac) {
-                    let _ = ctx
-                        .event_tx
-                        .send(WearableEvent::Metadata {
-                            wearable: desc.clone(),
-                            battery: Some(pct),
-                            body_location: None,
-                        })
-                        .await;
-                }
+                emit_connected_battery_update(&mac, bytes[0], ctx).await;
             }
         }
     }
@@ -747,6 +739,18 @@ async fn handle_lifecycle_action(action: &LifecycleAction, ctx: &mut BluezRuntim
                             status: *status,
                             ts_ms: *ts_ms,
                         },
+                    })
+                    .await;
+            }
+        }
+        LifecycleAction::StreamDisconnected { mac, reason, ts_ms } => {
+            if let Some(desc) = ctx.known_descriptors.get(mac) {
+                let _ = ctx
+                    .event_tx
+                    .send(WearableEvent::StreamDisconnected {
+                        wearable: desc.clone(),
+                        ts_ms: *ts_ms,
+                        reason: *reason,
                     })
                     .await;
             }

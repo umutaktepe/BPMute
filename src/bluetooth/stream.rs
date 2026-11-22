@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sleep_engine::{ContactStatus, HrPacket, StreamStatus};
+use crate::sleep_engine::{ContactStatus, HrPacket, StreamDisconnectReason, StreamStatus};
 use crate::storage::WearableDescriptor;
 
 /// Reason for a Bluetooth LE disconnection reported by BlueZ or the kernel.
@@ -18,6 +18,21 @@ pub enum DisconnectReason {
     Other(String),
 }
 
+impl DisconnectReason {
+    fn to_stream_reason(&self) -> StreamDisconnectReason {
+        match self {
+            Self::Remote => StreamDisconnectReason::Remote,
+            Self::Timeout | Self::Authentication | Self::Other(_) => {
+                StreamDisconnectReason::Timeout
+            }
+        }
+    }
+
+    fn is_not_permitted(&self) -> bool {
+        matches!(self, Self::Other(err) if err.contains("NotPermitted"))
+    }
+}
+
 /// Lifecycle action or diagnostic emitted by [`StreamTracker`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum LifecycleAction {
@@ -25,6 +40,12 @@ pub enum LifecycleAction {
     StatusTransition {
         mac: String,
         status: StreamStatus,
+        ts_ms: i64,
+    },
+    /// Active Wearable disconnected with classified disconnect reason (ADR-0012).
+    StreamDisconnected {
+        mac: String,
+        reason: StreamDisconnectReason,
         ts_ms: i64,
     },
     /// Directs BlueZ driver to call `GattCharacteristic1.StartNotify()`.
@@ -72,10 +93,19 @@ pub enum StreamEvent {
     },
 }
 
+const RF_DISCONNECT_DEBOUNCE_MS: i64 = 15_000;
+const DISCONNECT_RECONCILE_WINDOW_MS: i64 = 5_000;
+
 struct PendingRfDisconnect {
     mac: String,
     name: String,
     disconnected_at_ms: i64,
+}
+
+struct RecentTimeoutDisconnect {
+    name: String,
+    disconnected_at_ms: i64,
+    was_active: bool,
 }
 
 /// Tracks staged stream states (`Disconnected -> Connecting -> Acquiring -> Streaming <-> SignalLost`),
@@ -91,6 +121,8 @@ pub struct StreamTracker {
     last_any_packet_ts_ms: Option<i64>,
     notifying_checked: bool,
     pending_rf_disconnect: Option<PendingRfDisconnect>,
+    recent_timeout_disconnects: HashMap<String, RecentTimeoutDisconnect>,
+    recent_auth_alerts: HashMap<String, i64>,
     batteries: HashMap<String, u8>,
 }
 
@@ -114,6 +146,8 @@ impl StreamTracker {
             last_any_packet_ts_ms: None,
             notifying_checked: false,
             pending_rf_disconnect: None,
+            recent_timeout_disconnects: HashMap::new(),
+            recent_auth_alerts: HashMap::new(),
             batteries: HashMap::new(),
         }
     }
@@ -129,7 +163,10 @@ impl StreamTracker {
         let norm = mac.to_ascii_uppercase();
         self.enrolled.remove(&norm);
         self.connected.remove(&norm);
+        self.batteries.remove(&norm);
         self.standby_macs.retain(|m| m != &norm);
+        self.recent_timeout_disconnects.remove(&norm);
+        self.recent_auth_alerts.remove(&norm);
         if matches!(self.pending_rf_disconnect, Some(ref pending) if pending.mac == norm) {
             self.pending_rf_disconnect = None;
         }
@@ -169,12 +206,14 @@ impl StreamTracker {
                     return actions;
                 }
 
-                // If this device had a pending RF disconnect, cancel the debounced notification
+                // If this Wearable had a pending RF disconnect or recent timeout window, clear it
                 if let Some(ref pending) = self.pending_rf_disconnect
                     && pending.mac == norm
                 {
                     self.pending_rf_disconnect = None;
                 }
+                self.recent_timeout_disconnects.remove(&norm);
+                self.recent_auth_alerts.remove(&norm);
 
                 self.connected.insert(norm.clone());
 
@@ -247,21 +286,33 @@ impl StreamTracker {
 
             StreamEvent::BatteryUpdated { mac, percentage } => {
                 let norm = mac.to_ascii_uppercase();
-                self.batteries.insert(norm, percentage);
+                if self.connected.contains(&norm) {
+                    self.batteries.insert(norm, percentage);
+                }
             }
 
             StreamEvent::Disconnected { mac, reason, ts_ms } => {
                 let norm = mac.to_ascii_uppercase();
-                self.connected.remove(&norm);
+                if !self.enrolled.contains_key(&norm) {
+                    return actions;
+                }
+                let was_connected = self.connected.remove(&norm);
+                self.batteries.remove(&norm);
                 self.standby_macs.retain(|m| m != &norm);
+                let name = self.wearable_name(&norm);
 
                 if self.active_mac.as_ref() == Some(&norm) {
-                    self.transition_status(&norm, StreamStatus::Disconnected, ts_ms, &mut actions);
+                    self.recent_timeout_disconnects.remove(&norm);
+                    self.transition_to_disconnected(
+                        &norm,
+                        reason.to_stream_reason(),
+                        ts_ms,
+                        &mut actions,
+                    );
 
-                    let name = self.wearable_name(&norm);
-
-                    match reason {
+                    match &reason {
                         DisconnectReason::Remote => {
+                            self.cancel_pending_rf_disconnect(&norm);
                             actions.push(LifecycleAction::NotifyDisconnected {
                                 mac: norm.clone(),
                                 name,
@@ -270,27 +321,34 @@ impl StreamTracker {
                         DisconnectReason::Timeout => {
                             self.pending_rf_disconnect = Some(PendingRfDisconnect {
                                 mac: norm.clone(),
+                                name: name.clone(),
+                                disconnected_at_ms: ts_ms,
+                            });
+                            self.recent_timeout_disconnects.insert(
+                                norm.clone(),
+                                RecentTimeoutDisconnect {
+                                    name,
+                                    disconnected_at_ms: ts_ms,
+                                    was_active: true,
+                                },
+                            );
+                        }
+                        _ if self.emit_disconnect_alert(
+                            &norm,
+                            &name,
+                            &reason,
+                            ts_ms,
+                            &mut actions,
+                        ) =>
+                        {
+                            self.cancel_pending_rf_disconnect(&norm);
+                        }
+                        DisconnectReason::Other(_) | DisconnectReason::Authentication => {
+                            self.pending_rf_disconnect = Some(PendingRfDisconnect {
+                                mac: norm.clone(),
                                 name,
                                 disconnected_at_ms: ts_ms,
                             });
-                        }
-                        DisconnectReason::Authentication => {
-                            actions.push(LifecycleAction::AlertActionRequired {
-                                mac: norm.clone(),
-                                message: format!(
-                                    "Authentication failure for {name}; re-pair/re-enroll Wearable"
-                                ),
-                            });
-                        }
-                        DisconnectReason::Other(ref err) => {
-                            if err.contains("NotPermitted") {
-                                actions.push(LifecycleAction::AlertActionRequired {
-                                    mac: norm.clone(),
-                                    message: format!(
-                                        "{name} rejected GATT subscription (NotPermitted); enable Heart Rate Push or check Wearable support"
-                                    ),
-                                });
-                            }
                         }
                     }
 
@@ -305,13 +363,55 @@ impl StreamTracker {
                         );
                         actions.push(LifecycleAction::StartNotify { mac: next_mac });
                     }
+                } else if was_connected {
+                    if reason == DisconnectReason::Timeout {
+                        self.recent_timeout_disconnects.insert(
+                            norm,
+                            RecentTimeoutDisconnect {
+                                name,
+                                disconnected_at_ms: ts_ms,
+                                was_active: false,
+                            },
+                        );
+                    } else {
+                        self.emit_disconnect_alert(&norm, &name, &reason, ts_ms, &mut actions);
+                    }
+                } else if let Some(recent) = self.recent_timeout_disconnects.remove(&norm)
+                    && within_reconcile_window(ts_ms, recent.disconnected_at_ms)
+                {
+                    if reason == DisconnectReason::Remote {
+                        self.cancel_pending_rf_disconnect(&norm);
+                        if recent.was_active {
+                            actions.push(LifecycleAction::NotifyDisconnected {
+                                mac: norm.clone(),
+                                name: recent.name,
+                            });
+                            if self.active_mac.is_none() {
+                                actions.push(LifecycleAction::StreamDisconnected {
+                                    mac: norm,
+                                    reason: StreamDisconnectReason::Remote,
+                                    ts_ms: recent.disconnected_at_ms,
+                                });
+                            }
+                        }
+                    } else if self.emit_disconnect_alert(
+                        &norm,
+                        &recent.name,
+                        &reason,
+                        ts_ms,
+                        &mut actions,
+                    ) {
+                        self.cancel_pending_rf_disconnect(&norm);
+                    }
+                } else if reason == DisconnectReason::Authentication {
+                    self.emit_disconnect_alert(&norm, &name, &reason, ts_ms, &mut actions);
                 }
             }
 
             StreamEvent::Tick { ts_ms } => {
                 // 1. Check pending RF disconnect debounce (15 s)
                 if let Some(ref pending) = self.pending_rf_disconnect
-                    && ts_ms >= pending.disconnected_at_ms + 15_000
+                    && ts_ms >= pending.disconnected_at_ms + RF_DISCONNECT_DEBOUNCE_MS
                 {
                     actions.push(LifecycleAction::NotifyDisconnected {
                         mac: pending.mac.clone(),
@@ -319,6 +419,13 @@ impl StreamTracker {
                     });
                     self.pending_rf_disconnect = None;
                 }
+                self.recent_timeout_disconnects.retain(|_, recent| {
+                    ts_ms.saturating_sub(recent.disconnected_at_ms)
+                        <= DISCONNECT_RECONCILE_WINDOW_MS
+                });
+                self.recent_auth_alerts.retain(|_, alert_ts| {
+                    ts_ms.saturating_sub(*alert_ts) <= DISCONNECT_RECONCILE_WINDOW_MS
+                });
 
                 // 2. Check active stream timers
                 let Some(ref active) = self.active_mac.clone() else {
@@ -375,6 +482,79 @@ impl StreamTracker {
         actions
     }
 
+    fn cancel_pending_rf_disconnect(&mut self, norm_mac: &str) {
+        if matches!(
+            self.pending_rf_disconnect,
+            Some(ref pending) if pending.mac == norm_mac
+        ) {
+            self.pending_rf_disconnect = None;
+        }
+    }
+
+    fn emit_disconnect_alert(
+        &mut self,
+        norm_mac: &str,
+        name: &str,
+        reason: &DisconnectReason,
+        ts_ms: i64,
+        actions: &mut Vec<LifecycleAction>,
+    ) -> bool {
+        if *reason == DisconnectReason::Authentication {
+            self.emit_auth_alert_if_needed(norm_mac, name, ts_ms, actions);
+            return true;
+        }
+        if reason.is_not_permitted() {
+            actions.push(LifecycleAction::AlertActionRequired {
+                mac: norm_mac.to_string(),
+                message: format!(
+                    "{name} rejected GATT subscription (NotPermitted); enable Heart Rate Push or check Wearable support"
+                ),
+            });
+            return true;
+        }
+        false
+    }
+
+    fn emit_auth_alert_if_needed(
+        &mut self,
+        norm_mac: &str,
+        name: &str,
+        ts_ms: i64,
+        actions: &mut Vec<LifecycleAction>,
+    ) {
+        if let Some(prev_ts) = self.recent_auth_alerts.get(norm_mac)
+            && within_reconcile_window(ts_ms, *prev_ts)
+        {
+            return;
+        }
+        self.recent_auth_alerts.insert(norm_mac.to_string(), ts_ms);
+        actions.push(LifecycleAction::AlertActionRequired {
+            mac: norm_mac.to_string(),
+            message: format!("Authentication failure for {name}; re-pair/re-enroll Wearable"),
+        });
+    }
+
+    fn transition_to_disconnected(
+        &mut self,
+        mac: &str,
+        reason: StreamDisconnectReason,
+        ts_ms: i64,
+        actions: &mut Vec<LifecycleAction>,
+    ) {
+        let norm = mac.to_ascii_uppercase();
+        self.active_status = Some(StreamStatus::Disconnected);
+        self.active_mac = None;
+        self.acquiring_started_ts_ms = None;
+        self.last_valid_packet_ts_ms = None;
+        self.last_any_packet_ts_ms = None;
+        self.notifying_checked = false;
+        actions.push(LifecycleAction::StreamDisconnected {
+            mac: norm,
+            reason,
+            ts_ms,
+        });
+    }
+
     fn transition_status(
         &mut self,
         mac: &str,
@@ -427,4 +607,9 @@ impl StreamTracker {
             .unwrap_or("Wearable")
             .to_string()
     }
+}
+
+fn within_reconcile_window(ts_ms: i64, anchor_ms: i64) -> bool {
+    ts_ms >= anchor_ms.saturating_sub(1_000)
+        && ts_ms.saturating_sub(anchor_ms) <= DISCONNECT_RECONCILE_WINDOW_MS
 }

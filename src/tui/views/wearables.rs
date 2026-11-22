@@ -5,7 +5,9 @@ use ratatui::widgets::{Clear, Paragraph, Row, Table, Widget};
 
 use super::super::app::{ModalState, PairingPromptModalState, TuiApp, UnenrollButton};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget, UnenrollCheckbox};
-use super::{build_modal_clickable_row_line, centered_rect, fit_scroll_offset};
+use super::{
+    build_modal_clickable_row_line, centered_rect, fit_scroll_offset, format_wearable_battery,
+};
 
 pub(crate) struct WearablesScrollOffsets {
     pub(crate) table: usize,
@@ -102,10 +104,7 @@ fn render_wearables_table(
 
             let mac = &w.wearable.mac_masked;
             let status_str = w.status.display_label().to_string();
-            let bat_str = w
-                .battery
-                .map(|b| format!("{b}%"))
-                .unwrap_or_else(|| "--".to_string());
+            let bat_str = format_wearable_battery(app.daemon_connected, Some(w));
             let base_cap = if w.wearable.supports_rr {
                 "BPM+RR"
             } else {

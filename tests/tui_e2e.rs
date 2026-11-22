@@ -3213,6 +3213,96 @@ fn test_dashboard_gap_breaking_and_dynamic_y_autoscaling() {
 }
 
 #[test]
+fn test_battery_hidden_when_disconnected_on_dashboard_and_wearables() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.enrolled_wearables = vec![
+        make_wearable(
+            "w-1",
+            "AA:BB:CC:11:22:33",
+            Some("Polar H10"),
+            StreamStatus::Disconnected,
+            Some(85),
+            Some("Chest"),
+        ),
+        make_wearable(
+            "w-2",
+            "AA:BB:CC:44:55:66",
+            Some("Wrist Watch"),
+            StreamStatus::Connecting,
+            Some(74),
+            Some("Wrist"),
+        ),
+    ];
+
+    let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();
+
+    // 1. Dashboard with Disconnected primary wearable must show (--) and hide 85%
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let dash_dc = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        dash_dc.contains("Wearable: Polar H10 (--)"),
+        "Dashboard must show (--) when disconnected:\n{dash_dc}"
+    );
+    assert!(
+        !dash_dc.contains("85%"),
+        "Dashboard must not display ghost battery percentage:\n{dash_dc}"
+    );
+
+    // 2. Wearables tab: Disconnected row shows -- (not 85%), Connecting row shows 74%
+    app.active_tab = Tab::Wearables;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let wear_out = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        !wear_out.contains("85%"),
+        "Wearables table must not display ghost battery for Disconnected row:\n{wear_out}"
+    );
+    assert!(
+        wear_out.contains("74%"),
+        "Wearables table must display battery for Connecting row:\n{wear_out}"
+    );
+
+    // 3. Dashboard with SignalLost / Connecting connected states still displays battery
+    app.enrolled_wearables[0].status = StreamStatus::SignalLost;
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let dash_sig_lost = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        dash_sig_lost.contains("Wearable: Polar H10 (85%)"),
+        "Dashboard must show battery during SignalLost:\n{dash_sig_lost}"
+    );
+
+    // 4. Daemon disconnected -> battery hidden on both Dashboard and Wearables
+    app.handle_ipc(IpcEvent::Disconnected);
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let dash_offline = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        dash_offline.contains("Wearable: Polar H10 (--)"),
+        "Dashboard must show (--) when daemon is disconnected:\n{dash_offline}"
+    );
+    assert!(!dash_offline.contains("85%"));
+
+    app.active_tab = Tab::Wearables;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let wear_offline = buffer_to_string(terminal.backend().buffer());
+    assert!(
+        !wear_offline.contains("85%") && !wear_offline.contains("74%"),
+        "Wearables table must hide battery when daemon is disconnected:\n{wear_offline}"
+    );
+}
+
+#[test]
 fn test_grace_tick_activity_hold_banner_and_hit_map() {
     use bpmute::ipc::GraceTickEvent;
 

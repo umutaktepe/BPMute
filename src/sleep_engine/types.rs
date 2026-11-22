@@ -74,6 +74,11 @@ pub enum StreamStatus {
 }
 
 impl StreamStatus {
+    /// Returns whether this stream status represents an active Bluetooth link.
+    pub fn is_connected(self) -> bool {
+        !matches!(self, Self::Disconnected)
+    }
+
     /// Returns the human-readable Glossary/UI label for this stream state.
     pub fn display_label(self) -> &'static str {
         match self {

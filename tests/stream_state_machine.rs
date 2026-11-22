@@ -1,5 +1,6 @@
+use bpmute::bluetooth::operations::parse_bluez_disconnect_reason;
 use bpmute::bluetooth::stream::{DisconnectReason, LifecycleAction, StreamEvent, StreamTracker};
-use bpmute::sleep_engine::{ContactStatus, HrPacket, StreamStatus};
+use bpmute::sleep_engine::{ContactStatus, HrPacket, StreamDisconnectReason, StreamStatus};
 use bpmute::storage::WearableDescriptor;
 
 fn make_wearable(mac: &str, alias: &str) -> WearableDescriptor {
@@ -313,5 +314,424 @@ fn disconnect_notifications_and_rf_timeout_debounce() {
         actions
             .iter()
             .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { .. }))
+    );
+}
+
+#[test]
+fn battery_is_cleared_on_disconnect_and_ignored_while_disconnected() {
+    let w = make_wearable("AA:BB:CC:DD:EE:42", "Polar H10");
+    let mut tracker = StreamTracker::new();
+    tracker.add_enrolled(w.clone());
+
+    // Battery update while disconnected must not stick across a later connection
+    tracker.handle_event(StreamEvent::BatteryUpdated {
+        mac: w.mac.clone(),
+        percentage: 64,
+    });
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 1_000,
+    });
+    let actions = tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 1_500,
+    });
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyConnected { battery: None, .. }))
+    );
+
+    // Battery update while connected is reflected on NotifyConnected if sent before NotifyStarted,
+    // and then cleared on disconnect so a subsequent reconnect does not emit stale battery.
+    tracker.handle_event(StreamEvent::BatteryUpdated {
+        mac: w.mac.clone(),
+        percentage: 88,
+    });
+    tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Remote,
+        ts_ms: 2_000,
+    });
+
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 3_000,
+    });
+    let actions = tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 3_500,
+    });
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyConnected { battery: None, .. }))
+    );
+}
+
+#[test]
+fn bluez_reason_mapping_and_remote_before_timeout_deduplication() {
+    assert_eq!(
+        parse_bluez_disconnect_reason("org.bluez.Reason.Remote"),
+        DisconnectReason::Remote
+    );
+    assert_eq!(
+        parse_bluez_disconnect_reason("org.bluez.Reason.Timeout"),
+        DisconnectReason::Timeout
+    );
+    assert_eq!(
+        parse_bluez_disconnect_reason("org.bluez.Reason.Authentication"),
+        DisconnectReason::Authentication
+    );
+    assert_eq!(
+        parse_bluez_disconnect_reason("org.bluez.Reason.Unknown"),
+        DisconnectReason::Other("org.bluez.Reason.Unknown".to_string())
+    );
+    assert_eq!(
+        parse_bluez_disconnect_reason("org.bluez.Reason.Local"),
+        DisconnectReason::Other("org.bluez.Reason.Local".to_string())
+    );
+
+    let w = make_wearable("AA:BB:CC:DD:EE:50", "Watch");
+    let mut tracker = StreamTracker::new();
+    tracker.add_enrolled(w.clone());
+
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 1_000,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 1_500,
+    });
+
+    // 1. Device1.Disconnected("org.bluez.Reason.Remote") arrives before PropertiesChanged(Connected = false)
+    let first_actions = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Remote,
+        ts_ms: 10_000,
+    });
+    assert!(first_actions.iter().any(|a| matches!(
+        a,
+        LifecycleAction::StreamDisconnected {
+            mac,
+            reason: StreamDisconnectReason::Remote,
+            ts_ms: 10_000,
+        } if mac == &w.mac
+    )));
+    assert!(
+        first_actions
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { mac, .. } if mac == &w.mac))
+    );
+    assert_eq!(
+        tracker.active_stream_status(),
+        Some(StreamStatus::Disconnected)
+    );
+
+    // 2. Trailing PropertiesChanged(Connected = false) mapped to Timeout is deduplicated
+    let trailing_actions = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Timeout,
+        ts_ms: 10_020,
+    });
+    assert!(
+        trailing_actions.is_empty(),
+        "trailing Connected=false after Remote must be deduplicated: {trailing_actions:?}"
+    );
+
+    // 3. No 15s RF debounce was armed, so Tick after 15s emits nothing
+    let tick_actions = tracker.handle_event(StreamEvent::Tick { ts_ms: 26_000 });
+    assert!(
+        tick_actions.is_empty(),
+        "no debounced NotifyDisconnected should fire after Remote disconnect: {tick_actions:?}"
+    );
+}
+
+#[test]
+fn timeout_before_remote_reconciles_within_upgrade_window_and_cancels_debounce() {
+    let w = make_wearable("AA:BB:CC:DD:EE:51", "Watch");
+    let mut tracker = StreamTracker::new();
+    tracker.add_enrolled(w.clone());
+
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 1_000,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 1_500,
+    });
+
+    // 1. PropertiesChanged(Connected = false) arrives first -> Timeout + 15s debounce
+    let timeout_actions = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Timeout,
+        ts_ms: 10_000,
+    });
+    assert!(timeout_actions.iter().any(|a| matches!(
+        a,
+        LifecycleAction::StreamDisconnected {
+            mac,
+            reason: StreamDisconnectReason::Timeout,
+            ts_ms: 10_000,
+        } if mac == &w.mac
+    )));
+    assert!(
+        !timeout_actions
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { .. }))
+    );
+
+    // 2. Follow-up Device1.Disconnected("org.bluez.Reason.Remote") arrives 50ms later
+    let upgrade_actions = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Remote,
+        ts_ms: 10_050,
+    });
+    assert!(
+        upgrade_actions
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { mac, .. } if mac == &w.mac)),
+        "upgrade to Remote must fire NotifyDisconnected immediately: {upgrade_actions:?}"
+    );
+    assert!(
+        upgrade_actions.iter().any(|a| matches!(
+            a,
+            LifecycleAction::StreamDisconnected {
+                mac,
+                reason: StreamDisconnectReason::Remote,
+                ts_ms: 10_000,
+            } if mac == &w.mac
+        )),
+        "upgrade to Remote must emit Remote StreamDisconnected anchored at disconnect_ts: {upgrade_actions:?}"
+    );
+
+    // 3. Pending 15s RF debounce was cancelled -> Tick at +16s emits nothing
+    let tick_actions = tracker.handle_event(StreamEvent::Tick { ts_ms: 26_000 });
+    assert!(
+        tick_actions.is_empty(),
+        "pending RF debounce must stay cancelled after upgrade: {tick_actions:?}"
+    );
+
+    // 4. Outside the brief upgrade window (6s later), late Remote does not override Timeout
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 29_000,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 29_500,
+    });
+    tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Timeout,
+        ts_ms: 30_000,
+    });
+    let late_actions = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Remote,
+        ts_ms: 36_000,
+    });
+    assert!(
+        late_actions.is_empty(),
+        "Remote outside upgrade window must be ignored: {late_actions:?}"
+    );
+    let debounced_actions = tracker.handle_event(StreamEvent::Tick { ts_ms: 45_000 });
+    assert!(
+        debounced_actions
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { mac, .. } if mac == &w.mac))
+    );
+
+    // 5. Reconnecting within upgrade window clears stale reconciliation state
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 50_000,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 50_010,
+    });
+    tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Timeout,
+        ts_ms: 51_000,
+    });
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 51_020,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 51_030,
+    });
+    let fresh_dc = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Remote,
+        ts_ms: 51_100,
+    });
+    assert!(fresh_dc.iter().any(|a| matches!(
+        a,
+        LifecycleAction::StreamDisconnected {
+            mac,
+            reason: StreamDisconnectReason::Remote,
+            ts_ms: 51_100,
+        } if mac == &w.mac
+    )));
+}
+
+#[test]
+fn authentication_alert_and_fallback_other_reason_reconcile_across_signal_orders() {
+    let w = make_wearable("AA:BB:CC:DD:EE:52", "Strap");
+    let mut tracker = StreamTracker::new();
+    tracker.add_enrolled(w.clone());
+
+    // 1. Authentication arrives BEFORE Connected = false
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 1_000,
+    });
+    let auth_first = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Authentication,
+        ts_ms: 2_000,
+    });
+    assert_eq!(
+        auth_first
+            .iter()
+            .filter(
+                |a| matches!(a, LifecycleAction::AlertActionRequired { mac, .. } if mac == &w.mac)
+            )
+            .count(),
+        1
+    );
+    assert!(auth_first.iter().any(|a| matches!(
+        a,
+        LifecycleAction::StreamDisconnected {
+            mac,
+            reason: StreamDisconnectReason::Timeout,
+            ts_ms: 2_000,
+        } if mac == &w.mac
+    )));
+    let trailing_timeout = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Timeout,
+        ts_ms: 2_020,
+    });
+    assert!(trailing_timeout.is_empty());
+    assert!(
+        tracker
+            .handle_event(StreamEvent::Tick { ts_ms: 18_000 })
+            .is_empty()
+    );
+
+    // 2. Connected = false (Timeout) arrives BEFORE Authentication
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 20_000,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 20_500,
+    });
+    let timeout_first = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Timeout,
+        ts_ms: 21_000,
+    });
+    assert!(timeout_first.iter().any(|a| matches!(
+        a,
+        LifecycleAction::StreamDisconnected {
+            reason: StreamDisconnectReason::Timeout,
+            ..
+        }
+    )));
+    let auth_followup = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Authentication,
+        ts_ms: 21_040,
+    });
+    assert_eq!(
+        auth_followup
+            .iter()
+            .filter(
+                |a| matches!(a, LifecycleAction::AlertActionRequired { mac, .. } if mac == &w.mac)
+            )
+            .count(),
+        1,
+        "Authentication shortly after Connected=false must emit AlertActionRequired: {auth_followup:?}"
+    );
+    assert!(
+        tracker
+            .handle_event(StreamEvent::Tick { ts_ms: 37_000 })
+            .is_empty(),
+        "Authentication follow-up must cancel pending RF NotifyDisconnected debounce"
+    );
+
+    // 3. Authentication while disconnected (e.g. failed background reconnect) still alerts once
+    let auth_disconnected = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Authentication,
+        ts_ms: 45_000,
+    });
+    assert_eq!(
+        auth_disconnected
+            .iter()
+            .filter(
+                |a| matches!(a, LifecycleAction::AlertActionRequired { mac, .. } if mac == &w.mac)
+            )
+            .count(),
+        1
+    );
+    let auth_dup = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Authentication,
+        ts_ms: 45_050,
+    });
+    assert!(auth_dup.is_empty());
+
+    // 4. Fallback reason (e.g. org.bluez.Reason.Unknown) before Connected=false falls back to Timeout + 15s debounce
+    tracker.handle_event(StreamEvent::Connected {
+        mac: w.mac.clone(),
+        ts_ms: 60_000,
+    });
+    tracker.handle_event(StreamEvent::NotifyStarted {
+        mac: w.mac.clone(),
+        ts_ms: 60_500,
+    });
+    let other_first = tracker.handle_event(StreamEvent::Disconnected {
+        mac: w.mac.clone(),
+        reason: DisconnectReason::Other("org.bluez.Reason.Unknown".to_string()),
+        ts_ms: 61_000,
+    });
+    assert!(other_first.iter().any(|a| matches!(
+        a,
+        LifecycleAction::StreamDisconnected {
+            reason: StreamDisconnectReason::Timeout,
+            ts_ms: 61_000,
+            ..
+        }
+    )));
+    assert!(
+        !other_first
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { .. }))
+    );
+    assert!(
+        tracker
+            .handle_event(StreamEvent::Disconnected {
+                mac: w.mac.clone(),
+                reason: DisconnectReason::Timeout,
+                ts_ms: 61_030,
+            })
+            .is_empty()
+    );
+    let after_debounce = tracker.handle_event(StreamEvent::Tick { ts_ms: 76_000 });
+    assert!(
+        after_debounce
+            .iter()
+            .any(|a| matches!(a, LifecycleAction::NotifyDisconnected { mac, .. } if mac == &w.mac)),
+        "fallback Other reason must preserve 15s RF debounce: {after_debounce:?}"
     );
 }

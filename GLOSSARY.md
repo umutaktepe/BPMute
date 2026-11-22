@@ -29,7 +29,7 @@ The readiness tier (`Cold Start`, `Learning`, or `Calibrated`) indicating how st
 _Avoid_: Calibration level, training status, model confidence
 
 **Monitoring Session**:
-A single continuous episode of sleep-onset observation backed by a streaming Wearable, containing at most one sleep onset and closing upon sustained disconnection, host suspend or power-off, or sustained post-sleep wakefulness.
+A single continuous episode of sleep-onset observation backed by a streaming Wearable, containing at most one sleep onset and closing upon sustained disconnection, manual closure while disconnected or in `Signal Lost`, host suspend or power-off, or sustained post-sleep wakefulness.
 _Avoid_: Night, run, recording, log
 
 **Anomalous Session**:

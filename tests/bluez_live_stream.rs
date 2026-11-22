@@ -8,8 +8,10 @@ use std::sync::{
 use std::time::Duration;
 
 use bpmute::ipc::IpcClient;
+use chrono::Utc;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use zbus::interface;
 use zbus::object_server::SignalContext;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
@@ -48,8 +50,8 @@ fn owned<'a>(v: impl Into<Value<'a>>) -> OwnedValue {
     OwnedValue::try_from(v.into()).expect("convert Value into OwnedValue")
 }
 
-fn spawn_private_dbus(temp: &TempDir) -> (ChildGuard, String) {
-    let bus_sock = temp.path().join("system-bus.sock");
+fn spawn_private_dbus_named(temp: &TempDir, sock_name: &str) -> (ChildGuard, String) {
+    let bus_sock = temp.path().join(sock_name);
     let listen_addr = format!("unix:path={}", bus_sock.display());
     let mut child = Command::new("dbus-daemon")
         .args([
@@ -75,6 +77,10 @@ fn spawn_private_dbus(temp: &TempDir) -> (ChildGuard, String) {
     let addr = addr.trim().to_string();
     assert!(!addr.is_empty(), "dbus-daemon did not print a bus address");
     (ChildGuard(child), addr)
+}
+
+fn spawn_private_dbus(temp: &TempDir) -> (ChildGuard, String) {
+    spawn_private_dbus_named(temp, "system-bus.sock")
 }
 
 #[derive(Clone)]
@@ -673,6 +679,14 @@ async fn spawn_daemon_and_connect(
     temp: &TempDir,
     bus_addr: &str,
 ) -> (ChildGuard, IpcClient, std::path::PathBuf) {
+    spawn_daemon_with_session_bus(temp, bus_addr, "unix:path=/dev/null").await
+}
+
+async fn spawn_daemon_with_session_bus(
+    temp: &TempDir,
+    bus_addr: &str,
+    session_bus_addr: &str,
+) -> (ChildGuard, IpcClient, std::path::PathBuf) {
     let cfg_path = temp.path().join("cfg/bpmute/config.toml");
     let data_dir = temp.path().join("data/bpmute");
     let socket_path = temp.path().join("run/bpmute/daemon.sock");
@@ -688,7 +702,7 @@ async fn spawn_daemon_and_connect(
             "daemon",
         ])
         .env("DBUS_SYSTEM_BUS_ADDRESS", bus_addr)
-        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null")
+        .env("DBUS_SESSION_BUS_ADDRESS", session_bus_addr)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -728,40 +742,48 @@ async fn wait_for_hr_sample(client: &mut IpcClient, expected_bpm: f64) -> bool {
     .unwrap_or(false)
 }
 
-async fn wait_for_wearable_status(client: &mut IpcClient, expected_status: &str) -> bool {
+async fn poll_ipc_until<T>(
+    client: &mut IpcClient,
+    op: &str,
+    extract: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Option<T> {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Ok(res) = client.request("wearable.list", json!({})).await
-                && let Some(arr) = res["wearables"].as_array()
-                && arr
-                    .iter()
-                    .any(|w| w["status"].as_str() == Some(expected_status))
+            if let Ok(res) = client.request(op, json!({})).await
+                && let Some(val) = extract(&res)
             {
-                return true;
+                return Some(val);
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .unwrap_or(false)
+    .ok()
+    .flatten()
+}
+
+async fn wait_for_wearable_status(client: &mut IpcClient, expected_status: &str) -> bool {
+    poll_ipc_until(client, "wearable.list", |res| {
+        res["wearables"]
+            .as_array()?
+            .iter()
+            .any(|w| w["status"].as_str() == Some(expected_status))
+            .then_some(())
+    })
+    .await
+    .is_some()
 }
 
 async fn wait_for_wearable_battery(client: &mut IpcClient, expected_pct: u8) -> bool {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Ok(res) = client.request("wearable.list", json!({})).await
-                && let Some(arr) = res["wearables"].as_array()
-                && arr
-                    .iter()
-                    .any(|w| w["battery"].as_u64() == Some(u64::from(expected_pct)))
-            {
-                return true;
-            }
-            tokio::task::yield_now().await;
-        }
+    poll_ipc_until(client, "wearable.list", |res| {
+        res["wearables"]
+            .as_array()?
+            .iter()
+            .any(|w| w["battery"].as_u64() == Some(u64::from(expected_pct)))
+            .then_some(())
     })
     .await
-    .unwrap_or(false)
+    .is_some()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1690,5 +1712,471 @@ async fn bluez_daemon_reads_and_updates_battery_from_gatt_2a19() {
     assert!(
         wait_for_wearable_battery(&mut client, 79).await,
         "battery percentage 79% must be reflected in wearable.list after PropertiesChanged"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bluez_daemon_clears_battery_on_disconnect_and_ignores_disconnected_gatt_cache() {
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    let (bluez_conn, bluez_state) = start_mock_bluez_with_options(
+        &bus_addr,
+        MockBluezOptions {
+            expose_wearable: true,
+            expose_hrs_uuid: true,
+            initial_connected: false,
+            initial_gatt: true,
+            fail_connect: true,
+            expose_battery_char: true,
+            battery_level: 85,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (_daemon_guard, mut client, socket_path) = spawn_daemon_and_connect(&temp, &bus_addr).await;
+
+    let enroll_out = tokio::process::Command::new(env!("CARGO_BIN_EXE_bpmute"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "enroll",
+            "--address",
+            DEVICE_MAC,
+            "--alias",
+            "Watch",
+        ])
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &bus_addr)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null")
+        .output()
+        .await
+        .expect("bpmute enroll runs");
+    assert!(enroll_out.status.success());
+
+    // While disconnected, cached BlueZ 0x2A19 value must not populate battery
+    let initial = client.request("wearable.list", json!({})).await.unwrap();
+    assert_eq!(initial["wearables"][0]["status"], "disconnected");
+    assert!(
+        initial["wearables"][0]["battery"].is_null(),
+        "disconnected wearable must not show cached GATT battery: {initial}"
+    );
+
+    // Connect -> battery 85% appears
+    bluez_state.fail_connect.store(false, Ordering::SeqCst);
+    bluez_state.connected.store(true, Ordering::SeqCst);
+    let empty_inv: Vec<&str> = Vec::new();
+    let mut dev_changed: HashMap<&str, Value<'_>> = HashMap::new();
+    dev_changed.insert("Connected", Value::from(true));
+    bluez_conn
+        .emit_signal(
+            Option::<zbus::names::BusName>::None,
+            DEVICE_PATH,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("org.bluez.Device1", dev_changed, &empty_inv),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        wait_for_wearable_status(&mut client, "acquiring").await
+            || wait_for_wearable_status(&mut client, "streaming").await
+    );
+    assert!(wait_for_wearable_battery(&mut client, 85).await);
+
+    // Disconnect -> battery clears back to null
+    bluez_state.connected.store(false, Ordering::SeqCst);
+    bluez_state.notify_started.store(false, Ordering::SeqCst);
+    let mut disc_changed: HashMap<&str, Value<'_>> = HashMap::new();
+    disc_changed.insert("Connected", Value::from(false));
+    bluez_conn
+        .emit_signal(
+            Option::<zbus::names::BusName>::None,
+            DEVICE_PATH,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("org.bluez.Device1", disc_changed, &empty_inv),
+        )
+        .await
+        .unwrap();
+
+    assert!(wait_for_wearable_status(&mut client, "disconnected").await);
+    let after_dc = client.request("wearable.list", json!({})).await.unwrap();
+    assert!(
+        after_dc["wearables"][0]["battery"].is_null(),
+        "battery must be cleared after BlueZ disconnect: {after_dc}"
+    );
+}
+
+struct MockNotifications {
+    tx: mpsc::UnboundedSender<(String, String)>,
+    next_id: std::sync::atomic::AtomicU32,
+}
+
+#[interface(name = "org.freedesktop.Notifications")]
+impl MockNotifications {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "org.freedesktop.Notifications.Notify D-Bus method signature requires 8 parameters"
+    )]
+    fn notify(
+        &self,
+        _app_name: &str,
+        _replaces_id: u32,
+        _app_icon: &str,
+        summary: &str,
+        body: &str,
+        _actions: Vec<String>,
+        _hints: HashMap<String, zbus::zvariant::OwnedValue>,
+        _expire_timeout: i32,
+    ) -> u32 {
+        let _ = self.tx.send((summary.to_string(), body.to_string()));
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+}
+
+async fn start_mock_notifications(
+    temp: &TempDir,
+) -> (
+    ChildGuard,
+    String,
+    zbus::Connection,
+    mpsc::UnboundedReceiver<(String, String)>,
+) {
+    let (guard, session_addr) = spawn_private_dbus_named(temp, "session-bus.sock");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let conn = zbus::connection::Builder::address(session_addr.as_str())
+        .expect("valid session dbus addr")
+        .name("org.freedesktop.Notifications")
+        .expect("mock Notifications bus name")
+        .serve_at(
+            "/org/freedesktop/Notifications",
+            MockNotifications {
+                tx,
+                next_id: std::sync::atomic::AtomicU32::new(1),
+            },
+        )
+        .unwrap()
+        .build()
+        .await
+        .expect("mock notifications connection");
+    (guard, session_addr, conn, rx)
+}
+
+async fn wait_for_notification(
+    rx: &mut mpsc::UnboundedReceiver<(String, String)>,
+    expected_summary: &str,
+) -> Option<(String, String)> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some((summary, body)) = rx.recv().await {
+            if summary == expected_summary {
+                return Some((summary, body));
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn wait_for_daemon_status<T>(
+    client: &mut IpcClient,
+    extract: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Option<T> {
+    poll_ipc_until(client, "daemon.status", extract).await
+}
+
+struct StreamingDaemonFixture {
+    _temp: TempDir,
+    _dbus_guard: ChildGuard,
+    _sess_guard: ChildGuard,
+    _notif_conn: zbus::Connection,
+    _daemon_guard: ChildGuard,
+    bluez_conn: zbus::Connection,
+    bluez_state: MockBluezState,
+    client: IpcClient,
+    notif_rx: mpsc::UnboundedReceiver<(String, String)>,
+}
+
+async fn setup_streaming_daemon_fixture() -> StreamingDaemonFixture {
+    let temp = TempDir::new().unwrap();
+    let (_dbus_guard, bus_addr) = spawn_private_dbus(&temp);
+    let (_sess_guard, session_addr, _notif_conn, mut notif_rx) =
+        start_mock_notifications(&temp).await;
+    let (bluez_conn, bluez_state) = start_mock_bluez(&bus_addr, true, true, true).await;
+    let (_daemon_guard, mut client, socket_path) =
+        spawn_daemon_with_session_bus(&temp, &bus_addr, &session_addr).await;
+
+    let enroll_out = tokio::process::Command::new(env!("CARGO_BIN_EXE_bpmute"))
+        .args([
+            "--socket",
+            socket_path.to_str().unwrap(),
+            "enroll",
+            "--address",
+            DEVICE_MAC,
+            "--alias",
+            "Watch",
+        ])
+        .env("DBUS_SYSTEM_BUS_ADDRESS", &bus_addr)
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null")
+        .output()
+        .await
+        .expect("bpmute enroll runs");
+    assert!(enroll_out.status.success());
+
+    assert!(
+        wait_for_wearable_status(&mut client, "acquiring").await
+            || wait_for_wearable_status(&mut client, "streaming").await
+    );
+    assert!(
+        wait_for_notification(&mut notif_rx, "BPMute Wearable Connected")
+            .await
+            .is_some()
+    );
+
+    let mut changed: HashMap<&str, Value<'_>> = HashMap::new();
+    changed.insert("Value", Value::from(vec![0x06u8, 68u8]));
+    let invalidated: Vec<&str> = Vec::new();
+    bluez_conn
+        .emit_signal(
+            Option::<zbus::names::BusName>::None,
+            HRM_CHAR_PATH,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("org.bluez.GattCharacteristic1", changed, invalidated),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        wait_for_daemon_status(&mut client, |res| {
+            (res["monitoring_state"].as_str() == Some("Warmup")).then_some(())
+        })
+        .await
+        .is_some()
+    );
+
+    StreamingDaemonFixture {
+        _temp: temp,
+        _dbus_guard,
+        _sess_guard,
+        _notif_conn,
+        _daemon_guard,
+        bluez_conn,
+        bluez_state,
+        client,
+        notif_rx,
+    }
+}
+
+async fn emit_device_connected_prop(
+    bluez_conn: &zbus::Connection,
+    bluez_state: &MockBluezState,
+    connected: bool,
+) {
+    bluez_state.connected.store(connected, Ordering::SeqCst);
+    if !connected {
+        bluez_state.notify_started.store(false, Ordering::SeqCst);
+    }
+    let mut changed: HashMap<&str, Value<'_>> = HashMap::new();
+    changed.insert("Connected", Value::from(connected));
+    let empty_inv: Vec<&str> = Vec::new();
+    bluez_conn
+        .emit_signal(
+            Option::<zbus::names::BusName>::None,
+            DEVICE_PATH,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("org.bluez.Device1", changed, &empty_inv),
+        )
+        .await
+        .unwrap();
+}
+
+async fn emit_device_disconnected_signal(
+    bluez_conn: &zbus::Connection,
+    reason: &str,
+    message: &str,
+) {
+    bluez_conn
+        .emit_signal(
+            Option::<zbus::names::BusName>::None,
+            DEVICE_PATH,
+            "org.bluez.Device1",
+            "Disconnected",
+            &(reason, message),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bluez_device_disconnected_remote_before_connected_false_tightens_deadline_and_notifies_immediately()
+ {
+    let mut fx = setup_streaming_daemon_fixture().await;
+
+    let t_before = Utc::now().timestamp_millis();
+    fx.bluez_state.connected.store(false, Ordering::SeqCst);
+    fx.bluez_state.notify_started.store(false, Ordering::SeqCst);
+    emit_device_disconnected_signal(
+        &fx.bluez_conn,
+        "org.bluez.Reason.Remote",
+        "Connection Terminated by Remote User",
+    )
+    .await;
+
+    let notif = wait_for_notification(&mut fx.notif_rx, "BPMute Wearable Disconnected").await;
+    assert!(
+        notif.is_some(),
+        "Remote Device1.Disconnected must notify immediately without 15s debounce"
+    );
+
+    let deadline_2m = wait_for_daemon_status(&mut fx.client, |res| {
+        res["session_close_deadline_ms"]
+            .as_i64()
+            .filter(|&d| d > t_before)
+    })
+    .await
+    .expect("session_close_deadline_ms must be set");
+    assert!(
+        deadline_2m - t_before <= 125_000,
+        "Remote disconnect must set 2-minute deadline, got delta {} ms",
+        deadline_2m - t_before
+    );
+
+    // Trailing PropertiesChanged(Connected = false) must be deduplicated
+    emit_device_connected_prop(&fx.bluez_conn, &fx.bluez_state, false).await;
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+        let status_after = fx.client.request("daemon.status", json!({})).await.unwrap();
+        assert_eq!(
+            status_after["session_close_deadline_ms"].as_i64(),
+            Some(deadline_2m),
+            "trailing Connected=false must not extend or alter 2-minute deadline"
+        );
+    }
+    assert!(
+        fx.notif_rx.try_recv().is_err(),
+        "trailing Connected=false must not duplicate disconnect notification"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bluez_connected_false_before_device_disconnected_remote_tightens_deadline_and_notifies_immediately()
+ {
+    let mut fx = setup_streaming_daemon_fixture().await;
+
+    // 1. PropertiesChanged(Connected = false) arrives first -> 15 min deadline, debounced notification
+    let t_before = Utc::now().timestamp_millis();
+    emit_device_connected_prop(&fx.bluez_conn, &fx.bluez_state, false).await;
+    assert!(wait_for_wearable_status(&mut fx.client, "disconnected").await);
+
+    let deadline_15m = wait_for_daemon_status(&mut fx.client, |res| {
+        res["session_close_deadline_ms"]
+            .as_i64()
+            .filter(|&d| d - t_before > 800_000)
+    })
+    .await
+    .expect("Connected=false must initially set ~15-minute close deadline");
+    assert!(
+        fx.notif_rx.try_recv().is_err(),
+        "Connected=false alone must debounce disconnect notification"
+    );
+
+    // 2. Device1.Disconnected("org.bluez.Reason.Remote") arrives shortly after -> tightens to 2m & notifies
+    emit_device_disconnected_signal(
+        &fx.bluez_conn,
+        "org.bluez.Reason.Remote",
+        "Connection Terminated by Remote User",
+    )
+    .await;
+
+    let notif = wait_for_notification(&mut fx.notif_rx, "BPMute Wearable Disconnected").await;
+    assert!(
+        notif.is_some(),
+        "follow-up Remote signal must cancel debounce and fire NotifyDisconnected immediately"
+    );
+
+    let deadline_2m = wait_for_daemon_status(&mut fx.client, |res| {
+        res["session_close_deadline_ms"]
+            .as_i64()
+            .filter(|&d| d < deadline_15m)
+    })
+    .await
+    .expect("follow-up Remote signal must tighten session_close_deadline_ms");
+    assert!(
+        deadline_2m - t_before <= 125_000,
+        "tightened deadline must be ~2 minutes from disconnect, got delta {} ms",
+        deadline_2m - t_before
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bluez_device_disconnected_authentication_emits_pairing_alert_regardless_of_signal_order() {
+    let mut fx = setup_streaming_daemon_fixture().await;
+
+    // A: Authentication before Connected=false
+    fx.bluez_state.connected.store(false, Ordering::SeqCst);
+    fx.bluez_state.notify_started.store(false, Ordering::SeqCst);
+    emit_device_disconnected_signal(
+        &fx.bluez_conn,
+        "org.bluez.Reason.Authentication",
+        "Authentication Failure",
+    )
+    .await;
+    assert!(
+        wait_for_notification(&mut fx.notif_rx, "BPMute Wearable Pairing Alert")
+            .await
+            .is_some(),
+        "Authentication before Connected=false must emit pairing alert"
+    );
+    emit_device_connected_prop(&fx.bluez_conn, &fx.bluez_state, false).await;
+    assert!(wait_for_wearable_status(&mut fx.client, "disconnected").await);
+
+    // Reconnect
+    emit_device_connected_prop(&fx.bluez_conn, &fx.bluez_state, true).await;
+    assert!(
+        wait_for_wearable_status(&mut fx.client, "acquiring").await
+            || wait_for_wearable_status(&mut fx.client, "streaming").await
+    );
+    let _ = wait_for_notification(&mut fx.notif_rx, "BPMute Wearable Connected").await;
+
+    // B: Connected=false before Authentication
+    emit_device_connected_prop(&fx.bluez_conn, &fx.bluez_state, false).await;
+    assert!(wait_for_wearable_status(&mut fx.client, "disconnected").await);
+    emit_device_disconnected_signal(
+        &fx.bluez_conn,
+        "org.bluez.Reason.Authentication",
+        "Authentication Failure",
+    )
+    .await;
+    assert!(
+        wait_for_notification(&mut fx.notif_rx, "BPMute Wearable Pairing Alert")
+            .await
+            .is_some(),
+        "Authentication shortly after Connected=false must emit pairing alert"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bluez_legacy_host_without_device_disconnected_signal_falls_back_to_timeout_window() {
+    let mut fx = setup_streaming_daemon_fixture().await;
+
+    let t_before = Utc::now().timestamp_millis();
+    emit_device_connected_prop(&fx.bluez_conn, &fx.bluez_state, false).await;
+    assert!(wait_for_wearable_status(&mut fx.client, "disconnected").await);
+
+    let deadline = wait_for_daemon_status(&mut fx.client, |res| {
+        res["session_close_deadline_ms"]
+            .as_i64()
+            .filter(|&d| d - t_before > 800_000)
+    })
+    .await
+    .expect("legacy BlueZ Connected=false must fall back to 15-minute close deadline");
+    assert!(deadline - t_before <= 905_000);
+    assert!(
+        fx.notif_rx.try_recv().is_err(),
+        "legacy BlueZ Connected=false must retain 15-second RF debounce"
     );
 }

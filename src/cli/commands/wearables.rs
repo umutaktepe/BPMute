@@ -86,7 +86,7 @@ pub(crate) async fn run_wearables<WOut: Write, WErr: Write>(
                 let w = &item.wearable;
                 let alias_part = w.alias.as_deref().unwrap_or("-");
                 let name_part = w.advertised_name.as_deref().unwrap_or("-");
-                let battery_part = match item.battery {
+                let battery_part = match item.battery.filter(|_| item.status.is_connected()) {
                     Some(pct) => format!("{pct}%"),
                     None => "-".to_string(),
                 };
