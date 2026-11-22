@@ -20,6 +20,17 @@ impl LedgerStore {
         Ok(())
     }
 
+    /// Reclaims freed SQLite freelist pages to the operating system via incremental vacuum.
+    pub(crate) fn reclaim_freelist_pages(&self) -> Result<(), StorageError> {
+        let mut stmt = self.conn.prepare("PRAGMA incremental_vacuum;")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        drop(rows);
+        drop(stmt);
+        enforce_private_db_permissions(&self.db_path)?;
+        Ok(())
+    }
+
     /// Sets the active retention policy for three-tier SQLite pruning.
     pub fn set_retention_config(&mut self, config: RetentionConfig) {
         self.retention_config = config;
@@ -30,6 +41,7 @@ impl LedgerStore {
         let retention = self.retention_config.clone();
         let summary = self.write_tx(move |tx| prune_retention_in_tx(tx, &retention, now_ms))?;
         if summary.raw_samples_pruned > 0 || summary.session_epochs_pruned > 0 {
+            self.reclaim_freelist_pages()?;
             self.flush_wal()?;
         }
         Ok(summary)
@@ -59,10 +71,12 @@ impl LedgerStore {
                      WHERE status = 'closed' AND raw_samples_count != 0",
                     [],
                 )?;
-                let _ = tx.execute("PRAGMA incremental_vacuum;", []);
             }
             Ok(deleted)
         })?;
+        if deleted > 0 {
+            self.reclaim_freelist_pages()?;
+        }
         self.flush_wal()?;
         Ok(deleted)
     }

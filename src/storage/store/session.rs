@@ -484,7 +484,7 @@ impl LedgerStore {
         id_or_prefix: &str,
         now_ms: i64,
     ) -> Result<(String, CalibrationState), StorageError> {
-        self.write_tx_and_flush(|tx| {
+        let (session_id, state) = self.write_tx(|tx| {
             let session_id = resolve_session_id(tx, id_or_prefix)?;
             let status: String = tx.query_row(
                 "SELECT status FROM sessions WHERE id = ?1",
@@ -498,10 +498,13 @@ impl LedgerStore {
             }
 
             tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
-            let _ = tx.execute("PRAGMA incremental_vacuum;", []);
             let state = recompute_and_persist_in_tx(tx, now_ms)?;
             Ok((session_id, state))
-        })
+        })?;
+
+        self.reclaim_freelist_pages()?;
+        self.flush_wal()?;
+        Ok((session_id, state))
     }
 }
 

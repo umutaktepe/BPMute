@@ -333,7 +333,7 @@ impl LedgerStore {
             ..Default::default()
         };
 
-        let state = self.write_tx_and_flush(|tx| {
+        let state = self.write_tx(|tx| {
             if mode == ImportMode::Replace {
                 tx.execute("DELETE FROM raw_samples", [])?;
                 tx.execute("DELETE FROM session_epochs", [])?;
@@ -577,12 +577,13 @@ impl LedgerStore {
                 )?;
             }
 
-            let state = recompute_and_persist_in_tx(tx, now_ms)?;
-            if mode == ImportMode::Replace {
-                let _ = tx.execute("PRAGMA incremental_vacuum;", []);
-            }
-            Ok(state)
+            recompute_and_persist_in_tx(tx, now_ms)
         })?;
+
+        if mode == ImportMode::Replace {
+            self.reclaim_freelist_pages()?;
+        }
+        self.flush_wal()?;
 
         Ok((summary, state))
     }

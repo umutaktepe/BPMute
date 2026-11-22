@@ -170,7 +170,6 @@ impl LedgerStore {
                     "DELETE FROM sessions WHERE wearable_id = ?1",
                     params![id],
                 )?;
-                let _ = tx.execute("PRAGMA incremental_vacuum;", []);
                 cal_state = Some(recompute_and_persist_in_tx(tx, now_ms)?);
             }
             tx.execute(
@@ -181,6 +180,7 @@ impl LedgerStore {
             Ok((enrolled, cal_state))
         })?;
         if delete_sessions {
+            self.reclaim_freelist_pages()?;
             self.flush_wal()?;
         }
         Ok(result)

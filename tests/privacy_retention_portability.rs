@@ -1315,6 +1315,16 @@ fn test_purge_and_hard_wipe_reclaim_storage_and_truncate_wal() {
     assert_eq!(cal_b1.valid_sessions, 0);
     assert_eq!(cal_b1.maturity, CalibrationMaturity::ColdStart);
 
+    // Seed new session telemetry before hard wipe so hard_wipe has pages to reclaim.
+    seed_wearable_and_closed_session(
+        &mut store,
+        "AA:BB:CC:DD:EE:01",
+        "Band",
+        4_000_000,
+        60.0,
+        300,
+    );
+
     // Repeated hard_wipe calls must reclaim space, truncate WAL, and stay constant in size.
     let size_before_wipe = store.get_storage_stats().unwrap().db_size_bytes;
     let cal_w1 = store.hard_wipe(false, 5_000_000).unwrap();
@@ -1594,6 +1604,59 @@ fn test_sibling_storage_mutations_truncate_wal_and_reclaim_replace_space() {
         .query_row("PRAGMA journal_size_limit;", [], |r| r.get(0))
         .unwrap();
     assert_eq!(limit, 1_048_576);
+}
+
+#[test]
+fn test_delete_session_reclaims_storage_pages_and_shrinks_db() {
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let (_wid1, sid1) = seed_wearable_and_closed_session(
+        &mut store,
+        "AA:BB:CC:DD:EE:01",
+        "Band1",
+        1_000_000,
+        65.0,
+        500,
+    );
+    let (_wid2, _sid2) = seed_wearable_and_closed_session(
+        &mut store,
+        "AA:BB:CC:DD:EE:01",
+        "Band1",
+        2_000_000,
+        65.0,
+        500,
+    );
+
+    let stats_before = store.get_storage_stats().unwrap();
+    assert_eq!(stats_before.sessions_count, 2);
+    assert_eq!(stats_before.wal_size_bytes, 0);
+
+    let (deleted_id, _cal) = store
+        .delete_session_and_recompute(&sid1, 3_000_000)
+        .unwrap();
+    assert_eq!(deleted_id, sid1);
+
+    let stats_after = store.get_storage_stats().unwrap();
+    let ro_conn = rusqlite::Connection::open(&db_path).unwrap();
+    let freelist_count: i64 = ro_conn
+        .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stats_after.sessions_count, 1);
+    assert_eq!(stats_after.wal_size_bytes, 0);
+    assert_eq!(
+        freelist_count, 0,
+        "deleting a session must reclaim all freelist pages via incremental vacuum"
+    );
+    assert!(
+        stats_before.db_size_bytes - stats_after.db_size_bytes >= 25 * 4096,
+        "deleting a heavy session must shrink DB size by its full extent: before={}, after={}",
+        stats_before.db_size_bytes,
+        stats_after.db_size_bytes
+    );
 }
 
 #[tokio::test]
