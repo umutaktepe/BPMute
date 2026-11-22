@@ -10,5 +10,6 @@ disallowed-methods = [
   { path = "std::env::var_os", reason = "Use injected EnvSource instead of process-global std::env::var_os (CODING_STANDARDS.md: Boundary trait preservation)" },
   { path = "std::env::vars", reason = "Use injected EnvSource instead of process-global std::env::vars (CODING_STANDARDS.md: Boundary trait preservation)" },
   { path = "std::env::vars_os", reason = "Use injected EnvSource instead of process-global std::env::vars_os (CODING_STANDARDS.md: Boundary trait preservation)" },
+  { path = "wayland_client::Connection::connect_to_env", reason = "Use connect_wayland_socket(&dyn EnvSource) + Connection::from_socket to preserve the EnvSource boundary (CODING_STANDARDS.md: Boundary trait preservation)" },
 ]
 

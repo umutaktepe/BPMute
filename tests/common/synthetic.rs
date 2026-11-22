@@ -77,6 +77,30 @@ pub enum StageKind {
         duration_sec: i64,
         elevation_bpm: f64,
     },
+    RemCyclePlateau {
+        duration_sec: i64,
+    },
+    FirmwareSmoothedQuietWake {
+        duration_sec: i64,
+    },
+}
+
+impl StageKind {
+    /// Returns the duration of this stage in seconds.
+    pub fn duration_sec(&self) -> i64 {
+        match *self {
+            Self::QuietWake { duration_sec }
+            | Self::ActiveWakeSpike { duration_sec, .. }
+            | Self::PostWorkoutCooldown { duration_sec, .. }
+            | Self::DrowsyDip { duration_sec, .. }
+            | Self::N1Onset { duration_sec }
+            | Self::N2Sleep { duration_sec }
+            | Self::Arousal { duration_sec }
+            | Self::PostSleepWake { duration_sec, .. }
+            | Self::RemCyclePlateau { duration_sec }
+            | Self::FirmwareSmoothedQuietWake { duration_sec } => duration_sec,
+        }
+    }
 }
 
 /// Ground-truth realization at 1 Hz from which both `BPM+RR` and `BPM-only` streams are derived.
@@ -115,16 +139,7 @@ pub fn generate_paired_trace(seed: u64, phenotype: Phenotype, stages: &[StageKin
     let mut cur_hr = phenotype.quiet_wake_hr;
 
     for &stage in stages {
-        let dur = match stage {
-            StageKind::QuietWake { duration_sec }
-            | StageKind::ActiveWakeSpike { duration_sec, .. }
-            | StageKind::PostWorkoutCooldown { duration_sec, .. }
-            | StageKind::DrowsyDip { duration_sec, .. }
-            | StageKind::N1Onset { duration_sec }
-            | StageKind::N2Sleep { duration_sec }
-            | StageKind::Arousal { duration_sec }
-            | StageKind::PostSleepWake { duration_sec, .. } => duration_sec,
-        };
+        let dur = stage.duration_sec();
 
         if matches!(stage, StageKind::N1Onset { .. }) && onset_sec.is_none() {
             onset_sec = Some(sec);
@@ -214,16 +229,42 @@ pub fn generate_paired_trace(seed: u64, phenotype: Phenotype, stages: &[StageKin
                     1.90 * phenotype.wake_rmssd_ms,
                     "post_sleep_wake",
                 ),
+                StageKind::RemCyclePlateau { .. } => {
+                    // Mid-sleep REM/light-sleep plateau near baseline HR (z_hr ~ 0) with renewed
+                    // autonomic variability, matching Issue 1 overnight Watch GT5 behavior.
+                    let drift = 1.0 * (sec as f64 * 0.015).sin();
+                    (
+                        phenotype.quiet_wake_hr - phenotype.sleep_drop_bpm * 0.15 + drift,
+                        0.86,
+                        0.95,
+                        phenotype.wake_rmssd_ms * 0.98,
+                        1.70 * phenotype.wake_rmssd_ms,
+                        "rem_cycle_plateau",
+                    )
+                }
+                StageKind::FirmwareSmoothedQuietWake { .. } => {
+                    // Firmware-smoothed BPM-only quiet wake: local_mad_120s ~ 1.15-1.35 bpm
+                    // < SIGMA_MIN_BPM (r_var_120s ~ 0.55-0.70), matching observed Watch GT5 quiet wake.
+                    let drift = 1.0 * (sec as f64 * 0.015).sin();
+                    (
+                        phenotype.quiet_wake_hr + drift,
+                        0.86,
+                        0.78,
+                        phenotype.wake_rmssd_ms,
+                        1.85 * phenotype.wake_rmssd_ms,
+                        "fw_smoothed_quiet_wake",
+                    )
+                }
             };
 
             ar_hr = ar_phi * ar_hr + ar_sigma * sample_normal(&mut rng);
             // Sympathetic 0.05 Hz oscillation in wake, suppressed in sleep
-            let lf_amp = if matches!(stage, StageKind::N2Sleep { .. }) {
-                0.15
-            } else if matches!(stage, StageKind::N1Onset { .. }) {
-                1.2 * (1.0 - 0.7 * frac)
-            } else {
-                1.25
+            let lf_amp = match stage {
+                StageKind::N2Sleep { .. } => 0.15,
+                StageKind::N1Onset { .. } => 1.2 * (1.0 - 0.7 * frac),
+                StageKind::RemCyclePlateau { .. } => 1.0,
+                StageKind::FirmwareSmoothedQuietWake { .. } => 0.85,
+                _ => 1.25,
             };
             let lf_osc = lf_amp * (sec as f64 * 0.28).sin();
             cur_hr = (target_hr + ar_hr + lf_osc).clamp(36.0, 185.0);

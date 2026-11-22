@@ -115,7 +115,7 @@ pub(crate) fn run_replay<WOut: Write, WErr: Write>(
             .unwrap_or_else(|| "open".to_string());
         let _ = writeln!(
             stdout,
-            "  Session #{}: start={} ms, end={} ms ({}), epochs={}, confirmed={:?}, sleeping={:?}, anomalous={}, fps={}",
+            "  Session #{}: start={} ms, end={} ms ({}), epochs={}, confirmed={:?}, sleeping={:?}, sleep_mu={:?}, post_trigger_sleep={}s, anomalous={}, fps={}",
             s.session_index,
             s.start_ts_ms,
             s.end_ts_ms,
@@ -123,6 +123,8 @@ pub(crate) fn run_replay<WOut: Write, WErr: Write>(
             s.epochs_count,
             s.confirmed_ts_ms,
             s.sleeping_ts_ms,
+            s.sleep_mu_hr,
+            s.post_trigger_sleep_sec,
             s.anomalous,
             s.fp_count
         );

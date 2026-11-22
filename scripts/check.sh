@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hermetic test isolation: isolate test processes from host desktop D-Bus
+# Hermetic test isolation: isolate test processes from host desktop D-Bus, Wayland, and X11
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/dev/null}"
 export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/dev/null}"
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY
 
 fix_fmt=0
 lint_only=0
@@ -42,6 +43,11 @@ fi
 
 if grep -En '#!/usr/bin/env[[:space:]]' tests/*.rs; then
   echo "error: #!/usr/bin/env shebang forbidden in fake test scripts (stripped MapEnv PATH omits /usr/bin); use POSIX #!/bin/sh" >&2
+  exit 1
+fi
+
+if grep -REn '^[[:space:]]*(let[[:space:]]+_[[:space:]]*=[[:space:]]*)?(std::)?thread::spawn[[:space:]]*\(' src tests; then
+  echo "error: unjoined thread::spawn with discarded JoinHandle is forbidden; bind the handle and join on explicit shutdown (docs/agents/testing.md)" >&2
   exit 1
 fi
 

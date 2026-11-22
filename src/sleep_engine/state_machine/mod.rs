@@ -92,17 +92,30 @@ impl SleepSampleBuffers {
         }
     }
 
+    fn medians_for(vecs: &SleepSampleVecs) -> (Option<f64>, Option<f64>, Option<f64>) {
+        (
+            crate::sleep_engine::ppg::quantile(&vecs.hr, 0.5),
+            crate::sleep_engine::ppg::quantile(&vecs.ln_rmssd, 0.5),
+            crate::sleep_engine::ppg::quantile(&vecs.var_ratio, 0.5),
+        )
+    }
+
+    pub(super) fn peek_medians(&self) -> (Option<f64>, Option<f64>, Option<f64>) {
+        let src = if self.committed.hr.is_empty() {
+            &self.wake_tail
+        } else {
+            &self.committed
+        };
+        Self::medians_for(src)
+    }
+
     fn finalize_medians(&mut self) -> (Option<f64>, Option<f64>, Option<f64>) {
         if self.committed.hr.is_empty() {
             self.committed.append_from(&mut self.wake_tail);
         } else {
             self.wake_tail.clear();
         }
-        (
-            crate::sleep_engine::ppg::quantile(&self.committed.hr, 0.5),
-            crate::sleep_engine::ppg::quantile(&self.committed.ln_rmssd, 0.5),
-            crate::sleep_engine::ppg::quantile(&self.committed.var_ratio, 0.5),
-        )
+        Self::medians_for(&self.committed)
     }
 
     fn clear(&mut self) {

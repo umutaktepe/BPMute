@@ -8,7 +8,7 @@ use bpmute::paths::{EnvSource, ProcessEnv};
 use bpmute::sleep_engine::ppg::quantile;
 use bpmute::sleep_engine::{
     CalibrationMaturity, CalibrationPriors, DetectorState, EngineConfig, EngineEvent, EngineOutput,
-    Epoch, GraceOutcome, GraceResult, SleepEngine, WearableFloor,
+    Epoch, GraceOutcome, GraceResult, SessionEndReason, SleepEngine, WearableFloor,
 };
 use common::synthetic::{
     Phenotype, StageKind, generate_paired_trace, inject_flatline, inject_gt5_optical_lock_ramp,
@@ -35,6 +35,7 @@ enum SleepArchetype {
     SlowDescent,
     EveningActiveSpikeThenSleep,
     PostWorkoutCooldownThenSleep,
+    SleepWithRemCycle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +44,7 @@ enum WakeArchetype {
     PostWorkoutRecovery,
     BriefDrowsyDips,
     ActiveDeskSpikes,
+    FirmwareSmoothedMotionless,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +62,7 @@ struct ModeMetricsReport {
     sleep_true_positives: usize,
     sleep_missed: usize,
     sleep_recall: f64,
+    mid_sleep_splits: usize,
     median_latency_min: f64,
     p95_latency_min: f64,
     max_latency_min: f64,
@@ -101,6 +104,7 @@ struct ModeStatsAccum {
     pre_onset_false_positives: usize,
     sleep_total: usize,
     sleep_true_positives: usize,
+    mid_sleep_splits: usize,
     latencies_min: Vec<f64>,
 }
 
@@ -113,6 +117,7 @@ impl ModeStatsAccum {
             pre_onset_false_positives: 0,
             sleep_total: 0,
             sleep_true_positives: 0,
+            mid_sleep_splits: 0,
             latencies_min: Vec::new(),
         }
     }
@@ -143,6 +148,7 @@ impl ModeStatsAccum {
         let gates_passed = wake_specificity >= MIN_WAKE_SPECIFICITY
             && false_positive_rate <= (1.0 - MIN_WAKE_SPECIFICITY)
             && sleep_recall >= MIN_SLEEP_RECALL
+            && self.mid_sleep_splits == 0
             && !self.latencies_min.is_empty()
             && median_latency_min <= max_median_min
             && p95_latency_min <= MAX_P95_LATENCY_MIN;
@@ -161,6 +167,7 @@ impl ModeStatsAccum {
             sleep_true_positives: self.sleep_true_positives,
             sleep_missed: self.sleep_total.saturating_sub(self.sleep_true_positives),
             sleep_recall,
+            mid_sleep_splits: self.mid_sleep_splits,
             median_latency_min,
             p95_latency_min,
             max_latency_min,
@@ -310,6 +317,7 @@ fn apply_stochastic_noise(
 struct EngineTrace {
     confirmed_ts: Vec<i64>,
     epochs: Vec<Epoch>,
+    sustained_wake_splits: usize,
 }
 
 fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> EngineTrace {
@@ -323,6 +331,7 @@ fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> EngineTrace 
     });
     let mut confirmed_ts = Vec::new();
     let mut epochs = Vec::new();
+    let mut sustained_wake_splits = 0_usize;
     for ev in events {
         let outputs = engine.handle_event(ev.clone());
         let mut expire_at = None;
@@ -337,6 +346,11 @@ fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> EngineTrace 
                     confirmed_ts.push(ts_ms);
                     expire_at = Some(ts_ms);
                 }
+                EngineOutput::SessionEnded(summary)
+                    if summary.end_reason == SessionEndReason::SustainedWakefulness =>
+                {
+                    sustained_wake_splits += 1;
+                }
                 _ => {}
             }
         }
@@ -350,6 +364,7 @@ fn run_engine(events: &[EngineEvent], priors: CalibrationPriors) -> EngineTrace 
     EngineTrace {
         confirmed_ts,
         epochs,
+        sustained_wake_splits,
     }
 }
 
@@ -452,8 +467,25 @@ fn build_sleep_stages(rng: &mut ChaCha8Rng, arch: SleepArchetype) -> (Vec<StageK
                 duration_sec: rng.gen_range(1500..=1800),
             },
         ],
+        SleepArchetype::SleepWithRemCycle => vec![
+            StageKind::QuietWake {
+                duration_sec: rng.gen_range(900..=1200),
+            },
+            StageKind::N1Onset {
+                duration_sec: rng.gen_range(300..=480),
+            },
+            StageKind::N2Sleep {
+                duration_sec: rng.gen_range(1200..=1500),
+            },
+            StageKind::RemCyclePlateau {
+                duration_sec: rng.gen_range(900..=1500),
+            },
+            StageKind::N2Sleep {
+                duration_sec: rng.gen_range(900..=1200),
+            },
+        ],
     };
-    let total_sec = stages.iter().map(stage_duration_sec).sum();
+    let total_sec = stages.iter().map(StageKind::duration_sec).sum();
     (stages, total_sec)
 }
 
@@ -497,22 +529,12 @@ fn build_wake_stages(rng: &mut ChaCha8Rng, arch: WakeArchetype) -> (Vec<StageKin
             },
             StageKind::QuietWake { duration_sec: 1800 },
         ],
+        WakeArchetype::FirmwareSmoothedMotionless => vec![StageKind::FirmwareSmoothedQuietWake {
+            duration_sec: rng.gen_range(4500..=7200),
+        }],
     };
-    let total_sec = stages.iter().map(stage_duration_sec).sum();
+    let total_sec = stages.iter().map(StageKind::duration_sec).sum();
     (stages, total_sec)
-}
-
-fn stage_duration_sec(stage: &StageKind) -> i64 {
-    match *stage {
-        StageKind::QuietWake { duration_sec }
-        | StageKind::ActiveWakeSpike { duration_sec, .. }
-        | StageKind::PostWorkoutCooldown { duration_sec, .. }
-        | StageKind::DrowsyDip { duration_sec, .. }
-        | StageKind::N1Onset { duration_sec }
-        | StageKind::N2Sleep { duration_sec }
-        | StageKind::Arousal { duration_sec }
-        | StageKind::PostSleepWake { duration_sec, .. } => duration_sec,
-    }
 }
 
 fn render_markdown_report(report: &MonteCarloReport) -> String {
@@ -534,14 +556,14 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
             "FAIL"
         },
     ));
-    md.push_str("| Mode | Wake Specificity (Gate >= 98.0%) | FP Rate (Gate <= 2.0%) | Sleep Recall (Gate >= 95.0%) | Median Latency (Gate <= 8 / 10 min) | P95 Latency (Gate <= 18.0 min) | Max Latency | Gate |\n");
-    md.push_str("|---|---:|---:|---:|---:|---:|---:|:---:|\n");
+    md.push_str("| Mode | Wake Specificity (Gate >= 98.0%) | FP Rate (Gate <= 2.0%) | Sleep Recall (Gate >= 95.0%) | Mid-Sleep Splits (Gate == 0) | Median Latency (Gate <= 8 / 10 min) | P95 Latency (Gate <= 18.0 min) | Max Latency | Gate |\n");
+    md.push_str("|---|---:|---:|---:|---:|---:|---:|---:|:---:|\n");
     for (m, med_limit) in [
         (&report.bpm_rr, MAX_MEDIAN_LATENCY_BPM_RR_MIN),
         (&report.bpm_only, MAX_MEDIAN_LATENCY_BPM_ONLY_MIN),
     ] {
         md.push_str(&format!(
-            "| `{}` | {:.2}% ({} wake FP / {}) | {:.2}% ({} / {}) | {:.2}% ({}/{}) | {:.2} min (<= {:.1}) | {:.2} min (<= {:.1}) | {:.2} min | {} |\n",
+            "| `{}` | {:.2}% ({} wake FP / {}) | {:.2}% ({} / {}) | {:.2}% ({}/{}) | {} | {:.2} min (<= {:.1}) | {:.2} min (<= {:.1}) | {:.2} min | {} |\n",
             m.mode,
             m.wake_specificity * 100.0,
             m.wake_false_positives,
@@ -552,6 +574,7 @@ fn render_markdown_report(report: &MonteCarloReport) -> String {
             m.sleep_recall * 100.0,
             m.sleep_true_positives,
             m.sleep_sessions,
+            m.mid_sleep_splits,
             m.median_latency_min,
             med_limit,
             m.p95_latency_min,
@@ -615,12 +638,17 @@ fn tier2_seeded_monte_carlo_sweep() {
             SleepArchetype::PostWorkoutCooldownThenSleep,
             "PostWorkoutCooldownThenSleep",
         ),
+        (SleepArchetype::SleepWithRemCycle, "SleepWithRemCycle"),
     ];
     let wake_arches = [
         (WakeArchetype::MotionlessMovie, "MotionlessMovie"),
         (WakeArchetype::PostWorkoutRecovery, "PostWorkoutRecovery"),
         (WakeArchetype::BriefDrowsyDips, "BriefDrowsyDips"),
         (WakeArchetype::ActiveDeskSpikes, "ActiveDeskSpikes"),
+        (
+            WakeArchetype::FirmwareSmoothedMotionless,
+            "FirmwareSmoothedMotionless",
+        ),
     ];
 
     // 100 randomized sleep-onset Monitoring Sessions
@@ -658,6 +686,31 @@ fn tier2_seeded_monte_carlo_sweep() {
             }
             stats.sleep_total += 1;
             let trace = run_engine(events, priors.clone());
+            if trace.sustained_wake_splits > 0 {
+                stats.mid_sleep_splits += trace.sustained_wake_splits;
+                let window = format_epoch_window(&trace.epochs, onset_ms + 900_000);
+                if trace_failures {
+                    eprintln!(
+                        "[TRACE] Session #{idx} sleep {mode_name} {arch_name} split ({} SustainedWakefulness):\n  {}",
+                        trace.sustained_wake_splits,
+                        window.join("\n  ")
+                    );
+                }
+                failures.push(SessionFailureRecord {
+                    session_index: idx,
+                    kind: "sleep".to_string(),
+                    mode: mode_name.to_string(),
+                    archetype: arch_name.to_string(),
+                    maturity: maturity_label.to_string(),
+                    rhr_bpm: pheno.quiet_wake_hr,
+                    drop_bpm: pheno.sleep_drop_bpm,
+                    outcome: format!(
+                        "mid-sleep SustainedWakefulness split count={}",
+                        trace.sustained_wake_splits
+                    ),
+                    trace_window: window,
+                });
+            }
             let confirmed = &trace.confirmed_ts;
             let pre_onset = confirmed.iter().find(|&&t| t < onset_ms).copied();
             if let Some(fp_ts) = pre_onset {

@@ -377,19 +377,16 @@ impl SleepEngine {
         });
     }
 
-    pub(super) fn close_session(
-        &mut self,
+    fn build_summary(
+        &self,
+        session_index: u64,
         end_ts_ms: i64,
         end_reason: SessionEndReason,
-        outputs: &mut Vec<EngineOutput>,
-    ) {
-        let Some(session_index) = self.session_index else {
-            return;
-        };
-        let (sleep_mu_hr, sleep_ln_rmssd, observed_hr_var_ratio) =
-            self.sleep_samples.finalize_medians();
+        medians: (Option<f64>, Option<f64>, Option<f64>),
+    ) -> SessionSummary {
+        let (sleep_mu_hr, sleep_ln_rmssd, observed_hr_var_ratio) = medians;
         let typical_sqi = (self.sqi_count > 0).then(|| self.sqi_sum / self.sqi_count as f64);
-        let summary = SessionSummary {
+        SessionSummary {
             session_index,
             start_ts_ms: self.session_start_ts_ms.unwrap_or(end_ts_ms),
             end_ts_ms,
@@ -415,7 +412,35 @@ impl SleepEngine {
             rapid_wake_fp_count: self.rapid_wake_fp_count,
             snooze_count: self.snooze_count,
             epochs_count: self.epochs_count,
+        }
+    }
+
+    /// Snapshots summary metrics for the currently active `Monitoring Session` without mutating state.
+    pub(crate) fn snapshot_active_summary(
+        &self,
+        end_ts_ms: i64,
+        end_reason: SessionEndReason,
+    ) -> Option<SessionSummary> {
+        let session_index = self.session_index?;
+        Some(self.build_summary(
+            session_index,
+            end_ts_ms,
+            end_reason,
+            self.sleep_samples.peek_medians(),
+        ))
+    }
+
+    pub(super) fn close_session(
+        &mut self,
+        end_ts_ms: i64,
+        end_reason: SessionEndReason,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        let Some(session_index) = self.session_index else {
+            return;
         };
+        let medians = self.sleep_samples.finalize_medians();
+        let summary = self.build_summary(session_index, end_ts_ms, end_reason, medians);
         let prev = self.state;
         self.state = DetectorState::Idle;
         if prev != DetectorState::Idle {

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Hermetic test isolation: isolate test processes from host desktop D-Bus
+# Hermetic test isolation: isolate test processes from host desktop D-Bus, Wayland, and X11
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/dev/null}"
 export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/dev/null}"
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY
 
 build_args=()
 for arg in "$@"; do

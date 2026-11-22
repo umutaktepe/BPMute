@@ -9,7 +9,8 @@ use crate::config::{DetectionConfig, Sensitivity};
 use crate::replay::trace::{ReplayError, TraceFormat, detect_trace_format, parse_trace_str};
 use crate::sleep_engine::{
     CalibrationPriors, DetectorState, EngineConfig, EngineEvent, EngineOutput, Epoch, GraceOutcome,
-    GraceResult, SessionEndReason, SleepEngine, StreamState, StreamStatus, WearableFloor,
+    GraceResult, SessionEndReason, SessionSummary, SleepEngine, StreamState, StreamStatus,
+    WearableFloor,
 };
 use crate::storage::LedgerStore;
 
@@ -65,7 +66,49 @@ pub struct ReplaySessionSummary {
     pub anomalous: bool,
     pub fp_count: u8,
     pub warmup_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub warmup_sigma_hr: Option<f64>,
+    #[serde(default)]
+    pub onset_hr_bpm: Option<f64>,
+    #[serde(default)]
+    pub sleep_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub observed_hr_var_ratio: Option<f64>,
+    #[serde(default)]
+    pub post_trigger_sleep_sec: u32,
+    #[serde(default)]
+    pub grace_cancel_count: u8,
+    #[serde(default)]
+    pub rapid_wake_fp_count: u8,
+    #[serde(default)]
+    pub snooze_count: u8,
     pub epochs_count: usize,
+}
+
+impl ReplaySessionSummary {
+    fn from_engine_summary(s: SessionSummary, end_reason: Option<SessionEndReason>) -> Self {
+        Self {
+            session_index: s.session_index,
+            start_ts_ms: s.start_ts_ms,
+            end_ts_ms: s.end_ts_ms,
+            end_reason,
+            candidate_ts_ms: s.candidate_ts_ms,
+            confirmed_ts_ms: s.confirmed_ts_ms,
+            sleeping_ts_ms: s.sleeping_ts_ms,
+            anomalous: s.anomalous,
+            fp_count: s.fp_count,
+            warmup_mu_hr: s.warmup_mu_hr,
+            warmup_sigma_hr: s.warmup_sigma_hr,
+            onset_hr_bpm: s.onset_hr_bpm,
+            sleep_mu_hr: s.sleep_mu_hr,
+            observed_hr_var_ratio: s.observed_hr_var_ratio,
+            post_trigger_sleep_sec: s.post_trigger_sleep_sec,
+            grace_cancel_count: s.grace_cancel_count,
+            rapid_wake_fp_count: s.rapid_wake_fp_count,
+            snooze_count: s.snooze_count,
+            epochs_count: s.epochs_count,
+        }
+    }
 }
 
 /// Structured output report emitted by `bpmute replay`.
@@ -207,19 +250,11 @@ impl ReplayAccumulator {
                 EngineOutput::SessionEnded(summary) => {
                     self.pending_confirmed_since_ms = None;
                     self.active_session = None;
-                    self.sessions.push(ReplaySessionSummary {
-                        session_index: summary.session_index,
-                        start_ts_ms: summary.start_ts_ms,
-                        end_ts_ms: summary.end_ts_ms,
-                        end_reason: Some(summary.end_reason),
-                        candidate_ts_ms: summary.candidate_ts_ms,
-                        confirmed_ts_ms: summary.confirmed_ts_ms,
-                        sleeping_ts_ms: summary.sleeping_ts_ms,
-                        anomalous: summary.anomalous,
-                        fp_count: summary.fp_count,
-                        warmup_mu_hr: summary.warmup_mu_hr,
-                        epochs_count: summary.epochs_count,
-                    });
+                    let end_reason = Some(summary.end_reason);
+                    self.sessions
+                        .push(ReplaySessionSummary::from_engine_summary(
+                            summary, end_reason,
+                        ));
                 }
                 EngineOutput::GraceAbortRequested { .. } | EngineOutput::GapResolved { .. } => {}
             }
@@ -296,6 +331,7 @@ pub fn replay_events(
             samples_processed,
             events_processed: events.len(),
         },
+        &engine,
         acc,
     )
 }
@@ -333,6 +369,7 @@ pub fn replay_session_epochs(
             samples_processed: 0,
             events_processed: epochs.len(),
         },
+        &engine,
         acc,
     )
 }
@@ -458,21 +495,40 @@ struct ReplayReportMeta<'a> {
     events_processed: usize,
 }
 
-fn finalize_replay_report(meta: ReplayReportMeta<'_>, mut acc: ReplayAccumulator) -> ReplayReport {
+fn finalize_replay_report(
+    meta: ReplayReportMeta<'_>,
+    engine: &SleepEngine,
+    mut acc: ReplayAccumulator,
+) -> ReplayReport {
     if let Some(act) = acc.active_session.take() {
-        acc.sessions.push(ReplaySessionSummary {
-            session_index: act.session_index,
-            start_ts_ms: act.start_ts_ms,
-            end_ts_ms: act.last_ts_ms,
-            end_reason: None,
-            candidate_ts_ms: act.candidate_ts_ms,
-            confirmed_ts_ms: act.confirmed_ts_ms,
-            sleeping_ts_ms: act.sleeping_ts_ms,
-            anomalous: act.anomalous,
-            fp_count: act.fp_count,
-            warmup_mu_hr: act.warmup_mu_hr,
-            epochs_count: act.epochs_count,
-        });
+        let summary = if let Some(snapshot) =
+            engine.snapshot_active_summary(act.last_ts_ms, SessionEndReason::StreamEnded)
+        {
+            ReplaySessionSummary::from_engine_summary(snapshot, None)
+        } else {
+            ReplaySessionSummary {
+                session_index: act.session_index,
+                start_ts_ms: act.start_ts_ms,
+                end_ts_ms: act.last_ts_ms,
+                end_reason: None,
+                candidate_ts_ms: act.candidate_ts_ms,
+                confirmed_ts_ms: act.confirmed_ts_ms,
+                sleeping_ts_ms: act.sleeping_ts_ms,
+                anomalous: act.anomalous,
+                fp_count: act.fp_count,
+                warmup_mu_hr: act.warmup_mu_hr,
+                warmup_sigma_hr: None,
+                onset_hr_bpm: None,
+                sleep_mu_hr: None,
+                observed_hr_var_ratio: None,
+                post_trigger_sleep_sec: 0,
+                grace_cancel_count: 0,
+                rapid_wake_fp_count: 0,
+                snooze_count: 0,
+                epochs_count: act.epochs_count,
+            }
+        };
+        acc.sessions.push(summary);
     }
 
     ReplayReport {

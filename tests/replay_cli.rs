@@ -366,3 +366,92 @@ fn real_binary_replay_error_exit_codes() {
         assert_eq!(out.status.code(), Some(5));
     }
 }
+
+#[tokio::test]
+async fn replay_reports_sleep_diagnostics_for_open_and_closed_sessions() {
+    let temp = TempDir::new().unwrap();
+    let env = temp_env(&temp);
+
+    let trace = generate_paired_trace(
+        901,
+        Phenotype::typical(),
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep { duration_sec: 900 },
+        ],
+    );
+
+    let open_csv = temp.path().join("open_sleep.csv");
+    fs::write(&open_csv, events_to_csv(&trace.bpm_rr)).unwrap();
+
+    // Open-at-EOF sleep trace populates active session snapshot diagnostics.
+    let (code_open, out_open, err_open) = run_inproc_cli(
+        &[
+            "bpmute",
+            "replay",
+            open_csv.to_str().unwrap(),
+            "--cold-start",
+            "--json",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code_open, ExitCode::Success, "stderr: {err_open}");
+    let open_json: Value = serde_json::from_str(&out_open).unwrap();
+    let open_s = &open_json["sessions"][0];
+    assert!(open_s["end_reason"].is_null());
+    assert!(open_s["sleeping_ts_ms"].as_i64().is_some());
+    assert!(open_s["sleep_mu_hr"].as_f64().is_some());
+    assert!(open_s["warmup_sigma_hr"].as_f64().is_some());
+    assert!(open_s["onset_hr_bpm"].as_f64().is_some());
+    assert!(open_s["observed_hr_var_ratio"].as_f64().is_some());
+    assert!(
+        open_s["post_trigger_sleep_sec"].as_u64().unwrap() > 0,
+        "expected post_trigger_sleep_sec > 0 for open sleep session: {open_s}"
+    );
+
+    // Human-readable output includes sleep_mu and post_trigger_sleep fields.
+    let (code_txt, out_txt, err_txt) =
+        run_inproc_cli(&["bpmute", "replay", open_csv.to_str().unwrap()], &env).await;
+    assert_eq!(code_txt, ExitCode::Success, "stderr: {err_txt}");
+    assert!(out_txt.contains("sleep_mu=Some("));
+    assert!(out_txt.contains("post_trigger_sleep="));
+
+    // Closed session via sustained post-sleep wake also retains diagnostics.
+    let closed_trace = generate_paired_trace(
+        901,
+        Phenotype::typical(),
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep { duration_sec: 900 },
+            StageKind::PostSleepWake {
+                duration_sec: 900,
+                elevation_bpm: 18.0,
+            },
+        ],
+    );
+    let closed_csv = temp.path().join("closed_sleep.csv");
+    fs::write(&closed_csv, events_to_csv(&closed_trace.bpm_rr)).unwrap();
+
+    let (code_closed, out_closed, err_closed) = run_inproc_cli(
+        &[
+            "bpmute",
+            "replay",
+            closed_csv.to_str().unwrap(),
+            "--cold-start",
+            "--json",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code_closed, ExitCode::Success, "stderr: {err_closed}");
+    let closed_json: Value = serde_json::from_str(&out_closed).unwrap();
+    let closed_s = &closed_json["sessions"][0];
+    assert_eq!(closed_s["end_reason"], "sustained_wakefulness");
+    assert!(closed_s["sleep_mu_hr"].as_f64().is_some());
+    assert!(closed_s["warmup_sigma_hr"].as_f64().is_some());
+    assert!(closed_s["onset_hr_bpm"].as_f64().is_some());
+    assert!(closed_s["post_trigger_sleep_sec"].as_u64().unwrap() > 0);
+}
