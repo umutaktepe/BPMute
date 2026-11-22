@@ -17,6 +17,7 @@ pub(crate) enum ClickTarget {
     SelectTab(Tab),
     CancelGrace,
     SnoozeGrace,
+    EndSession,
     ToggleDiagnostics,
     OpenPausePopover,
     AcceptShift,

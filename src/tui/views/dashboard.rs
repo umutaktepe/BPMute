@@ -191,15 +191,25 @@ fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let p_sleep = app.latest_p_sleep.unwrap_or(0.0).clamp(0.0, 1.0);
     let p_pct = (p_sleep * 100.0).round() as u16;
 
+    let line1 = if let Some(rem_sec) = app.session_close_remaining_sec() {
+        let formatted = crate::tui::format_close_countdown(rem_sec);
+        Line::from(vec![Span::styled(
+            format!(" Closing in {formatted}"),
+            app.theme.warning(),
+        )])
+    } else {
+        Line::from(vec![Span::styled(
+            format!(" P(SleepNREM): {:>3}%", p_pct),
+            app.theme.base(),
+        )])
+    };
+
     let lines = vec![
         Line::from(vec![
             Span::styled(" State: ", app.theme.muted()),
             Span::styled(state_str, app.theme.primary()),
         ]),
-        Line::from(vec![Span::styled(
-            format!(" P(SleepNREM): {:>3}%", p_pct),
-            app.theme.base(),
-        )]),
+        line1,
     ];
 
     let chunks = Layout::default()

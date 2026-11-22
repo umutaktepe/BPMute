@@ -196,6 +196,9 @@ pub(crate) fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map:
                 Tab::Dashboard => {
                     writer.push_action("[d]", " Diagnostics", true, ClickTarget::ToggleDiagnostics);
                     writer.push_action("[p]", " Pause", connected, ClickTarget::OpenPausePopover);
+                    if connected && app.session_close_deadline_ms.is_some() {
+                        writer.push_action("[E]", " End Session", true, ClickTarget::EndSession);
+                    }
                     if connected && app.grace_state.is_some() {
                         writer.push_action("[c]", " Cancel", true, ClickTarget::CancelGrace);
                         writer.push_action("[s]", " Snooze", true, ClickTarget::SnoozeGrace);
@@ -222,6 +225,9 @@ pub(crate) fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map:
                     writer.push_action("[f]", " Feedback", can_act, ClickTarget::HistoryFeedback);
                     writer.push_action("[x]", " Export", can_act, ClickTarget::HistoryExport);
                     writer.push_action("[D]", " Delete", can_act, ClickTarget::HistoryDelete);
+                    if connected && app.session_close_deadline_ms.is_some() {
+                        writer.push_action("[E]", " End Session", true, ClickTarget::EndSession);
+                    }
                     writer.push_hint("[j/k]", " Navigate");
                 }
                 Tab::Settings => {

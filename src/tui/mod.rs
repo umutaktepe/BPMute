@@ -24,6 +24,7 @@ pub mod views;
 
 pub use app::{
     GraceState, ModalState, OpFeedback, PairingPromptModalState, Tab, TuiApp, UnenrollButton,
+    format_close_countdown,
 };
 pub use client::TuiIpcBridge;
 pub use event::{IpcEvent, TUI_TICK_MS, TuiCommand, TuiEvent};

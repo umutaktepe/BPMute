@@ -23,12 +23,16 @@ impl TuiApp {
         if let Some(ref mut cfg) = self.active_config {
             cfg.schedule = status.schedule.clone();
         }
+        self.session_close_deadline_ms = status.session_close_deadline_ms;
         self.daemon_status = Some(status);
     }
 
     fn handle_disconnected(&mut self) {
         self.daemon_connected = false;
         self.daemon_status = None;
+        self.session_close_deadline_ms = None;
+        self.daemon_clock_offset_ms = None;
+        self.daemon_now_ms = None;
         self.monitoring_state = MonitoringState::Idle;
         self.grace_state = None;
         self.latest_bpm = None;
@@ -61,6 +65,14 @@ impl TuiApp {
                     server_now_ms,
                 } = *snapshot;
                 self.apply_daemon_status(status);
+                if let Some(s_now) = server_now_ms {
+                    self.daemon_clock_offset_ms =
+                        Some(s_now - chrono::Utc::now().timestamp_millis());
+                    self.daemon_now_ms = Some(s_now);
+                } else {
+                    self.daemon_clock_offset_ms = None;
+                    self.daemon_now_ms = Some(chrono::Utc::now().timestamp_millis());
+                }
                 self.alerts = alerts;
                 self.sparkline_data
                     .set_samples(hr_ring_buffer, server_now_ms);
@@ -223,6 +235,7 @@ impl TuiApp {
                 {
                     self.selected_session_detail = Some(*closed_detail);
                 }
+                self.session_close_deadline_ms = None;
                 if self.daemon_connected {
                     return Some(TuiCommand::RefreshSessions);
                 }
@@ -456,6 +469,11 @@ impl TuiApp {
                     self.op_feedback = Some(OpFeedback {
                         is_error: false,
                         message: "Trace exported".to_string(),
+                    });
+                } else if op == "session.end" && success {
+                    self.op_feedback = Some(OpFeedback {
+                        is_error: false,
+                        message: "Monitoring session ended".to_string(),
                     });
                 } else {
                     self.op_feedback = None;

@@ -3748,3 +3748,612 @@ fn test_dashboard_snapshot_server_now_ms_edge_cases() {
     assert_eq!(app_dc_race.latest_bpm, None);
     assert!(!app_dc_race.contact_ok);
 }
+
+#[test]
+fn test_tuiapp_tracks_session_close_deadline_and_counts_down_on_ticks() {
+    let mut status = make_daemon_status(ScheduleConfig::default());
+    let deadline_ms = 1_700_000_120_001i64; // 2 minutes window + 1ms
+    status.session_close_deadline_ms = Some(deadline_ms);
+
+    let mut app = TuiApp::new(false, false, false);
+    assert_eq!(app.session_close_deadline_ms, None);
+    assert_eq!(app.session_close_remaining_sec(), None);
+
+    // 1. Initial Snapshot hydrates session_close_deadline_ms, daemon_clock_offset_ms, and daemon_now_ms
+    let server_now = 1_700_000_000_000i64;
+    app.handle_ipc(IpcEvent::Snapshot(Box::new(bpmute::ipc::SnapshotEvent {
+        status: status.clone(),
+        hr_ring_buffer: vec![],
+        alerts: vec![],
+        server_now_ms: Some(server_now),
+    })));
+
+    assert_eq!(app.session_close_deadline_ms, Some(deadline_ms));
+    assert!(app.daemon_clock_offset_ms.is_some());
+    assert_eq!(app.daemon_now_ms, Some(server_now));
+    // Remaining sec at server_now: 120_001.saturating_sub(1).div_ceil(1000) = 120 sec (2m 0s)
+    assert_eq!(app.session_close_remaining_sec(), Some(120));
+    assert_eq!(
+        bpmute::tui::format_close_countdown(app.session_close_remaining_sec().unwrap()),
+        "2m 0s"
+    );
+
+    // 2. UI ticks advance daemon_now_ms smoothly without extra IPC
+    // 4 ticks = 1 second
+    for _ in 0..4 {
+        app.handle_event(TuiEvent::Tick);
+    }
+    assert_eq!(app.daemon_now_ms, Some(server_now + 1_000));
+    // Remaining sec is now 119 sec (1m 59s)
+    assert_eq!(app.session_close_remaining_sec(), Some(119));
+    assert_eq!(
+        bpmute::tui::format_close_countdown(app.session_close_remaining_sec().unwrap()),
+        "1m 59s"
+    );
+
+    // 3. Live StateChanged tightens deadline or clears it
+    let tightened_deadline = 1_700_000_030_001i64;
+    status.session_close_deadline_ms = Some(tightened_deadline);
+    app.handle_ipc(IpcEvent::StateChanged(status.clone()));
+    assert_eq!(app.session_close_deadline_ms, Some(tightened_deadline));
+    // At server_now + 1000: remaining is (30_001 - 1000) = 29_001 -> 29 sec
+    assert_eq!(app.session_close_remaining_sec(), Some(29));
+    assert_eq!(
+        bpmute::tui::format_close_countdown(app.session_close_remaining_sec().unwrap()),
+        "29s"
+    );
+
+    // 4. StateChanged clearing deadline (e.g. streaming resumed) reverts it to None
+    status.session_close_deadline_ms = None;
+    app.handle_ipc(IpcEvent::StateChanged(status.clone()));
+    assert_eq!(app.session_close_deadline_ms, None);
+    assert_eq!(app.session_close_remaining_sec(), None);
+
+    // 5. Disconnection clears deadline and clock offset
+    app.session_close_deadline_ms = Some(deadline_ms);
+    app.handle_ipc(IpcEvent::Disconnected);
+    assert_eq!(app.session_close_deadline_ms, None);
+    assert_eq!(app.daemon_clock_offset_ms, None);
+    assert_eq!(app.daemon_now_ms, None);
+}
+
+#[test]
+fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
+    use bpmute::storage::SessionListEntry;
+
+    let deadline_ms = 1_700_000_120_001i64;
+    let server_now = 1_700_000_000_000i64;
+
+    let mut status = make_daemon_status(ScheduleConfig::default());
+    status.monitoring_state = MonitoringState::Candidate;
+    status.session_close_deadline_ms = Some(deadline_ms);
+
+    let mut app = TuiApp::new(false, false, false);
+    app.handle_ipc(IpcEvent::Snapshot(Box::new(bpmute::ipc::SnapshotEvent {
+        status: status.clone(),
+        hr_ring_buffer: vec![],
+        alerts: vec![],
+        server_now_ms: Some(server_now),
+    })));
+
+    let active_session = SessionListEntry {
+        id: "sess-closing".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Watch".into()),
+        wearable_mac_masked: "..:EC:05".into(),
+        status: SessionStatus::Active,
+        start_ts_ms: server_now - 600_000,
+        end_ts_ms: server_now,
+        end_reason: None,
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(65.0),
+        sleep_mu_hr: None,
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 40,
+        raw_samples_count: 600,
+        feedback: None,
+    };
+    app.history_sessions = vec![active_session];
+    app.selected_session_idx = 0;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // 1. Dashboard rendering: Sleep State card and Footer
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+
+    // Verify row 0 preserves "State: Candidate"
+    assert!(find_text_coords(&buf, "State: Candidate").is_some());
+    // Verify row 1 renders "Closing in 2m 0s"
+    assert!(find_text_coords(&buf, "Closing in 2m 0s").is_some());
+    // Verify footer contains "[E] End Session"
+    assert!(find_text_coords(&buf, "[E] End Session").is_some());
+
+    // Verify clicking footer "[E] End Session" triggers SessionEnd command
+    let (end_col, end_row) = find_text_coords(&buf, "[E] End Session").unwrap();
+    let cmd = app.handle_event(mouse_left_click(end_col + 1, end_row));
+    assert_eq!(cmd, Some(TuiCommand::SessionEnd));
+    assert_eq!(app.monitoring_state, MonitoringState::Idle);
+    assert_eq!(app.history_sessions[0].status, SessionStatus::Closed);
+    assert_eq!(
+        app.history_sessions[0].end_reason,
+        Some(SessionEndReason::ManualClose)
+    );
+    assert!(app.op_feedback.is_some());
+
+    // 2. History rendering: [CLOSING] badge, detail countdown, and Footer
+    // Re-arm closing state for History test
+    status.monitoring_state = MonitoringState::Candidate;
+    status.session_close_deadline_ms = Some(deadline_ms);
+    app.handle_ipc(IpcEvent::StateChanged(status.clone()));
+    app.history_sessions[0].status = SessionStatus::Active;
+    app.history_sessions[0].end_reason = None;
+
+    app.active_tab = Tab::History;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_hist = terminal.backend().buffer().clone();
+
+    // Verify session list row renders "[CLOSING]"
+    assert!(find_text_coords(&buf_hist, "[CLOSING]").is_some());
+    // Verify detail pane header shows "Outcome: Closing in 2m 0s"
+    assert!(find_text_coords(&buf_hist, "Outcome: Closing in 2m 0s").is_some());
+    // Verify History footer also contains "[E] End Session"
+    assert!(find_text_coords(&buf_hist, "[E] End Session").is_some());
+    let (h_col, h_row) = find_text_coords(&buf_hist, "[E] End Session").unwrap();
+    let cmd_hist = app.handle_event(mouse_left_click(h_col + 1, h_row));
+    assert_eq!(cmd_hist, Some(TuiCommand::SessionEnd));
+
+    // 3. Clear deadline (streaming resumes / session closes) -> lines revert cleanly and [E] End Session disappears
+    status.session_close_deadline_ms = None;
+    app.handle_ipc(IpcEvent::StateChanged(status.clone()));
+
+    app.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_resumed = terminal.backend().buffer().clone();
+    assert!(find_text_coords(&buf_resumed, "Closing in").is_none());
+    assert!(find_text_coords(&buf_resumed, "P(SleepNREM):").is_some());
+    assert!(find_text_coords(&buf_resumed, "[E] End Session").is_none());
+
+    app.active_tab = Tab::History;
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_hist_resumed = terminal.backend().buffer().clone();
+    assert!(find_text_coords(&buf_hist_resumed, "[CLOSING]").is_none());
+    assert!(find_text_coords(&buf_hist_resumed, "Closing in").is_none());
+    assert!(find_text_coords(&buf_hist_resumed, "[E] End Session").is_none());
+
+    // 4. Pressing 'E' or 'e' is a no-op when Idle or deadline is None
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        None
+    );
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('e')))),
+        None
+    );
+    app.active_tab = Tab::Dashboard;
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        None
+    );
+
+    // 5. Pressing 'E' when closing triggers SessionEnd
+    status.monitoring_state = MonitoringState::Candidate;
+    status.session_close_deadline_ms = Some(deadline_ms);
+    app.handle_ipc(IpcEvent::StateChanged(status.clone()));
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        Some(TuiCommand::SessionEnd)
+    );
+    assert_eq!(app.monitoring_state, MonitoringState::Idle);
+
+    // 6. Verification with --ascii and NO_COLOR themes at 80x24
+    let mut app_ascii = TuiApp::new_with_theme(false, Theme::new(true, true), false);
+    app_ascii.handle_ipc(IpcEvent::Snapshot(Box::new(bpmute::ipc::SnapshotEvent {
+        status,
+        hr_ring_buffer: vec![],
+        alerts: vec![],
+        server_now_ms: Some(server_now),
+    })));
+    app_ascii.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app_ascii.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_ascii = terminal.backend().buffer().clone();
+    assert!(find_text_coords(&buf_ascii, "State: Candidate").is_some());
+    assert!(find_text_coords(&buf_ascii, "Closing in 2m 0s").is_some());
+    assert!(find_text_coords(&buf_ascii, "[E] End Session").is_some());
+
+    app_ascii.active_tab = Tab::History;
+    app_ascii.history_sessions = vec![SessionListEntry {
+        id: "sess-closing-ascii".into(),
+        wearable_id: "w-1".into(),
+        wearable_alias: Some("Watch".into()),
+        wearable_mac_masked: "..:EC:05".into(),
+        status: SessionStatus::Active,
+        start_ts_ms: server_now - 600_000,
+        end_ts_ms: server_now,
+        end_reason: None,
+        detection_sensitivity: Sensitivity::Balanced,
+        had_rr: true,
+        warmup_mu_hr: Some(65.0),
+        sleep_mu_hr: None,
+        onset_confirmed_ts_ms: None,
+        sleeping_ts_ms: None,
+        auto_anomalous: false,
+        fp_count: 0,
+        epochs_count: 40,
+        raw_samples_count: 600,
+        feedback: None,
+    }];
+    terminal
+        .draw(|f| app_ascii.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_ascii_hist = terminal.backend().buffer().clone();
+    assert!(find_text_coords(&buf_ascii_hist, "[CLOSING]").is_some());
+    assert!(find_text_coords(&buf_ascii_hist, "Outcome: Closing in 2m 0s").is_some());
+    assert!(find_text_coords(&buf_ascii_hist, "[E] End Session").is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flow() {
+    use bpmute::daemon::WearableEvent;
+    use bpmute::sleep_engine::{HrPacket, StreamState};
+    use bpmute::storage::WearableDescriptor;
+    use chrono::TimeZone;
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, 0).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (source, w_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "EC:09:86:B0:EC:05".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Watch".to_string()),
+        advertised_name: Some("HUAWEI WATCH HR-C05".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+    let t0 = start_utc.timestamp_millis();
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), t0)
+        .await
+        .unwrap();
+
+    // Virtual-time keepalive ticker: prevents Tokio paused-time auto-advance from
+    // jumping across the 15-minute gap deadline while tasks park on Unix socket I/O
+    // and SQLite worker threads (ADR-0007 / docs/agents/testing.md).
+    let (stop_ticker_tx, mut stop_ticker_rx) = watch::channel(false);
+    let ticker_task = tokio::spawn(async move {
+        while !*stop_ticker_rx.borrow() {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                _ = stop_ticker_rx.changed() => break,
+            }
+        }
+    });
+
+    // 1. Open TUI #1 while daemon is connected
+    let (mut app1, mut event_rx1, cmd_tx1, shutdown_tx1, bridge_task1) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
+    wait_for_app_state(&mut app1, &mut event_rx1, |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+
+    // While Idle, [E] End Session is hidden and pressing 'E' is a no-op
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app1.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_none());
+    assert_eq!(
+        app1.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        None
+    );
+
+    // 2. Start streaming and send packets to open a Monitoring Session
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0,
+        },
+    })
+    .await
+    .unwrap();
+
+    for sec in 0..=15 {
+        w_tx.send(WearableEvent::HrPacket {
+            wearable: desc.clone(),
+            packet: HrPacket {
+                ts_ms: t0 + sec * 1_000,
+                bpm: 65.0,
+                rr_ms: vec![],
+                contact_status: ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    wait_for_app_state_with_cmds(&mut app1, &mut event_rx1, Some(&cmd_tx1), |a| {
+        a.monitoring_state != MonitoringState::Idle
+    })
+    .await;
+
+    // While Streaming, [E] End Session is hidden in both footers and pressing 'E' is a no-op
+    terminal
+        .draw(|f| app1.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_none());
+    assert_eq!(
+        app1.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        None
+    );
+
+    app1.active_tab = Tab::History;
+    terminal
+        .draw(|f| app1.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_none());
+    assert_eq!(
+        app1.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        None
+    );
+
+    // 3. Disconnect wearable -> enters gap with 15-minute countdown (ADR-0012)
+    let t_dc = t0 + 15_000;
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Disconnected,
+            ts_ms: t_dc,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app1, &mut event_rx1, Some(&cmd_tx1), |a| {
+        a.session_close_deadline_ms.is_some() && !a.history_sessions.is_empty()
+    })
+    .await;
+
+    // Verify Dashboard rendering: Sleep State card row 0 & 1, footer [E] End Session
+    app1.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app1.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_dc = terminal.backend().buffer().clone();
+    assert!(find_text_coords(&buf_dc, "State: Warmup").is_some());
+    assert!(find_text_coords(&buf_dc, "Closing in").is_some());
+    assert!(find_text_coords(&buf_dc, "[E] End Session").is_some());
+
+    // Verify History rendering: [CLOSING] and Outcome: Closing in ...
+    app1.active_tab = Tab::History;
+    terminal
+        .draw(|f| app1.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_hist_dc = terminal.backend().buffer().clone();
+    assert!(find_text_coords(&buf_hist_dc, "[CLOSING]").is_some());
+    assert!(find_text_coords(&buf_hist_dc, "Outcome: Closing in").is_some());
+    assert!(find_text_coords(&buf_hist_dc, "[E] End Session").is_some());
+
+    // 4. Test TUI reopen mid-countdown: close TUI #1, advance 60s, open fresh TUI #2
+    let _ = shutdown_tx1.send(true);
+    let _ = bridge_task1.await;
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+
+    let (mut app2, mut event_rx2, cmd_tx2, shutdown_tx2, bridge_task2) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.daemon_connected
+            && a.session_close_deadline_ms.is_some()
+            && !a.history_sessions.is_empty()
+    })
+    .await;
+
+    // Remaining seconds reflects the elapsed 60 seconds (15m window -> ~14m remaining)
+    let rem_sec = app2
+        .session_close_remaining_sec()
+        .expect("remaining sec must be present");
+    assert!(
+        (830..=850).contains(&rem_sec),
+        "Expected remaining sec ~840s (14m) after 60s elapsed; got {rem_sec}"
+    );
+
+    app2.active_tab = Tab::Dashboard;
+    terminal
+        .draw(|f| app2.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "Closing in").is_some());
+    assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_some());
+
+    // 5. Test reconnect clearing: Wearable reconnects and resumes streaming
+    let t_resume = t_dc + 65_000;
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t_resume,
+        },
+    })
+    .await
+    .unwrap();
+
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t_resume,
+            bpm: 66.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.session_close_deadline_ms.is_none()
+    })
+    .await;
+
+    // Reverts row 1 to P(SleepNREM) and hides [E] End Session
+    terminal
+        .draw(|f| app2.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "Closing in").is_none());
+    assert!(find_text_coords(terminal.backend().buffer(), "P(SleepNREM):").is_some());
+    assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_none());
+    assert_eq!(
+        app2.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
+        None
+    );
+
+    // 6. Disconnect again and test mouse click closure
+    let t_dc2 = t_resume + 5_000;
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Disconnected,
+            ts_ms: t_dc2,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.session_close_deadline_ms.is_some()
+    })
+    .await;
+
+    terminal
+        .draw(|f| app2.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let (click_col, click_row) =
+        find_text_coords(terminal.backend().buffer(), "[E] End Session").unwrap();
+
+    // Mouse click immediately invokes session.end
+    let click_cmd = app2.handle_event(mouse_left_click(click_col + 1, click_row));
+    assert_eq!(click_cmd, Some(TuiCommand::SessionEnd));
+    assert_eq!(app2.monitoring_state, MonitoringState::Idle);
+    assert_eq!(app2.history_sessions[0].status, SessionStatus::Closed);
+    assert_eq!(
+        app2.history_sessions[0].end_reason,
+        Some(SessionEndReason::ManualClose)
+    );
+    assert!(app2.op_feedback.is_some());
+
+    // Dispatch the SessionEnd command over the real socket
+    cmd_tx2.send(click_cmd.unwrap()).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.monitoring_state == MonitoringState::Idle
+            && a.session_close_deadline_ms.is_none()
+            && a.history_sessions
+                .first()
+                .is_some_and(|s| s.status == SessionStatus::Closed)
+    })
+    .await;
+
+    // Verify concise status feedback in banner
+    terminal
+        .draw(|f| app2.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    assert!(find_text_coords(terminal.backend().buffer(), "Monitoring session ended").is_some());
+    assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_none());
+
+    // 7. Test keyboard 'E' closure on subsequent session
+    let t_new = t_dc2 + 10_000;
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t_new,
+        },
+    })
+    .await
+    .unwrap();
+
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t_new,
+            bpm: 64.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.monitoring_state != MonitoringState::Idle
+    })
+    .await;
+
+    // Disconnect
+    let t_dc3 = t_new + 5_000;
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Disconnected,
+            ts_ms: t_dc3,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.session_close_deadline_ms.is_some()
+    })
+    .await;
+
+    // Key 'E' immediately invokes session.end
+    let key_cmd = app2.handle_event(TuiEvent::Key(key(KeyCode::Char('E'))));
+    assert_eq!(key_cmd, Some(TuiCommand::SessionEnd));
+    cmd_tx2.send(key_cmd.unwrap()).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
+        a.monitoring_state == MonitoringState::Idle
+            && a.session_close_deadline_ms.is_none()
+            && a.history_sessions
+                .first()
+                .is_some_and(|s| s.end_reason == Some(SessionEndReason::ManualClose))
+    })
+    .await;
+
+    let _ = shutdown_tx2.send(true);
+    let _ = bridge_task2.await;
+    let _ = stop_ticker_tx.send(true);
+    let _ = ticker_task.await;
+    daemon.shutdown().await;
+}

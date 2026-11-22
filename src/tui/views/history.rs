@@ -176,7 +176,11 @@ fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
                 let dur_str = format_duration_compact(dur_sec);
 
                 let outcome_tag = if entry.status == SessionStatus::Active {
-                    "[ACTIVE]"
+                    if app.session_close_deadline_ms.is_some() {
+                        "[CLOSING]"
+                    } else {
+                        "[ACTIVE]"
+                    }
                 } else {
                     match entry.end_reason {
                         Some(SessionEndReason::HostSuspend) => "[Suspend]",
@@ -186,7 +190,11 @@ fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
                     }
                 };
 
-                let line1 = format!("{local_time} {dur_str:>4} {outcome_tag}");
+                let outcome_style = if outcome_tag == "[CLOSING]" && !is_selected {
+                    app.theme.warning()
+                } else {
+                    bg_style
+                };
                 let selected_prefix = if is_selected {
                     if app.theme.ascii { "> " } else { "▶ " }
                 } else {
@@ -201,7 +209,8 @@ fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
                             app.theme.muted()
                         },
                     ),
-                    Span::styled(line1, bg_style),
+                    Span::styled(format!("{local_time} {dur_str:>4} "), bg_style),
+                    Span::styled(outcome_tag, outcome_style),
                 ];
                 buf.set_line(inner.x, current_y, &Line::from(line1_spans), inner.width);
                 hit_map.push_click(
@@ -340,10 +349,24 @@ fn build_detail_header<'a>(
         Span::styled(format!("  Wearable: {wearable_label}"), app.theme.base()),
     ]));
 
-    lines.push(Line::from(vec![Span::styled(
-        format!(" Window: {start_str}..{end_str} ({dur_str})  Outcome: {reason_str}"),
-        app.theme.muted(),
-    )]));
+    let is_closing =
+        entry.status == SessionStatus::Active && app.session_close_deadline_ms.is_some();
+    if is_closing && let Some(rem_sec) = app.session_close_remaining_sec() {
+        let formatted = crate::tui::format_close_countdown(rem_sec);
+        lines.push(Line::from(vec![Span::styled(
+            format!(" Window: {start_str}..{end_str} ({dur_str})"),
+            app.theme.muted(),
+        )]));
+        lines.push(Line::from(vec![
+            Span::styled(" Outcome: ", app.theme.muted()),
+            Span::styled(format!("Closing in {formatted}"), app.theme.warning()),
+        ]));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" Window: {start_str}..{end_str} ({dur_str})  Outcome: {reason_str}"),
+            app.theme.muted(),
+        )]));
+    }
 
     let qw_str = entry
         .warmup_mu_hr

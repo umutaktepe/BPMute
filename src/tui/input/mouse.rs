@@ -134,6 +134,7 @@ impl TuiApp {
                         None
                     }
                     ClickTarget::PauseOption(idx) => self.click_pause_option(idx),
+                    ClickTarget::EndSession => self.end_active_session(),
                     ClickTarget::Consume => None,
                 }
             }

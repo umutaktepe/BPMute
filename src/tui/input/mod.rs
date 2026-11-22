@@ -110,6 +110,11 @@ impl TuiApp {
             Tab::Dashboard => match key.code {
                 KeyCode::Char('d') => self.toggle_diagnostics(),
                 KeyCode::Char('p') if self.daemon_connected => self.open_pause_popover(),
+                KeyCode::Char('E') | KeyCode::Char('e')
+                    if self.daemon_connected && self.session_close_deadline_ms.is_some() =>
+                {
+                    self.end_active_session()
+                }
                 KeyCode::Char('e')
                     if self.daemon_connected && self.enrolled_wearables.is_empty() =>
                 {
@@ -141,10 +146,21 @@ impl TuiApp {
                 }
                 _ => None,
             },
-            Tab::History if self.can_act_on_selected_session() => match key.code {
-                KeyCode::Char('f') => self.open_history_feedback_modal(),
-                KeyCode::Char('x') => self.open_history_export_modal(),
-                KeyCode::Char('D') => self.open_history_delete_modal(),
+            Tab::History => match key.code {
+                KeyCode::Char('E') | KeyCode::Char('e')
+                    if self.daemon_connected && self.session_close_deadline_ms.is_some() =>
+                {
+                    self.end_active_session()
+                }
+                KeyCode::Char('f') if self.can_act_on_selected_session() => {
+                    self.open_history_feedback_modal()
+                }
+                KeyCode::Char('x') if self.can_act_on_selected_session() => {
+                    self.open_history_export_modal()
+                }
+                KeyCode::Char('D') if self.can_act_on_selected_session() => {
+                    self.open_history_delete_modal()
+                }
                 _ => None,
             },
             Tab::Settings => match key.code {

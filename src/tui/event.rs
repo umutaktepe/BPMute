@@ -113,6 +113,7 @@ pub enum TuiCommand {
     SessionDelete {
         id: String,
     },
+    SessionEnd,
     ConfigGet,
     ConfigUpdate(ConfigPatch),
     ConfigReload,

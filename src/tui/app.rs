@@ -21,8 +21,8 @@ use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, MonitoringState,
     alert_ids,
 };
-use crate::sleep_engine::{CalibrationMaturity, Epoch, StreamStatus};
-use crate::storage::{SessionFullDetail, SessionListEntry, StorageStats};
+use crate::sleep_engine::{CalibrationMaturity, Epoch, SessionEndReason, StreamStatus};
+use crate::storage::{SessionFullDetail, SessionListEntry, SessionStatus, StorageStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -280,6 +280,9 @@ pub struct TuiApp {
     pub dry_run: bool,
     pub idle_backend: Option<String>,
     pub playing_players_count: Option<usize>,
+    pub session_close_deadline_ms: Option<i64>,
+    pub daemon_clock_offset_ms: Option<i64>,
+    pub daemon_now_ms: Option<i64>,
 
     // Biometrics & sparkline
     pub sparkline_data: HrSparklineData,
@@ -352,6 +355,9 @@ impl TuiApp {
             dry_run: false,
             idle_backend: None,
             playing_players_count: None,
+            session_close_deadline_ms: None,
+            daemon_clock_offset_ms: None,
+            daemon_now_ms: None,
             sparkline_data: HrSparklineData::new(),
             latest_bpm: None,
             contact_ok: true,
@@ -583,6 +589,9 @@ impl TuiApp {
     pub fn tick(&mut self) -> Option<TuiCommand> {
         if self.daemon_connected {
             self.sparkline_data.advance_tick(i64::from(TUI_TICK_MS));
+            if let Some(ref mut now_ms) = self.daemon_now_ms {
+                *now_ms = now_ms.saturating_add(i64::from(TUI_TICK_MS));
+            }
         }
         if let ModalState::EnrollmentModal {
             ref mut scanning_remaining_ms,
@@ -593,6 +602,62 @@ impl TuiApp {
             *scanning_remaining_ms = scanning_remaining_ms.saturating_sub(TUI_TICK_MS);
         }
         None
+    }
+
+    /// Resolves the current estimated timestamp (in milliseconds) of the daemon clock,
+    /// anchored to `server_now_ms` and smoothly advanced on UI ticks.
+    pub fn current_daemon_now_ms(&self) -> i64 {
+        if let Some(offset) = self.daemon_clock_offset_ms {
+            let local_now = chrono::Utc::now().timestamp_millis();
+            let wall_now = local_now.saturating_add(offset);
+            if let Some(tick_now) = self.daemon_now_ms {
+                tick_now.max(wall_now)
+            } else {
+                wall_now
+            }
+        } else if let Some(tick_now) = self.daemon_now_ms {
+            tick_now
+        } else {
+            chrono::Utc::now().timestamp_millis()
+        }
+    }
+
+    /// Returns remaining close countdown seconds while `session_close_deadline_ms` is active.
+    pub fn session_close_remaining_sec(&self) -> Option<u64> {
+        let deadline_ms = self.session_close_deadline_ms?;
+        let now_ms = self.current_daemon_now_ms();
+        let remaining_ms = deadline_ms.saturating_sub(now_ms).max(0) as u64;
+        Some(remaining_ms.saturating_sub(1).div_ceil(1000))
+    }
+
+    /// Invokes immediate manual closure of an active session during a gap/Signal Lost window.
+    pub fn end_active_session(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected || self.session_close_deadline_ms.is_none() {
+            return None;
+        }
+
+        self.monitoring_state = MonitoringState::Idle;
+        self.session_close_deadline_ms = None;
+
+        for s in &mut self.history_sessions {
+            if s.status == SessionStatus::Active {
+                s.status = SessionStatus::Closed;
+                s.end_reason = Some(SessionEndReason::ManualClose);
+            }
+        }
+        if let Some(ref mut detail) = self.selected_session_detail
+            && detail.status == SessionStatus::Active
+        {
+            detail.status = SessionStatus::Closed;
+            detail.session.end_reason = SessionEndReason::ManualClose;
+        }
+
+        self.op_feedback = Some(OpFeedback {
+            is_error: false,
+            message: "Monitoring session ended".to_string(),
+        });
+
+        Some(TuiCommand::SessionEnd)
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
@@ -687,4 +752,18 @@ fn render_resize_notice(area: Rect, buf: &mut Buffer, theme: Theme) {
     ];
 
     Paragraph::new(lines).render(inner, buf);
+}
+
+/// Formats remaining seconds as compact countdown string (e.g. `2m 0s`, `1m 59s`, `29s`, `1h 2m 3s`).
+pub fn format_close_countdown(sec: u64) -> String {
+    if sec >= 3600 {
+        let h = sec / 3600;
+        let m = (sec % 3600) / 60;
+        let s = sec % 60;
+        format!("{h}h {m}m {s}s")
+    } else if sec >= 60 {
+        format!("{}m {}s", sec / 60, sec % 60)
+    } else {
+        format!("{sec}s")
+    }
 }

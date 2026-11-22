@@ -572,6 +572,29 @@ impl WearableSource for LiveStreamTestSource {
     }
 }
 
+pub fn spawn_tui_bridge_session_with_cmds(
+    socket_path: &std::path::Path,
+) -> (
+    TuiApp,
+    mpsc::Receiver<TuiEvent>,
+    mpsc::Sender<TuiCommand>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (event_tx, event_rx) = mpsc::channel(256);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(socket_path.to_path_buf(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+    (
+        TuiApp::new(false, false, false),
+        event_rx,
+        cmd_tx,
+        shutdown_tx,
+        bridge_task,
+    )
+}
+
 pub fn spawn_tui_bridge_session(
     socket_path: &std::path::Path,
 ) -> (
@@ -580,17 +603,9 @@ pub fn spawn_tui_bridge_session(
     watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
-    let (event_tx, event_rx) = mpsc::channel(256);
-    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(socket_path.to_path_buf(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-    (
-        TuiApp::new(false, false, false),
-        event_rx,
-        shutdown_tx,
-        bridge_task,
-    )
+    let (app, event_rx, _cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(socket_path);
+    (app, event_rx, shutdown_tx, bridge_task)
 }
 
 pub fn render_dashboard_braille_cols(

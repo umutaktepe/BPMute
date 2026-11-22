@@ -309,6 +309,16 @@ pub(super) async fn execute_command(
                 refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
             }
         }
+        TuiCommand::SessionEnd => {
+            let resp =
+                send_op_request(req_tx, pending, next_id, "session.end", json!({}), event_tx)
+                    .await?;
+            if resp.ok {
+                refresh_sessions(req_tx, pending, next_id, event_tx, false).await?;
+                refresh_calibration(req_tx, pending, next_id, event_tx).await?;
+                refresh_storage_stats(req_tx, pending, next_id, event_tx).await?;
+            }
+        }
         TuiCommand::ConfigGet => {
             refresh_config(req_tx, pending, next_id, event_tx).await?;
         }
