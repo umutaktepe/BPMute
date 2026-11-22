@@ -1348,3 +1348,309 @@ fn test_purge_and_hard_wipe_reclaim_storage_and_truncate_wal() {
         "third hard_wipe must not grow DB: w2={size_after_wipe2}, w3={size_after_wipe3}"
     );
 }
+
+fn seed_wearable_and_closed_session(
+    store: &mut LedgerStore,
+    mac: &str,
+    alias: &str,
+    start_ts_ms: i64,
+    warmup_mu_hr: f64,
+    raw_count: u32,
+) -> (String, String) {
+    let wid = store
+        .upsert_wearable(
+            &WearableDescriptor {
+                mac: mac.to_string(),
+                address_type: "public".to_string(),
+                alias: Some(alias.to_string()),
+                advertised_name: None,
+                supports_rr: true,
+                supports_contact: true,
+            },
+            start_ts_ms.saturating_sub(1_000),
+        )
+        .unwrap();
+    let sid = store
+        .open_session(&OpenSessionRequest {
+            wearable_id: wid.clone(),
+            start_ts_ms,
+            detection_sensitivity: Sensitivity::Balanced,
+        })
+        .unwrap();
+    if raw_count > 0 {
+        let raw: Vec<(u32, HrPacket)> = (0..raw_count)
+            .map(|i| {
+                (
+                    i,
+                    HrPacket {
+                        ts_ms: start_ts_ms + i64::from(i) * 1000,
+                        bpm: 62.0,
+                        rr_ms: vec![960.0],
+                        contact_status: ContactStatus::Contact,
+                    },
+                )
+            })
+            .collect();
+        let raw_refs: Vec<(u32, &HrPacket)> = raw.iter().map(|(seq, p)| (*seq, p)).collect();
+        store.append_epoch_and_raw(&sid, None, &raw_refs).unwrap();
+    }
+    let mut summary = sample_summary(start_ts_ms, start_ts_ms + 200_000, 56.0);
+    summary.warmup_mu_hr = Some(warmup_mu_hr);
+    store
+        .close_session_and_recompute(
+            &CloseSessionRequest {
+                session_id: sid.clone(),
+                summary,
+                trigger_power_action: PowerAction::None,
+                rapid_resume_within_5m: false,
+            },
+            start_ts_ms + 200_000,
+        )
+        .unwrap();
+    (wid, sid)
+}
+
+#[test]
+fn test_rebaseline_undo_keeps_db_and_wal_bounded() {
+    const MAX_MAIN_DB_PAGE_GROWTH_BYTES: u64 = 2 * 4096;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+
+    seed_wearable_and_closed_session(&mut store, "AA:BB:CC:DD:EE:01", "Band", 1_000_000, 66.0, 0);
+
+    let baseline = store.get_storage_stats().unwrap();
+    let main_db_bytes = || std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let base_main = main_db_bytes();
+
+    let mut cycle_sizes = Vec::new();
+    for i in 0..10i64 {
+        let ts = 2_000_000 + i * 10_000;
+        store
+            .set_calibration_boundary(None, Some(54.0), false, ts)
+            .unwrap();
+        store.undo_calibration_boundary(ts + 1_000).unwrap();
+        let stats = store.get_storage_stats().unwrap();
+        cycle_sizes.push((main_db_bytes(), stats.wal_size_bytes, stats.db_size_bytes));
+    }
+
+    let final_stats = store.get_storage_stats().unwrap();
+    assert_eq!(
+        final_stats.wal_size_bytes, 0,
+        "repeated rebaseline+undo must not leave growing WAL (base_main={base_main}, base_total={}, cycles={cycle_sizes:?})",
+        baseline.db_size_bytes
+    );
+    assert!(
+        final_stats.db_size_bytes <= baseline.db_size_bytes + MAX_MAIN_DB_PAGE_GROWTH_BYTES,
+        "repeated rebaseline+undo must not monotonically bloat DB size (baseline={}, final={}, cycles={cycle_sizes:?})",
+        baseline.db_size_bytes,
+        final_stats.db_size_bytes
+    );
+}
+
+#[test]
+fn test_sibling_storage_mutations_truncate_wal_and_reclaim_replace_space() {
+    use bpmute::storage::{ExportBundleOptions, ImportMode, SetFeedbackRequest};
+
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let small_bundle_path = temp.path().join("small_bundle.json");
+
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let (wid, sid) = seed_wearable_and_closed_session(
+        &mut store,
+        "AA:BB:CC:DD:EE:02",
+        "Band2",
+        1_000_000,
+        66.0,
+        0,
+    );
+    assert_eq!(
+        store.get_storage_stats().unwrap().wal_size_bytes,
+        0,
+        "close_session_and_recompute must truncate WAL even when 0 rows were pruned"
+    );
+
+    store
+        .export_bundle(
+            &small_bundle_path,
+            ExportBundleOptions {
+                include_epochs: false,
+                include_wearables: true,
+                include_raw: false,
+            },
+            1_300_000,
+        )
+        .unwrap();
+
+    store
+        .set_day1_seed_and_recompute(Some(55.0), 1_350_000)
+        .unwrap();
+    assert_eq!(store.get_storage_stats().unwrap().wal_size_bytes, 0);
+
+    store
+        .set_feedback_and_recompute(
+            &SetFeedbackRequest {
+                session_id_or_prefix: sid,
+                verdict: bpmute::config::PatchField::Unchanged,
+                onset_hhmm: bpmute::config::PatchField::Unchanged,
+                avg_sleep_hr: bpmute::config::PatchField::Set(55.0),
+                clear_all: false,
+            },
+            1_400_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_storage_stats().unwrap().wal_size_bytes,
+        0,
+        "set_feedback_and_recompute must truncate WAL"
+    );
+
+    // Recovering a stale active session must flush/truncate WAL.
+    store
+        .open_session(&OpenSessionRequest {
+            wearable_id: wid.clone(),
+            start_ts_ms: 1_500_000,
+            detection_sensitivity: Sensitivity::Balanced,
+        })
+        .unwrap();
+    assert!(store.get_storage_stats().unwrap().wal_size_bytes > 0);
+    let recovered = store.recover_stale_sessions(1_600_000).unwrap();
+    assert_eq!(recovered, 1);
+    assert_eq!(
+        store.get_storage_stats().unwrap().wal_size_bytes,
+        0,
+        "recover_stale_sessions must truncate WAL"
+    );
+
+    // Trigger 5-session persistent shift -> dismiss_shift and accept_shift must truncate WAL.
+    for i in 1..=4 {
+        seed_wearable_and_closed_session(
+            &mut store,
+            "AA:BB:CC:DD:EE:02",
+            "Band2",
+            1_700_000 + i * 300_000,
+            66.0,
+            0,
+        );
+    }
+    for i in 0..5 {
+        seed_wearable_and_closed_session(
+            &mut store,
+            "AA:BB:CC:DD:EE:02",
+            "Band2",
+            3_500_000 + i * 300_000,
+            85.0,
+            0,
+        );
+    }
+    store.accept_shift_and_recompute(5_200_000).unwrap();
+    assert_eq!(
+        store.get_storage_stats().unwrap().wal_size_bytes,
+        0,
+        "accept_shift_and_recompute must truncate WAL"
+    );
+    store.undo_calibration_boundary(5_300_000).unwrap();
+    store.dismiss_shift_and_recompute(5_400_000).unwrap();
+    assert_eq!(
+        store.get_storage_stats().unwrap().wal_size_bytes,
+        0,
+        "dismiss_shift_and_recompute must truncate WAL"
+    );
+
+    // Add heavy raw samples, then ImportMode::Replace with the small bundle must reclaim pages and truncate WAL.
+    seed_wearable_and_closed_session(
+        &mut store,
+        "AA:BB:CC:DD:EE:02",
+        "Band2",
+        6_000_000,
+        66.0,
+        400,
+    );
+    let size_with_raw = store.get_storage_stats().unwrap().db_size_bytes;
+    store
+        .import_bundle(&small_bundle_path, ImportMode::Replace, false, 6_500_000)
+        .unwrap();
+    let after_replace = store.get_storage_stats().unwrap();
+    assert_eq!(
+        after_replace.wal_size_bytes, 0,
+        "import_bundle must truncate WAL"
+    );
+    assert!(
+        after_replace.db_size_bytes < size_with_raw,
+        "ImportMode::Replace with small bundle must reclaim heavy raw sample pages: before={size_with_raw}, after={}",
+        after_replace.db_size_bytes
+    );
+
+    // Verify journal_size_limit pragma is configured on RW connections (1 MiB).
+    let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+    bpmute::storage::schema::initialize_rw_connection(&raw_conn, Some(&db_path)).unwrap();
+    let limit: i64 = raw_conn
+        .query_row("PRAGMA journal_size_limit;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(limit, 1_048_576);
+}
+
+#[tokio::test]
+async fn test_persistence_worker_shutdown_truncates_wal() {
+    use bpmute::storage::PersistenceWorker;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    let (worker, handle, _cal) = PersistenceWorker::spawn(&db_path, &lock_path, 2_000_000).unwrap();
+    let wid = handle
+        .upsert_wearable(
+            WearableDescriptor {
+                mac: "AA:BB:CC:DD:EE:03".to_string(),
+                address_type: "public".to_string(),
+                alias: Some("Band3".to_string()),
+                advertised_name: None,
+                supports_rr: false,
+                supports_contact: false,
+            },
+            2_000_000,
+        )
+        .await
+        .unwrap();
+    let sid = handle
+        .open_session(OpenSessionRequest {
+            wearable_id: wid,
+            start_ts_ms: 2_100_000,
+            detection_sensitivity: Sensitivity::Balanced,
+        })
+        .await
+        .unwrap();
+    handle
+        .append_epoch_and_raw(
+            sid,
+            None,
+            vec![(
+                0,
+                HrPacket {
+                    ts_ms: 2_100_000,
+                    bpm: 64.0,
+                    rr_ms: Vec::new(),
+                    contact_status: ContactStatus::Contact,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    drop(handle);
+    worker.shutdown_async().await;
+
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+    let wal_after_shutdown = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        wal_after_shutdown, 0,
+        "PersistenceWorker shutdown must truncate WAL"
+    );
+}

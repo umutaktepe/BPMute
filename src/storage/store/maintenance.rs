@@ -8,7 +8,7 @@ use crate::calibration::{BoundaryReason, CalibrationBoundaryRecord, CalibrationS
 use crate::config::{RawSamplesRetention, RetentionConfig, SessionEpochsRetention};
 use crate::paths::ensure_private_dir;
 use crate::storage::lock::LedgerFileLock;
-use crate::storage::schema::enforce_private_db_permissions;
+use crate::storage::schema::{WAL_RUNTIME_PRAGMAS, enforce_private_db_permissions};
 use crate::storage::{PruneSummary, StorageError, StorageStats};
 
 impl LedgerStore {
@@ -93,15 +93,14 @@ impl LedgerStore {
         };
         // Set auto_vacuum before VACUUM so incremental mode is guaranteed, then truncate WAL
         // so VACUUM's rewritten pages are flushed to the main DB and deleted data cannot linger in -wal.
-        self.conn.execute_batch(
+        self.conn.execute_batch(&format!(
             "PRAGMA secure_delete = ON;
              PRAGMA auto_vacuum = INCREMENTAL;
              VACUUM;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             {WAL_RUNTIME_PRAGMAS}
              PRAGMA foreign_keys = ON;
-             PRAGMA wal_checkpoint(TRUNCATE);",
-        )?;
+             PRAGMA wal_checkpoint(TRUNCATE);"
+        ))?;
         enforce_private_db_permissions(&self.db_path)?;
         Ok(cal_state)
     }

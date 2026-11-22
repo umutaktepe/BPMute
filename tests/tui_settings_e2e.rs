@@ -800,8 +800,19 @@ async fn test_real_socket_settings_purge_rebaseline_and_repeated_wipe_db_size() 
     })
     .await;
 
-    // 3. Repeated Hard Wipe ('W' + "WIPE") -> shrinks DB size on first wipe and stays constant
-    let size_before_wipe = h.app.storage_stats.as_ref().unwrap().db_size_bytes;
+    let after_undo_stats = h.app.storage_stats.as_ref().unwrap().clone();
+    assert_eq!(
+        after_undo_stats.wal_size_bytes, 0,
+        "Calibration Boundary set + undo must truncate WAL over real socket"
+    );
+    assert_eq!(
+        after_undo_stats.db_size_bytes, after_purge_stats.db_size_bytes,
+        "Calibration Boundary set + undo must not bloat DB size: after_purge={}, after_undo={}",
+        after_purge_stats.db_size_bytes, after_undo_stats.db_size_bytes
+    );
+
+    // 3. Repeated Hard Wipe ('W' + "WIPE") -> reclaims/keeps minimal DB size and stays constant
+    let size_before_wipe = after_undo_stats.db_size_bytes;
     let mut wipe_sizes = Vec::with_capacity(3);
     for _ in 0..3 {
         h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('W'))));
@@ -822,8 +833,8 @@ async fn test_real_socket_settings_purge_rebaseline_and_repeated_wipe_db_size() 
     }
 
     assert!(
-        wipe_sizes[0] < size_before_wipe,
-        "First WIPE should shrink DB size: before={size_before_wipe}, after_w1={}",
+        wipe_sizes[0] <= size_before_wipe,
+        "First WIPE must not grow DB size: before={size_before_wipe}, after_w1={}",
         wipe_sizes[0]
     );
     assert_eq!(

@@ -89,14 +89,23 @@ for path in files:
 for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
     content = open(path, encoding="utf-8").read()
     has_vacuum = bool(re.search(r'\bVACUUM;|PRAGMA\s+incremental_vacuum\b', content))
-    if has_vacuum and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(', content):
+    if has_vacuum and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(|write_tx_and_flush\(', content):
         sys.exit(
-            f"error: {path} runs VACUUM or PRAGMA incremental_vacuum without wal_checkpoint(TRUNCATE) / flush_wal()"
+            f"error: {path} runs VACUUM or PRAGMA incremental_vacuum without wal_checkpoint(TRUNCATE) / flush_wal() / write_tx_and_flush()"
         )
     if "VACUUM;" in content and "PRAGMA auto_vacuum" in content:
         if content.index("VACUUM;") < content.index("PRAGMA auto_vacuum"):
             sys.exit(
                 f"error: {path} sets PRAGMA auto_vacuum after VACUUM;; set it before VACUUM"
+            )
+    for fn_block in re.split(r'(?=^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+)', content, flags=re.M)[1:]:
+        fn_sig = fn_block.splitlines()[0].strip()
+        if not fn_sig.startswith("pub fn "):
+            continue
+        needs_flush = bool(re.search(r'\bVACUUM;|PRAGMA\s+incremental_vacuum\b|recompute_and_persist_in_tx\(', fn_block))
+        if needs_flush and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(|write_tx_and_flush\(', fn_block):
+            sys.exit(
+                f"error: {path} ({fn_sig}) mutates/recomputes ledger without wal_checkpoint(TRUNCATE) / flush_wal() / write_tx_and_flush()"
             )
 PY
 

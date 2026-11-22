@@ -333,7 +333,7 @@ impl LedgerStore {
             ..Default::default()
         };
 
-        let state = self.write_tx(|tx| {
+        let state = self.write_tx_and_flush(|tx| {
             if mode == ImportMode::Replace {
                 tx.execute("DELETE FROM raw_samples", [])?;
                 tx.execute("DELETE FROM session_epochs", [])?;
@@ -577,7 +577,11 @@ impl LedgerStore {
                 )?;
             }
 
-            recompute_and_persist_in_tx(tx, now_ms)
+            let state = recompute_and_persist_in_tx(tx, now_ms)?;
+            if mode == ImportMode::Replace {
+                let _ = tx.execute("PRAGMA incremental_vacuum;", []);
+            }
+            Ok(state)
         })?;
 
         Ok((summary, state))
@@ -599,6 +603,15 @@ impl LedgerStore {
         let out = f(&tx)?;
         tx.commit()?;
         enforce_private_db_permissions(&self.db_path)?;
+        Ok(out)
+    }
+
+    fn write_tx_and_flush<T, F>(&mut self, f: F) -> Result<T, StorageError>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StorageError>,
+    {
+        let out = self.write_tx(f)?;
+        self.flush_wal()?;
         Ok(out)
     }
 }

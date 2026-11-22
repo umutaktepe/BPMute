@@ -87,6 +87,11 @@ pub fn backup_pre_migration(
     Ok(backup_path)
 }
 
+/// WAL runtime pragmas applied to every read-write SQLite connection (`1 MiB` journal size cap).
+pub(crate) const WAL_RUNTIME_PRAGMAS: &str = "PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA journal_size_limit = 1048576;";
+
 /// Initializes a read-write SQLite WAL connection with `secure_delete` and `auto_vacuum = INCREMENTAL`.
 /// Creates an automatic pre-migration backup if upgrading an existing older database schema version.
 pub fn initialize_rw_connection(
@@ -102,11 +107,8 @@ pub fn initialize_rw_connection(
     let user_version: i32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
     if user_version == 0 {
         // Must precede first table creation so SQLite enables incremental auto-vacuuming.
-        conn.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL;
-             PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
-        )?;
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
+        conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
         conn.execute_batch(DDL_V1)?;
         conn.execute_batch(&format!(
             "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
@@ -115,18 +117,12 @@ pub fn initialize_rw_connection(
         if let Some(path) = db_path {
             let _ = backup_pre_migration(conn, path, user_version);
         }
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
-        )?;
+        conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
         conn.execute_batch(&format!(
             "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
         ))?;
     } else if user_version == CURRENT_DB_SCHEMA_VERSION {
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
-        )?;
+        conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
         let _ = conn.execute(
             "ALTER TABLE wearables ADD COLUMN address_type TEXT NOT NULL DEFAULT 'public';",
             [],

@@ -212,6 +212,7 @@ impl PersistenceWorker {
                     }
                     dispatch_command(&mut store, cmd);
                 }
+                let _ = store.flush_wal();
             })?;
 
         let initial_state = init_rx.recv().map_err(|_| StorageError::WorkerStopped)??;

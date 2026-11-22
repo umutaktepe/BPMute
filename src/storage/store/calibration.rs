@@ -45,7 +45,7 @@ impl LedgerStore {
                 .map_err(StorageError::Validation)?;
         }
 
-        self.write_tx(|tx| {
+        self.write_tx_and_flush(|tx| {
             let active_boundary_id: Option<String> = tx
                 .query_row(
                     "SELECT id FROM calibration_boundaries
@@ -83,7 +83,7 @@ impl LedgerStore {
         now_ms: i64,
     ) -> Result<AcceptShiftResult, StorageError> {
         let boundary_id = generate_uuid_v7_with(&self.uuid_ctx, now_ms);
-        self.write_tx(|tx| {
+        self.write_tx_and_flush(|tx| {
             let current = recompute_calibration(&load_ledger_recompute_input(tx)?);
             let alert = current.pending_shift_alert.ok_or_else(|| {
                 StorageError::PreconditionFailed(
@@ -136,7 +136,7 @@ impl LedgerStore {
         &mut self,
         now_ms: i64,
     ) -> Result<CalibrationState, StorageError> {
-        self.write_tx(|tx| {
+        self.write_tx_and_flush(|tx| {
             let current = recompute_calibration(&load_ledger_recompute_input(tx)?);
             let alert = current.pending_shift_alert.ok_or_else(|| {
                 StorageError::PreconditionFailed(
@@ -173,7 +173,7 @@ impl LedgerStore {
         let boundary_id = generate_uuid_v7_with(&self.uuid_ctx, now_ms);
         let eff_ts = effective_ts_ms.unwrap_or(now_ms);
 
-        self.write_tx(|tx| {
+        self.write_tx_and_flush(|tx| {
             let boundary = CalibrationBoundaryRecord {
                 id: boundary_id,
                 effective_ts_ms: eff_ts,
@@ -208,7 +208,7 @@ impl LedgerStore {
         &mut self,
         now_ms: i64,
     ) -> Result<(CalibrationBoundaryRecord, CalibrationState), StorageError> {
-        self.write_tx(|tx| {
+        self.write_tx_and_flush(|tx| {
             let active_boundary: Option<CalibrationBoundaryRecord> = tx
                 .query_row(
                     "SELECT id, effective_ts_ms, reason, seed_sleep_hr, reset_floors, created_at_ms, reverted_at_ms

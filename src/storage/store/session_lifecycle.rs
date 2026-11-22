@@ -10,7 +10,7 @@ use super::{LedgerStore, recompute_and_persist_in_tx};
 impl LedgerStore {
     /// Recovers stale `'active'` sessions left behind by an ungraceful daemon termination.
     pub fn recover_stale_sessions(&mut self, now_ms: i64) -> Result<usize, StorageError> {
-        self.write_tx(|tx| {
+        let recovered = self.write_tx(|tx| {
             let mut stmt = tx.prepare(
                 "SELECT id, start_ts_ms, end_ts_ms FROM sessions WHERE status = 'active'",
             )?;
@@ -45,7 +45,11 @@ impl LedgerStore {
 
             recompute_and_persist_in_tx(tx, now_ms)?;
             Ok(stale.len())
-        })
+        })?;
+        if recovered > 0 {
+            self.flush_wal()?;
+        }
+        Ok(recovered)
     }
 
     /// Persists pre-trigger `sleeping_ts_ms` and `trigger_power_action` on an active session
@@ -56,7 +60,7 @@ impl LedgerStore {
         sleeping_ts_ms: i64,
         trigger_power_action: PowerAction,
     ) -> Result<(), StorageError> {
-        self.write_tx(|tx| {
+        self.write_tx_and_flush(|tx| {
             tx.execute(
                 "UPDATE sessions
                  SET sleeping_ts_ms = COALESCE(sleeping_ts_ms, ?2),
@@ -65,7 +69,6 @@ impl LedgerStore {
                 params![session_id, sleeping_ts_ms, trigger_power_action.as_str()],
             )?;
             Ok(())
-        })?;
-        self.flush_wal()
+        })
     }
 }
