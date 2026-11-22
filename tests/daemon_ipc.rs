@@ -166,6 +166,10 @@ async fn subscribe_snapshot_pause_until_morning_and_virtual_time_auto_resume() {
     let snapshot = client.next_event().await.unwrap();
     assert_eq!(snapshot.v, 1);
     assert_eq!(snapshot.event, "Snapshot");
+    assert_eq!(
+        snapshot.data["server_now_ms"].as_i64(),
+        Some(local_start.with_timezone(&Utc).timestamp_millis())
+    );
     assert_eq!(snapshot.data["status"]["v"], 1);
     assert_eq!(snapshot.data["status"]["daemon_running"], true);
     assert_eq!(snapshot.data["status"]["armed"], true);

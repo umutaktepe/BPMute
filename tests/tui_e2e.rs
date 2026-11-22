@@ -3361,3 +3361,396 @@ fn test_grace_tick_activity_hold_banner_and_hit_map() {
         assert!(app.grace_state.is_none());
     }
 }
+
+fn spawn_tui_bridge_session(
+    socket_path: &std::path::Path,
+) -> (
+    TuiApp,
+    mpsc::Receiver<TuiEvent>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (event_tx, event_rx) = mpsc::channel(256);
+    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(socket_path.to_path_buf(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+    (
+        TuiApp::new(false, false, false),
+        event_rx,
+        shutdown_tx,
+        bridge_task,
+    )
+}
+
+fn render_dashboard_braille_cols(
+    terminal: &mut Terminal<TestBackend>,
+    app: &mut TuiApp,
+    top_lbl: &str,
+    bot_lbl: &str,
+) -> (Vec<u16>, u16, u16, String) {
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let (start_col, _) = find_text_coords(buf, "-30m").unwrap();
+    let (now_col, _) = find_text_coords(buf, "Now").unwrap();
+    let chart_right = now_col + 2;
+    let (_, top_row) = find_text_coords(buf, top_lbl).unwrap();
+    let (_, bot_row) = find_text_coords(buf, bot_lbl).unwrap();
+    let cols: Vec<u16> = (start_col..=chart_right)
+        .filter(|&x| {
+            (top_row..=bot_row).any(|y| {
+                buf[(x, y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(is_non_blank_braille)
+            })
+        })
+        .collect();
+    (cols, start_col, chart_right, buffer_to_string(buf))
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_tui_reopen_preserves_30m_trailing_gap_after_disconnect() {
+    use bpmute::daemon::WearableEvent;
+    use bpmute::sleep_engine::{HrPacket, StreamState};
+    use bpmute::storage::WearableDescriptor;
+    use chrono::TimeZone;
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, 0).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (source, w_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "EC:09:86:B0:EC:05".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Watch".to_string()),
+        advertised_name: Some("HUAWEI WATCH HR-C05".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+    let t0 = start_utc.timestamp_millis();
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), t0)
+        .await
+        .unwrap();
+
+    // 1. Open TUI #1 while connected and stream a 2-minute HR burst
+    let (mut app1, mut event_rx1, shutdown_tx1, bridge_task1) =
+        spawn_tui_bridge_session(&paths.socket_path);
+    wait_for_app_state(&mut app1, &mut event_rx1, |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0,
+        },
+    })
+    .await
+    .unwrap();
+
+    for sec in 0..=120 {
+        let bpm = 60.0 + (sec as f64 / 120.0) * 6.0;
+        w_tx.send(WearableEvent::HrPacket {
+            wearable: desc.clone(),
+            packet: HrPacket {
+                ts_ms: t0 + sec * 1_000,
+                bpm,
+                rr_ms: vec![],
+                contact_status: ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    let last_sample_ts = t0 + 120_000;
+    wait_for_app_state(&mut app1, &mut event_rx1, |a| {
+        a.sparkline_data
+            .samples
+            .back()
+            .is_some_and(|s| s.ts_ms == last_sample_ts)
+    })
+    .await;
+
+    // Advance virtual time to match the 2-minute burst and disconnect wearable
+    tokio::time::advance(Duration::from_secs(120)).await;
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Disconnected,
+            ts_ms: last_sample_ts,
+        },
+    })
+    .await
+    .unwrap();
+    wait_for_app_state(&mut app1, &mut event_rx1, |a| {
+        a.active_wearable()
+            .is_some_and(|w| w.status == StreamStatus::Disconnected)
+    })
+    .await;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let (cols_initial, start_col, chart_right, out1) =
+        render_dashboard_braille_cols(&mut terminal, &mut app1, "69bpm", "57bpm");
+    let chart_w = chart_right - start_col + 1;
+    assert!(
+        !cols_initial.is_empty(),
+        "Initial burst must render Braille trace:\n{out1}"
+    );
+    let burst_cutoff = chart_right.saturating_sub(8);
+    assert!(
+        cols_initial.iter().all(|&x| x >= burst_cutoff),
+        "Initial burst must sit near Now (>= {burst_cutoff}), got {cols_initial:?}:\n{out1}"
+    );
+
+    // Close TUI #1 while wearable stays disconnected
+    let _ = shutdown_tx1.send(true);
+    let _ = bridge_task1.await;
+
+    // 2. Advance virtual time 10 minutes while disconnected, then open a fresh TUI #2
+    tokio::time::advance(Duration::from_secs(600)).await;
+    tokio::task::yield_now().await;
+
+    let (mut app2, mut event_rx2, shutdown_tx2, bridge_task2) =
+        spawn_tui_bridge_session(&paths.socket_path);
+    wait_for_app_state(&mut app2, &mut event_rx2, |a| {
+        a.daemon_connected
+            && !a.enrolled_wearables.is_empty()
+            && !a.sparkline_data.samples.is_empty()
+    })
+    .await;
+
+    assert_eq!(
+        app2.sparkline_data.samples.back().unwrap().ts_ms,
+        last_sample_ts,
+        "Daemon Snapshot must preserve original sample timestamps"
+    );
+    assert!(
+        app2.sparkline_data
+            .window_end_ms
+            .is_some_and(|end| end >= last_sample_ts + 600_000),
+        "Reopened TUI window_end_ms must reflect >=10m elapsed since disconnect (expected >= {}, got {:?})",
+        last_sample_ts + 600_000,
+        app2.sparkline_data.window_end_ms
+    );
+    assert_eq!(
+        app2.latest_bpm, None,
+        "Reopened TUI must not hydrate stale BPM while disconnected"
+    );
+    assert!(!app2.contact_ok);
+
+    let (cols_reopen, _, _, out2) =
+        render_dashboard_braille_cols(&mut terminal, &mut app2, "69bpm", "57bpm");
+    assert!(
+        !cols_reopen.is_empty(),
+        "Reopened TUI after 10m disconnect must still show historical trace:\n{out2}"
+    );
+    let gap_cutoff = chart_right.saturating_sub(chart_w / 4);
+    assert!(
+        cols_reopen.iter().all(|&x| x < gap_cutoff),
+        "Reopened TUI trace must sit left of >=10m trailing gap (< {gap_cutoff}), not flush at Now; got {cols_reopen:?}:\n{out2}"
+    );
+
+    let _ = shutdown_tx2.send(true);
+    let _ = bridge_task2.await;
+
+    // 3. Advance another 25 minutes (>= 35m after disconnect) and reopen TUI #3 -> stale trace clipped empty
+    tokio::time::advance(Duration::from_secs(1500)).await;
+    tokio::task::yield_now().await;
+
+    let (mut app3, mut event_rx3, shutdown_tx3, bridge_task3) =
+        spawn_tui_bridge_session(&paths.socket_path);
+    wait_for_app_state(&mut app3, &mut event_rx3, |a| {
+        a.daemon_connected
+            && !a.enrolled_wearables.is_empty()
+            && !a.sparkline_data.samples.is_empty()
+    })
+    .await;
+
+    assert_eq!(app3.latest_bpm, None);
+    assert!(!app3.contact_ok);
+
+    let (cols_expired, _, _, out3) =
+        render_dashboard_braille_cols(&mut terminal, &mut app3, "100bpm", "50bpm");
+    assert!(
+        cols_expired.is_empty(),
+        "After >30m disconnect, reopened TUI must clip stale trace empty, got {cols_expired:?}:\n{out3}"
+    );
+
+    let _ = shutdown_tx3.send(true);
+    let _ = bridge_task3.await;
+    daemon.shutdown().await;
+}
+
+#[test]
+fn test_dashboard_snapshot_server_now_ms_edge_cases() {
+    use bpmute::ipc::{EnrolledWearableStatus, SnapshotEvent};
+
+    let base_status = make_daemon_status(ScheduleConfig::default());
+    let disconnected_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Disconnected,
+        None,
+        Some("Chest"),
+    )];
+    let streaming_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Streaming,
+        Some(88),
+        Some("Chest"),
+    )];
+    let connecting_wearables = vec![make_wearable(
+        "w-1",
+        "AA:BB:CC:11:22:33",
+        Some("Polar H10"),
+        StreamStatus::Connecting,
+        Some(88),
+        Some("Chest"),
+    )];
+
+    let t0 = 1_700_000_000_000i64;
+    let last_ts = t0 + 120_000;
+    let ring: Vec<HrSampleEvent> = (0..=120)
+        .map(|sec| HrSampleEvent {
+            ts_ms: t0 + sec * 1_000,
+            bpm: 60.0 + (sec as f64 / 120.0) * 6.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+            wearable_id: "w-1".into(),
+            session_id: Some("s-1".into()),
+        })
+        .collect();
+
+    let apply_snapshot = |wearables: Vec<EnrolledWearableStatus>,
+                          hr_ring_buffer: Vec<HrSampleEvent>,
+                          server_now_ms: Option<i64>| {
+        let mut app = TuiApp::new(false, false, false);
+        app.enrolled_wearables = wearables;
+        app.handle_ipc(IpcEvent::Snapshot(Box::new(SnapshotEvent {
+            status: base_status.clone(),
+            hr_ring_buffer,
+            alerts: vec![],
+            server_now_ms,
+        })));
+        app
+    };
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+
+    // 1. server_now_ms = last_ts + 20m -> trace sits left of -15m, Tick advances further, stale BPM cleared
+    let now_20m = last_ts + 20 * 60_000;
+    let mut app_20m = apply_snapshot(disconnected_wearables.clone(), ring.clone(), Some(now_20m));
+    assert_eq!(app_20m.sparkline_data.window_end_ms, Some(now_20m));
+    assert_eq!(app_20m.latest_bpm, None);
+    assert!(!app_20m.contact_ok);
+    let (cols_20m, start_col, chart_right, out_20m) =
+        render_dashboard_braille_cols(&mut terminal, &mut app_20m, "69bpm", "57bpm");
+    let mid_col = start_col + (chart_right - start_col) / 2;
+    assert!(
+        !cols_20m.is_empty() && cols_20m.iter().all(|&x| x < mid_col),
+        "Snapshot at +20m must sit left of -15m (< {mid_col}), got {cols_20m:?}:\n{out_20m}"
+    );
+    app_20m.handle_event(TuiEvent::Tick);
+    assert_eq!(app_20m.sparkline_data.window_end_ms, Some(now_20m + 250));
+
+    // 2. server_now_ms = last_ts + 35m -> all stale samples clipped empty, default 100..50bpm Y bounds
+    let mut app_35m = apply_snapshot(
+        disconnected_wearables.clone(),
+        ring.clone(),
+        Some(last_ts + 35 * 60_000),
+    );
+    assert_eq!(app_35m.latest_bpm, None);
+    assert!(!app_35m.contact_ok);
+    let (cols_35m, _, _, out_35m) =
+        render_dashboard_braille_cols(&mut terminal, &mut app_35m, "100bpm", "50bpm");
+    assert!(
+        cols_35m.is_empty(),
+        "Snapshot at +35m must clip stale samples empty, got {cols_35m:?}:\n{out_35m}"
+    );
+
+    // 3. server_now_ms = None (legacy JSON payload without field) -> anchors at max_sample_ts (near Now)
+    let legacy_snapshot: SnapshotEvent = serde_json::from_value(json!({
+        "status": base_status,
+        "hr_ring_buffer": ring,
+        "alerts": []
+    }))
+    .expect("legacy Snapshot JSON without server_now_ms must deserialize");
+    assert_eq!(legacy_snapshot.server_now_ms, None);
+    let mut app_none = apply_snapshot(streaming_wearables.clone(), ring.clone(), None);
+    assert_eq!(app_none.sparkline_data.window_end_ms, Some(last_ts));
+    assert_eq!(app_none.latest_bpm, Some(66.0));
+    assert!(app_none.contact_ok);
+    let (cols_none, _, chart_right, out_none) =
+        render_dashboard_braille_cols(&mut terminal, &mut app_none, "69bpm", "57bpm");
+    let burst_cutoff = chart_right.saturating_sub(8);
+    assert!(
+        !cols_none.is_empty() && cols_none.iter().all(|&x| x >= burst_cutoff),
+        "Legacy Snapshot without server_now_ms must stay anchored near Now (>= {burst_cutoff}):\n{out_none}"
+    );
+
+    // 4. server_now_ms < last_ts -> clamped to max_ts via max_ts.max(now)
+    let app_skew = apply_snapshot(
+        streaming_wearables.clone(),
+        ring.clone(),
+        Some(last_ts - 60_000),
+    );
+    assert_eq!(app_skew.sparkline_data.window_end_ms, Some(last_ts));
+    assert_eq!(app_skew.latest_bpm, Some(66.0));
+    assert!(app_skew.contact_ok);
+
+    // 5. Empty hr_ring_buffer with server_now_ms: Some(now) -> window_end_ms stays None
+    let app_empty = apply_snapshot(
+        disconnected_wearables.clone(),
+        vec![],
+        Some(last_ts + 600_000),
+    );
+    assert_eq!(app_empty.sparkline_data.window_end_ms, None);
+    assert_eq!(app_empty.latest_bpm, None);
+    assert!(!app_empty.contact_ok);
+
+    // 6. Fresh live Snapshot (<= 5s old, Streaming) hydrates latest_bpm and contact_ok
+    let app_live = apply_snapshot(
+        streaming_wearables.clone(),
+        ring.clone(),
+        Some(last_ts + 1_000),
+    );
+    assert_eq!(app_live.latest_bpm, Some(66.0));
+    assert!(app_live.contact_ok);
+
+    // 7. Stale Snapshot (> 5s old) even while Connecting/Streaming clears latest_bpm and contact_ok
+    let app_connecting_stale = apply_snapshot(connecting_wearables, ring.clone(), Some(now_20m));
+    assert_eq!(app_connecting_stale.latest_bpm, None);
+    assert!(!app_connecting_stale.contact_ok);
+    let app_streaming_stale = apply_snapshot(streaming_wearables, ring.clone(), Some(now_20m));
+    assert_eq!(app_streaming_stale.latest_bpm, None);
+    assert!(!app_streaming_stale.contact_ok);
+
+    // 8. Disconnected wearable clears latest_bpm and contact_ok even if sample timestamp is 1s old
+    let app_dc_race = apply_snapshot(disconnected_wearables, ring, Some(last_ts + 1_000));
+    assert_eq!(app_dc_race.latest_bpm, None);
+    assert!(!app_dc_race.contact_ok);
+}

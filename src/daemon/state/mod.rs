@@ -27,8 +27,8 @@ use crate::ipc::protocol::{
     AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
     DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus, EpochUpdateEvent,
     ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams,
-    PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, WearablesUpdatedEvent, alert_ids,
-    error_codes,
+    PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, SnapshotEvent,
+    WearablesUpdatedEvent, alert_ids, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -403,19 +403,22 @@ impl DaemonCore {
         (sub_id, queue, status)
     }
 
-    /// Builds a `Snapshot` push envelope with current status, rolling 30-min HR ring buffer, and alerts.
+    /// Builds a `Snapshot` push envelope with current status, rolling 30-min HR ring buffer, alerts, and daemon clock timestamp.
     pub fn make_snapshot_event(&self, status: &DaemonStatus) -> PushEventEnvelope {
+        let server_now_ms = self.clock.now_utc().timestamp_millis();
         let ring: Vec<HrSampleEvent> = {
             let guard = self.inner.lock().expect("daemon state mutex poisoned");
             guard.hr_ring_buffer.iter().cloned().collect()
         };
+        let payload = SnapshotEvent {
+            status: status.clone(),
+            hr_ring_buffer: ring,
+            alerts: status.alerts.clone(),
+            server_now_ms: Some(server_now_ms),
+        };
         self.broker.make_event(
             "Snapshot",
-            json!({
-                "status": status,
-                "hr_ring_buffer": ring,
-                "alerts": status.alerts,
-            }),
+            serde_json::to_value(payload).unwrap_or_else(|_| json!({})),
         )
     }
 

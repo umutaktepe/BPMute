@@ -58,12 +58,14 @@ impl HrSparklineData {
         self.samples.push_back(sample);
     }
 
-    pub fn set_samples(&mut self, samples: Vec<HrSampleEvent>) {
+    pub fn set_samples(&mut self, samples: Vec<HrSampleEvent>, now_ms: Option<i64>) {
         self.samples = samples.into();
         while self.samples.len() > MAX_SPARKLINE_SAMPLES {
             self.samples.pop_front();
         }
-        self.window_end_ms = self.samples.iter().map(|s| s.ts_ms).max();
+        let max_sample_ts = self.samples.iter().map(|s| s.ts_ms).max();
+        self.window_end_ms =
+            max_sample_ts.map(|max_ts| now_ms.map_or(max_ts, |now| max_ts.max(now)));
     }
 
     pub fn advance_tick(&mut self, delta_ms: i64) {
@@ -77,8 +79,17 @@ impl HrSparklineData {
             .or_else(|| self.samples.iter().map(|s| s.ts_ms).max())
     }
 
-    pub fn latest_bpm(&self) -> Option<f64> {
-        self.samples.back().map(|s| s.bpm)
+    /// Returns the most recent HR sample only if it is still live relative to `now_ms`
+    /// (within `DASHBOARD_MAX_GAP_MS`). When `now_ms` is `None` (legacy daemon), falls back
+    /// to returning the last buffered sample if any.
+    pub fn latest_live_sample(&self, now_ms: Option<i64>) -> Option<&HrSampleEvent> {
+        let last = self.samples.back()?;
+        if let Some(now) = now_ms
+            && now.saturating_sub(last.ts_ms) > DASHBOARD_MAX_GAP_MS
+        {
+            return None;
+        }
+        Some(last)
     }
 
     fn clipped_hr_segments(&self) -> Option<(i64, i64, Vec<Vec<TracePoint>>)> {

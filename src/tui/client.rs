@@ -21,7 +21,7 @@ use crate::ipc::protocol::{
     ConfigSnapshotPayload, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollmentUpdateEvent,
     EpochUpdateEvent, GraceTickEvent, HrSampleEvent, MAX_FRAME_BYTES, PROTOCOL_VERSION,
     PushEventEnvelope, RequestEnvelope, ResponseEnvelope, SessionClosedEvent, SessionStartedEvent,
-    WearablesUpdatedEvent,
+    SnapshotEvent, WearablesUpdatedEvent,
 };
 
 pub(super) type PendingMap = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<ResponseEnvelope>>>>>;
@@ -222,28 +222,9 @@ impl TuiIpcBridge {
 async fn handle_incoming_push(push: PushEventEnvelope, event_tx: &mpsc::Sender<TuiEvent>) {
     match push.event.as_str() {
         "Snapshot" => {
-            let status = push
-                .data
-                .get("status")
-                .and_then(|v| serde_json::from_value::<DaemonStatus>(v.clone()).ok());
-            let hr_ring = push
-                .data
-                .get("hr_ring_buffer")
-                .and_then(|v| serde_json::from_value::<Vec<HrSampleEvent>>(v.clone()).ok())
-                .unwrap_or_default();
-            let alerts = push
-                .data
-                .get("alerts")
-                .and_then(|v| serde_json::from_value::<Vec<DaemonAlert>>(v.clone()).ok())
-                .unwrap_or_default();
-
-            if let Some(st) = status {
+            if let Ok(snapshot) = serde_json::from_value::<SnapshotEvent>(push.data) {
                 let _ = event_tx
-                    .send(TuiEvent::ipc(IpcEvent::Snapshot {
-                        status: st,
-                        hr_ring_buffer: hr_ring,
-                        alerts,
-                    }))
+                    .send(TuiEvent::ipc(IpcEvent::Snapshot(Box::new(snapshot))))
                     .await;
             }
         }

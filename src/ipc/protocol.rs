@@ -535,6 +535,18 @@ pub struct DataBackupSqliteParams {
     pub path: String,
 }
 
+/// Control event payload pushed as `Snapshot` immediately after `daemon.subscribe`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotEvent {
+    pub status: DaemonStatus,
+    #[serde(default)]
+    pub hr_ring_buffer: Vec<HrSampleEvent>,
+    #[serde(default)]
+    pub alerts: Vec<DaemonAlert>,
+    #[serde(default)]
+    pub server_now_ms: Option<i64>,
+}
+
 /// Stream event payload pushed as `HrSample` (and buffered for `Snapshot`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HrSampleEvent {

@@ -1,5 +1,5 @@
 use crate::config::PowerAction;
-use crate::ipc::protocol::{DaemonStatus, MonitoringState, PairingPrompt};
+use crate::ipc::protocol::{DaemonStatus, MonitoringState, PairingPrompt, SnapshotEvent};
 use crate::tui::app::{GraceState, ModalState, OpFeedback, PairingPromptModalState, TuiApp};
 use crate::tui::event::{IpcEvent, TuiCommand};
 
@@ -53,15 +53,34 @@ impl TuiApp {
             IpcEvent::Disconnected => {
                 self.handle_disconnected();
             }
-            IpcEvent::Snapshot {
-                status,
-                hr_ring_buffer,
-                alerts,
-            } => {
+            IpcEvent::Snapshot(snapshot) => {
+                let SnapshotEvent {
+                    status,
+                    hr_ring_buffer,
+                    alerts,
+                    server_now_ms,
+                } = *snapshot;
                 self.apply_daemon_status(status);
                 self.alerts = alerts;
-                self.sparkline_data.set_samples(hr_ring_buffer);
-                self.latest_bpm = self.sparkline_data.latest_bpm();
+                self.sparkline_data
+                    .set_samples(hr_ring_buffer, server_now_ms);
+                let wearable_disconnected = self.active_wearable().is_some_and(|w| {
+                    matches!(
+                        w.status,
+                        crate::sleep_engine::StreamStatus::Disconnected
+                            | crate::sleep_engine::StreamStatus::SignalLost
+                    )
+                });
+                if !wearable_disconnected
+                    && let Some(sample) = self.sparkline_data.latest_live_sample(server_now_ms)
+                {
+                    self.latest_bpm = Some(sample.bpm);
+                    self.contact_ok =
+                        sample.contact_status != crate::sleep_engine::ContactStatus::NoContact;
+                } else {
+                    self.latest_bpm = None;
+                    self.contact_ok = false;
+                }
             }
             IpcEvent::HrSample(sample) => {
                 self.latest_bpm = Some(sample.bpm);

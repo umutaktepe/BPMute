@@ -9,5 +9,5 @@ pub use protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
     OfflineStatus, PairingPrompt, PauseMode, SessionClosedEvent, SessionStartedEvent,
-    WearablesUpdatedEvent, alert_ids,
+    SnapshotEvent, WearablesUpdatedEvent, alert_ids,
 };

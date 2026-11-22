@@ -5,7 +5,7 @@ use crate::config::{ClockTime, Config, ConfigPatch};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
-    PauseParams, SessionStartedEvent,
+    PauseParams, SessionStartedEvent, SnapshotEvent,
 };
 use crate::replay::TraceFormat;
 use crate::storage::{SessionFullDetail, SessionListEntry, StorageStats};
@@ -34,11 +34,7 @@ impl TuiEvent {
 pub enum IpcEvent {
     Connected(DaemonStatus),
     Disconnected,
-    Snapshot {
-        status: DaemonStatus,
-        hr_ring_buffer: Vec<HrSampleEvent>,
-        alerts: Vec<DaemonAlert>,
-    },
+    Snapshot(Box<SnapshotEvent>),
     HrSample(HrSampleEvent),
     GraceTick(GraceTickEvent),
     EpochUpdate(EpochUpdateEvent),
