@@ -601,6 +601,12 @@ pub struct CalibrationUpdatedEvent {
     pub calibration: CalibrationState,
 }
 
+/// Control event payload pushed as `AlertChanged` when active daemon alerts change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlertChangedEvent {
+    pub alerts: Vec<DaemonAlert>,
+}
+
 /// Control event payload pushed as `WearablesUpdated` when wearable status or allowlist changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WearablesUpdatedEvent {

@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
 use tokio::sync::{mpsc, watch};
 
 use crate::actions::traits::BoxFuture;
@@ -552,8 +551,7 @@ impl DaemonCore {
             changed.then(|| guard.alerts.clone())
         };
         if let Some(alerts) = alerts_opt {
-            self.broker
-                .publish_control("AlertChanged", json!({ "alerts": alerts }));
+            self.publish_alerts_changed(alerts);
         }
     }
 

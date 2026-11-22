@@ -24,10 +24,10 @@ use crate::config::{
 use crate::daemon::EngineControlEvent;
 use crate::idle::{IdleBackendKind, IdleProbe};
 use crate::ipc::protocol::{
-    AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
-    DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus, EpochUpdateEvent,
-    ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams,
-    PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, SnapshotEvent,
+    AlertChangedEvent, AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert,
+    DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus,
+    EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode,
+    PauseParams, PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, SnapshotEvent,
     WearablesUpdatedEvent, alert_ids, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
@@ -490,8 +490,7 @@ impl DaemonCore {
         let _ = self.calibration_tx.send(new_cal.clone());
 
         if let Some(alerts) = alerts_opt {
-            self.broker
-                .publish_control("AlertChanged", json!({ "alerts": alerts }));
+            self.publish_alerts_changed(alerts);
         }
         if let Ok(val) = serde_json::to_value(CalibrationUpdatedEvent {
             calibration: new_cal,
@@ -670,8 +669,7 @@ impl DaemonCore {
                 };
 
                 if let Some(alerts) = alerts_opt {
-                    self.broker
-                        .publish_control("AlertChanged", json!({ "alerts": alerts }));
+                    self.publish_alerts_changed(alerts);
                 }
 
                 tracing::error!(
@@ -732,8 +730,7 @@ impl DaemonCore {
         });
 
         if let Some(alerts) = alerts_changed {
-            self.broker
-                .publish_control("AlertChanged", json!({ "alerts": alerts }));
+            self.publish_alerts_changed(alerts);
         }
         if let Ok(val) = serde_json::to_value(&snapshot) {
             self.broker.publish_control("ConfigUpdated", val);
@@ -749,6 +746,12 @@ impl DaemonCore {
     fn publish_state_changed(&self, status: &DaemonStatus) {
         if let Ok(val) = serde_json::to_value(status) {
             self.broker.publish_control("StateChanged", val);
+        }
+    }
+
+    pub(super) fn publish_alerts_changed(&self, alerts: Vec<DaemonAlert>) {
+        if let Ok(val) = serde_json::to_value(AlertChangedEvent { alerts }) {
+            self.broker.publish_control("AlertChanged", val);
         }
     }
 

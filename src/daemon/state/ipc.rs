@@ -669,8 +669,7 @@ impl DaemonCore {
                     (guard.alerts.len() != before, guard.alerts.clone())
                 };
                 if changed {
-                    self.broker
-                        .publish_control("AlertChanged", json!({ "alerts": alerts }));
+                    self.publish_alerts_changed(alerts);
                 }
                 Ok(json!({ "dismissed": changed }))
             }

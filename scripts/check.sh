@@ -92,6 +92,27 @@ for path in files:
             f"error: raw JSON string-key indexing forbidden in {path}; deserialize typed response structs from src/ipc/protocol.rs"
         )
 
+tui_client = "\n".join(
+    l.split("//", 1)[0] for l in open("src/tui/client.rs", encoding="utf-8").read().splitlines()
+)
+if re.search(r'push\.data\.get\(\s*"', tui_client):
+    sys.exit(
+        "error: raw push.data.get(...) forbidden in src/tui/client.rs; deserialize typed event structs from src/ipc/protocol.rs"
+    )
+
+for path in sorted(glob.glob("src/daemon/state/**/*.rs", recursive=True)):
+    stripped = "\n".join(
+        l.split("//", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()
+    )
+    if re.search(
+        r'\b(?:make_event|publish_control|publish_stream)\(\s*"[^"]+"\s*,\s*json!\(\s*\{',
+        stripped,
+        flags=re.S,
+    ):
+        sys.exit(
+            f"error: untyped json!({{ ... }}) push event payload forbidden in {path}; serialize a typed struct from src/ipc/protocol.rs"
+        )
+
 for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
     content = open(path, encoding="utf-8").read()
     has_vacuum = bool(re.search(r'\bVACUUM;|PRAGMA\s+incremental_vacuum\b', content))

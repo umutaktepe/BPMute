@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
@@ -567,4 +569,54 @@ impl WearableSource for LiveStreamTestSource {
         });
         out_rx
     }
+}
+
+pub fn spawn_tui_bridge_session(
+    socket_path: &std::path::Path,
+) -> (
+    TuiApp,
+    mpsc::Receiver<TuiEvent>,
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (event_tx, event_rx) = mpsc::channel(256);
+    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bridge = TuiIpcBridge::new(socket_path.to_path_buf(), event_tx, cmd_rx, shutdown_rx);
+    let bridge_task = tokio::spawn(bridge.run());
+    (
+        TuiApp::new(false, false, false),
+        event_rx,
+        shutdown_tx,
+        bridge_task,
+    )
+}
+
+pub fn render_dashboard_braille_cols(
+    terminal: &mut Terminal<TestBackend>,
+    app: &mut TuiApp,
+    top_lbl: &str,
+    bot_lbl: &str,
+) -> (Vec<u16>, u16, u16, String) {
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let (start_col, _) = find_text_coords(buf, "-30m").unwrap();
+    let (now_col, _) = find_text_coords(buf, "Now").unwrap();
+    let chart_right = now_col + 2;
+    let (_, top_row) = find_text_coords(buf, top_lbl).unwrap();
+    let (_, bot_row) = find_text_coords(buf, bot_lbl).unwrap();
+    let cols: Vec<u16> = (start_col..=chart_right)
+        .filter(|&x| {
+            (top_row..=bot_row).any(|y| {
+                buf[(x, y)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .is_some_and(is_non_blank_braille)
+            })
+        })
+        .collect();
+    (cols, start_col, chart_right, buffer_to_string(buf))
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
@@ -15,14 +15,19 @@ use super::client_commands::{
     refresh_storage_stats, refresh_wearables,
 };
 use super::event::{IpcEvent, TuiCommand, TuiEvent};
-use crate::calibration::CalibrationState;
 use crate::ipc::framing::{read_bounded_line, write_ndjson_line};
 use crate::ipc::protocol::{
-    ConfigSnapshotPayload, DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollmentUpdateEvent,
-    EpochUpdateEvent, GraceTickEvent, HrSampleEvent, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    PushEventEnvelope, RequestEnvelope, ResponseEnvelope, SessionClosedEvent, SessionStartedEvent,
-    SnapshotEvent, WearablesUpdatedEvent,
+    AlertChangedEvent, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonStatus,
+    DiscoveredWearable, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION, PushEventEnvelope, RequestEnvelope, ResponseEnvelope,
+    SessionClosedEvent, SessionStartedEvent, SnapshotEvent, WearablesUpdatedEvent,
 };
+
+#[derive(Deserialize)]
+struct LegacyEnrollmentDiscovered {
+    #[serde(alias = "devices")]
+    wearables: Vec<DiscoveredWearable>,
+}
 
 pub(super) type PendingMap = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<ResponseEnvelope>>>>>;
 
@@ -271,20 +276,16 @@ async fn handle_incoming_push(push: PushEventEnvelope, event_tx: &mpsc::Sender<T
             }
         }
         "AlertChanged" => {
-            if let Some(alerts_val) = push.data.get("alerts")
-                && let Ok(alerts) = serde_json::from_value::<Vec<DaemonAlert>>(alerts_val.clone())
-            {
+            if let Ok(ev) = serde_json::from_value::<AlertChangedEvent>(push.data) {
                 let _ = event_tx
-                    .send(TuiEvent::ipc(IpcEvent::AlertChanged(alerts)))
+                    .send(TuiEvent::ipc(IpcEvent::AlertChanged(ev.alerts)))
                     .await;
             }
         }
         "CalibrationUpdated" => {
-            if let Some(cal_val) = push.data.get("calibration")
-                && let Ok(cal) = serde_json::from_value::<CalibrationState>(cal_val.clone())
-            {
+            if let Ok(ev) = serde_json::from_value::<CalibrationUpdatedEvent>(push.data) {
                 let _ = event_tx
-                    .send(TuiEvent::ipc(IpcEvent::CalibrationUpdated(cal)))
+                    .send(TuiEvent::ipc(IpcEvent::CalibrationUpdated(ev.calibration)))
                     .await;
             }
         }
@@ -307,15 +308,13 @@ async fn handle_incoming_push(push: PushEventEnvelope, event_tx: &mpsc::Sender<T
                 let _ = event_tx
                     .send(TuiEvent::ipc(IpcEvent::EnrollmentUpdate(update)))
                     .await;
-            } else if let Some(devices_val) = push
-                .data
-                .get("wearables")
-                .or_else(|| push.data.get("devices"))
-                && let Ok(devices) =
-                    serde_json::from_value::<Vec<DiscoveredWearable>>(devices_val.clone())
+            } else if let Ok(legacy) =
+                serde_json::from_value::<LegacyEnrollmentDiscovered>(push.data)
             {
                 let _ = event_tx
-                    .send(TuiEvent::ipc(IpcEvent::EnrollmentDiscovered(devices)))
+                    .send(TuiEvent::ipc(IpcEvent::EnrollmentDiscovered(
+                        legacy.wearables,
+                    )))
                     .await;
             }
         }

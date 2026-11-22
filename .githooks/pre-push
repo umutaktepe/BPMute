@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
+if [ -n "$(git -C "$repo_root" status --porcelain)" ]; then
+  echo "warning: working tree has uncommitted changes; check.sh validates the working tree rather than the pushed commit in isolation" >&2
+fi
 exec "$repo_root/scripts/check.sh"
