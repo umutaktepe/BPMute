@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use common::daemon::TestWearableSource;
+use common::daemon::{TestWearableSource, send_trace_slice as send_shared_trace_slice};
 use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -408,35 +408,7 @@ async fn send_trace_slice(
     base_ts: i64,
 ) {
     let desc = default_test_wearable();
-    for ev in events {
-        match ev {
-            EngineEvent::StreamState(st) => {
-                let mut shifted = *st;
-                shifted.ts_ms += base_ts;
-                wearable_tx
-                    .send(WearableEvent::StreamState {
-                        wearable: desc.clone(),
-                        state: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::HrPacket(pkt) => {
-                let mut shifted = pkt.clone();
-                shifted.ts_ms += base_ts;
-                wearable_tx
-                    .send(WearableEvent::HrPacket {
-                        wearable: desc.clone(),
-                        packet: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::StreamDisconnected(_)
-            | EngineEvent::DesktopActivity(_)
-            | EngineEvent::GraceOutcome(_) => {}
-        }
-    }
+    send_shared_trace_slice(wearable_tx, &desc, events, base_ts).await;
 }
 
 async fn feed_trace_until_confirmed(

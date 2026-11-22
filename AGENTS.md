@@ -22,4 +22,4 @@ Runtime actor ownership (`DaemonCore`, `MonitoringContext`, `GraceCoordinator`, 
 
 ## Verification
 
-Run targeted iterative tests with `./scripts/test.sh --test <target> [filter]` (compiles first, then enforces 30 s execution timeout and hermetic D-Bus isolation), fast format/static/clippy checks with `./scripts/check.sh --lint` (or `--fix`), and `./scripts/check.sh` before finishing any change.
+Run targeted iterative tests with `./scripts/test.sh --test <target> [filter]` (compiles first, then enforces 30 s execution timeout and hermetic D-Bus isolation), fast format/static/clippy checks with `./scripts/check.sh --lint` (or `--fix`), and `./scripts/check.sh` (or `./scripts/check.sh --staged` when unrelated dirty files remain in the working tree) before finishing any change.

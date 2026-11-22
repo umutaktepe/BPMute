@@ -23,6 +23,7 @@ use bpmute::storage::{
 };
 use chrono::{Local, TimeZone, Utc};
 use clap::Parser;
+use common::daemon::send_trace_slice;
 use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -394,35 +395,7 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
 
     let base_ts = start_utc.timestamp_millis();
     let split_idx = trace.bpm_rr.len() * 2 / 3;
-    for ev in &trace.bpm_rr[..split_idx] {
-        match ev {
-            EngineEvent::StreamState(st) => {
-                let mut shifted = *st;
-                shifted.ts_ms += base_ts;
-                wearable_tx
-                    .send(WearableEvent::StreamState {
-                        wearable: desc.clone(),
-                        state: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::HrPacket(pkt) => {
-                let mut shifted = pkt.clone();
-                shifted.ts_ms += base_ts;
-                wearable_tx
-                    .send(WearableEvent::HrPacket {
-                        wearable: desc.clone(),
-                        packet: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::StreamDisconnected(_)
-            | EngineEvent::DesktopActivity(_)
-            | EngineEvent::GraceOutcome(_) => {}
-        }
-    }
+    send_trace_slice(&wearable_tx, &desc, &trace.bpm_rr[..split_idx], base_ts).await;
 
     let mut saw_hr = false;
     let mut saw_epoch = false;
@@ -793,35 +766,7 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
     };
 
     let base_a = start_utc.timestamp_millis();
-    for ev in &trace_a.bpm_rr {
-        match ev {
-            EngineEvent::StreamState(st) => {
-                let mut shifted = *st;
-                shifted.ts_ms += base_a;
-                wearable_tx
-                    .send(WearableEvent::StreamState {
-                        wearable: desc.clone(),
-                        state: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::HrPacket(pkt) => {
-                let mut shifted = pkt.clone();
-                shifted.ts_ms += base_a;
-                wearable_tx
-                    .send(WearableEvent::HrPacket {
-                        wearable: desc.clone(),
-                        packet: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::StreamDisconnected(_)
-            | EngineEvent::DesktopActivity(_)
-            | EngineEvent::GraceOutcome(_) => {}
-        }
-    }
+    send_trace_slice(&wearable_tx, &desc, &trace_a.bpm_rr, base_a).await;
     // Insert > 15 min gap to close Session A while keeping WearableSource open
     let session_b_start = base_a + 4_200_000; // +70 min (now ~00:25 local next day)
     wearable_tx
@@ -868,35 +813,7 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
             },
         ],
     );
-    for ev in &trace_b.bpm_rr {
-        match ev {
-            EngineEvent::StreamState(st) => {
-                let mut shifted = *st;
-                shifted.ts_ms += session_b_start;
-                wearable_tx
-                    .send(WearableEvent::StreamState {
-                        wearable: desc.clone(),
-                        state: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::HrPacket(pkt) => {
-                let mut shifted = pkt.clone();
-                shifted.ts_ms += session_b_start;
-                wearable_tx
-                    .send(WearableEvent::HrPacket {
-                        wearable: desc.clone(),
-                        packet: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::StreamDisconnected(_)
-            | EngineEvent::DesktopActivity(_)
-            | EngineEvent::GraceOutcome(_) => {}
-        }
-    }
+    send_trace_slice(&wearable_tx, &desc, &trace_b.bpm_rr, session_b_start).await;
     drop(wearable_tx);
 
     let mut closed_ids = Vec::new();

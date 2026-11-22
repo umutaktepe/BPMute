@@ -585,35 +585,7 @@ async fn feed_until_confirmed(
         ],
     );
     let split_idx = trace.bpm_rr.len() * 2 / 3;
-    for ev in &trace.bpm_rr[..split_idx] {
-        match ev {
-            EngineEvent::StreamState(st) => {
-                let mut shifted = *st;
-                shifted.ts_ms += base_ts;
-                wearable_tx
-                    .send(WearableEvent::StreamState {
-                        wearable: desc.clone(),
-                        state: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::HrPacket(pkt) => {
-                let mut shifted = pkt.clone();
-                shifted.ts_ms += base_ts;
-                wearable_tx
-                    .send(WearableEvent::HrPacket {
-                        wearable: desc.clone(),
-                        packet: shifted,
-                    })
-                    .await
-                    .unwrap();
-            }
-            EngineEvent::StreamDisconnected(_)
-            | EngineEvent::DesktopActivity(_)
-            | EngineEvent::GraceOutcome(_) => {}
-        }
-    }
+    send_trace_slice(wearable_tx, &desc, &trace.bpm_rr[..split_idx], base_ts).await;
 
     for _ in 0..10_000 {
         let ev = client.next_event().await.unwrap();

@@ -27,8 +27,8 @@ use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{
-    AlertSeverity, DaemonAlert, DaemonStatus, DiscoveredWearable, HrSampleEvent, MonitoringState,
-    PauseMode, PauseParams, alert_ids,
+    AlertSeverity, DaemonAlert, DiscoveredWearable, HrSampleEvent, MonitoringState, PauseMode,
+    PauseParams, alert_ids,
 };
 use bpmute::paths::MapEnv;
 use bpmute::sleep_engine::{
@@ -71,31 +71,15 @@ async fn test_cli_tui_flags_are_scoped_and_80x24_baseline_renders_cleanly() {
     app.dry_run = true;
     app.latest_bpm = Some(64.0);
     app.latest_p_sleep = Some(0.24);
-    app.daemon_status = Some(bpmute::ipc::protocol::DaemonStatus {
-        v: 1,
-        daemon_running: true,
-        version: "0.1.0".into(),
-        pid: 1,
-        uptime_sec: 10,
-        monitoring_state: MonitoringState::Monitoring,
-        armed: true,
-        paused: false,
-        paused_until: None,
-        pause_mode: None,
-        dry_run: true,
-        schedule: ScheduleConfig {
-            active_hours_enabled: true,
-            ..ScheduleConfig::default()
-        },
-        config_path: String::new(),
-        config_loaded_from_file: false,
-        socket_path: String::new(),
-        log_biometrics: false,
-        alerts: Vec::new(),
-        idle_backend: Some("ext-idle-notify".into()),
-        playing_players_count: Some(1),
-        session_close_deadline_ms: None,
+    let mut status = make_daemon_status(ScheduleConfig {
+        active_hours_enabled: true,
+        ..ScheduleConfig::default()
     });
+    status.pid = 1;
+    status.dry_run = true;
+    status.idle_backend = Some("ext-idle-notify".into());
+    status.playing_players_count = Some(1);
+    app.daemon_status = Some(status);
     app.enrolled_wearables = vec![make_wearable(
         "w-1",
         "AA:BB:CC:11:22:33",
@@ -1181,28 +1165,12 @@ custom_command = ["notify-send", "sleepy"]
     );
 
     // 6. Test Live Reconnect
-    app.handle_event(TuiEvent::Ipc(Box::new(IpcEvent::Connected(DaemonStatus {
-        v: 1,
-        daemon_running: true,
-        version: "0.1.0".into(),
-        pid: 1,
-        uptime_sec: 10,
-        monitoring_state: MonitoringState::Idle,
-        armed: true,
-        paused: false,
-        paused_until: None,
-        pause_mode: None,
-        dry_run: false,
-        schedule: ScheduleConfig::default(),
-        config_path: String::new(),
-        config_loaded_from_file: false,
-        socket_path: String::new(),
-        log_biometrics: false,
-        alerts: Vec::new(),
-        idle_backend: Some("test-idle".into()),
-        playing_players_count: Some(0),
-        session_close_deadline_ms: None,
-    }))));
+    let mut reconnect_status = make_daemon_status(ScheduleConfig::default());
+    reconnect_status.pid = 1;
+    reconnect_status.monitoring_state = MonitoringState::Idle;
+    app.handle_event(TuiEvent::Ipc(Box::new(IpcEvent::Connected(
+        reconnect_status,
+    ))));
     assert!(app.daemon_connected);
 
     // After reconnect, mutating keys work immediately
@@ -2482,28 +2450,11 @@ fn test_mouse_dashboard_system_card_diagnostics_and_readonly_cards() {
         Some(88),
         None,
     )];
-    app.daemon_status = Some(DaemonStatus {
-        v: 1,
-        daemon_running: true,
-        version: "0.1.0".into(),
-        pid: 1,
-        uptime_sec: 10,
-        monitoring_state: MonitoringState::Monitoring,
-        armed: true,
-        paused: false,
-        paused_until: None,
-        pause_mode: None,
-        dry_run: false,
-        schedule: ScheduleConfig::default(),
-        config_path: String::new(),
-        config_loaded_from_file: false,
-        socket_path: String::new(),
-        log_biometrics: false,
-        alerts: Vec::new(),
-        idle_backend: Some("ext-idle-notify".into()),
-        playing_players_count: Some(1),
-        session_close_deadline_ms: None,
-    });
+    let mut status = make_daemon_status(ScheduleConfig::default());
+    status.pid = 1;
+    status.idle_backend = Some("ext-idle-notify".into());
+    status.playing_players_count = Some(1);
+    app.daemon_status = Some(status);
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal

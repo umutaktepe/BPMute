@@ -8,16 +8,32 @@ unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY
 
 fix_fmt=0
 lint_only=0
+staged_only=0
 for arg in "$@"; do
   case "$arg" in
     --fix) fix_fmt=1 ;;
     --lint) lint_only=1 ;;
+    --staged) staged_only=1 ;;
     *)
-      echo "usage: $0 [--fix] [--lint]" >&2
+      echo "usage: $0 [--fix] [--lint] [--staged]" >&2
       exit 2
       ;;
   esac
 done
+
+if [ "$fix_fmt" -eq 1 ] && [ "$staged_only" -eq 1 ]; then
+  echo "error: --fix cannot be combined with --staged" >&2
+  exit 2
+fi
+
+if [ "$staged_only" -eq 1 ]; then
+  repo_root="$(git rev-parse --show-toplevel)"
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  git -C "$repo_root" checkout-index -a --prefix="$tmp_dir/"
+  cd "$tmp_dir"
+  export CARGO_TARGET_DIR="$repo_root/target/staged"
+fi
 
 if [ "$fix_fmt" -eq 1 ]; then
   cargo fmt
@@ -38,6 +54,11 @@ done < <(find ./src -name '*.rs' -print0)
 
 if grep -Eq 'DaemonOptions\s*\{' tests/*.rs; then
   echo "error: direct DaemonOptions struct literal forbidden in tests; use DaemonOptions::for_testing(...) (docs/agents/testing.md:27)" >&2
+  exit 1
+fi
+
+if grep -Eq 'DaemonStatus\s*\{' tests/*.rs; then
+  echo "error: direct DaemonStatus struct literal forbidden in tests; use tests/common/tui.rs::make_daemon_status(...) (docs/agents/testing.md)" >&2
   exit 1
 fi
 
@@ -224,6 +245,7 @@ if [ "$lint_only" -eq 1 ]; then
   exit 0
 fi
 
+cargo test --no-run
 timeout 60 cargo test
 timeout 5 cargo test --test sleep_engine
 timeout 5 cargo test --test calibration_ledger
