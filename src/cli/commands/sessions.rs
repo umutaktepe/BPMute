@@ -133,6 +133,21 @@ pub(crate) fn run_replay<WOut: Write, WErr: Write>(
     ExitCode::Success
 }
 
+fn write_session_metrics<W: Write>(
+    stdout: &mut W,
+    session: &crate::calibration::SessionLedgerRecord,
+) {
+    let _ = writeln!(
+        stdout,
+        "  Metrics: warmup_mu={:?}, sleep_mu={:?}, delta_hr={:?}, post_trigger_sleep_sec={}, anomalous={}",
+        session.warmup_mu_hr,
+        session.sleep_mu_hr,
+        session.delta_hr_onset,
+        session.post_trigger_sleep_sec,
+        session.auto_anomalous
+    );
+}
+
 pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
     action: SessionsCommand,
     paths: &ResolvedPaths,
@@ -264,15 +279,7 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
                 detail.session.end_ts_ms,
                 detail.session.end_reason.as_str()
             );
-            let _ = writeln!(
-                stdout,
-                "  Metrics: warmup_mu={:?}, sleep_mu={:?}, delta_hr={:?}, post_trigger_sleep_sec={}, anomalous={}",
-                detail.session.warmup_mu_hr,
-                detail.session.sleep_mu_hr,
-                detail.session.delta_hr_onset,
-                detail.session.post_trigger_sleep_sec,
-                detail.session.auto_anomalous
-            );
+            write_session_metrics(stdout, &detail.session);
             let _ = writeln!(
                 stdout,
                 "  Data: epochs={}, raw_samples={} (retained={})",
@@ -506,6 +513,51 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
                 }
                 Err(code) => code,
             }
+        }
+        SessionsCommand::End { json } => {
+            let mut client = match connect_online_or_offline(paths, stderr).await {
+                Ok(OnlineOrOffline::Online(client)) => client,
+                Ok(OnlineOrOffline::Offline) => {
+                    let _ = writeln!(
+                        stderr,
+                        "error: daemon is offline; start daemon or ensure socket is reachable"
+                    );
+                    return ExitCode::DaemonOffline;
+                }
+                Err(code) => return code,
+            };
+
+            let detail: SessionFullDetail =
+                match ipc_request_typed(&mut client, "session.end", serde_json::json!({}), stderr)
+                    .await
+                {
+                    Ok(detail) => detail,
+                    Err(code) => return code,
+                };
+
+            if json {
+                return write_json_line(&detail, stdout, stderr);
+            }
+
+            let wearable_label = format_wearable_label(
+                detail.wearable.alias.as_deref(),
+                &detail.wearable.mac_masked,
+                false,
+            );
+            let _ = writeln!(
+                stdout,
+                "Ended Monitoring Session {} (reason: {})",
+                detail.session.id,
+                detail.session.end_reason.as_str()
+            );
+            let _ = writeln!(stdout, "  Wearable: {wearable_label}");
+            let _ = writeln!(
+                stdout,
+                "  Window: {}..{} ms",
+                detail.session.start_ts_ms, detail.session.end_ts_ms
+            );
+            write_session_metrics(stdout, &detail.session);
+            ExitCode::Success
         }
     }
 }

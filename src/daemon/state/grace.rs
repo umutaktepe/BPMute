@@ -498,11 +498,18 @@ impl DaemonCore {
                                 | GraceResult::Snoozed { .. }
                                 | GraceResult::AbortedNoPenalty
                         ) {
-                            core.set_detector_phase(
-                                DetectorState::Monitoring,
-                                Some(session_id.clone()),
-                                Some(wearable_id.clone()),
-                            );
+                            let is_still_active = {
+                                let guard = core.inner.lock().expect("daemon state mutex poisoned");
+                                guard.active_session_id.as_deref() == Some(&session_id)
+                                    && guard.detector_state != DetectorState::Idle
+                            };
+                            if is_still_active {
+                                core.set_detector_phase(
+                                    DetectorState::Monitoring,
+                                    Some(session_id.clone()),
+                                    Some(wearable_id.clone()),
+                                );
+                            }
                         }
                         if !core.is_dry_run() {
                             core.deliver_grace_outcome(gr).await;

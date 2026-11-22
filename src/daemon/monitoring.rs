@@ -8,15 +8,17 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::{DetectionConfig, RawSamplesRetention};
 use crate::daemon::EngineControlEvent;
-use crate::daemon::state::DaemonCore;
+use crate::daemon::state::{DaemonCore, ipc_err, storage_to_ipc_err};
 use crate::daemon::wearable::{WearableDescriptor, WearableEvent};
-use crate::ipc::protocol::{EpochUpdateEvent, HrSampleEvent, SessionStartedEvent};
+use crate::ipc::protocol::{
+    EpochUpdateEvent, ErrorPayload, HrSampleEvent, SessionStartedEvent, error_codes,
+};
 use crate::logging::BiometricLogContext;
 use crate::sleep_engine::{
     DetectorState, EngineConfig, EngineEvent, EngineOutput, GraceAbortReason, HrPacket,
-    SessionEndReason, SleepEngine, StreamDisconnected, StreamStatus,
+    ManualCloseError, SessionEndReason, SleepEngine, StreamDisconnected, StreamStatus,
 };
-use crate::storage::{CloseSessionRequest, OpenSessionRequest};
+use crate::storage::{CloseSessionRequest, OpenSessionRequest, SessionFullDetail, StorageError};
 
 struct MonitoringContext {
     core: Arc<DaemonCore>,
@@ -221,6 +223,46 @@ impl MonitoringContext {
                 self.abort_active_session(wipe_all);
                 let _ = reply.send(());
             }
+            EngineControlEvent::ManualCloseSession { reply } => {
+                let res = self.manual_close_active_session().await;
+                let _ = reply.send(res);
+            }
+        }
+    }
+
+    async fn manual_close_active_session(&mut self) -> Result<SessionFullDetail, ErrorPayload> {
+        if self.active_session_id.is_none() {
+            return Err(ipc_err(
+                error_codes::PRECONDITION_FAILED,
+                "no active monitoring session to close",
+            ));
+        }
+        let wearable_id = self.active_wearable_id.clone().unwrap_or_default();
+        let outputs = match self.engine.manual_close_session() {
+            Ok(outputs) => outputs,
+            Err(ManualCloseError::NoActiveSession) => {
+                return Err(ipc_err(
+                    error_codes::PRECONDITION_FAILED,
+                    "no active monitoring session to close",
+                ));
+            }
+            Err(ManualCloseError::StreamingActive) => {
+                return Err(ipc_err(
+                    error_codes::PRECONDITION_FAILED,
+                    "cannot manually close session while wearable is streaming; disconnect wearable or stop heart rate broadcast first",
+                ));
+            }
+        };
+
+        self.core.signal_arousal_abort().await;
+
+        match self.process_outputs(&wearable_id, outputs).await {
+            Some(Ok(detail)) => Ok(detail),
+            Some(Err(err)) => Err(storage_to_ipc_err(err)),
+            None => Err(ipc_err(
+                error_codes::INTERNAL_ERROR,
+                "session closure did not produce detail",
+            )),
         }
     }
 
@@ -281,7 +323,12 @@ impl MonitoringContext {
         self.process_outputs(&wearable_id, outputs).await;
     }
 
-    async fn process_outputs(&mut self, wearable_id: &str, outputs: Vec<EngineOutput>) {
+    async fn process_outputs(
+        &mut self,
+        wearable_id: &str,
+        outputs: Vec<EngineOutput>,
+    ) -> Option<Result<SessionFullDetail, StorageError>> {
+        let mut closed_result = None;
         for output in outputs {
             match output {
                 EngineOutput::SessionStarted { ts_ms, .. } => {
@@ -386,10 +433,12 @@ impl MonitoringContext {
                             Ok((detail, cal_state)) => {
                                 let floor = cal_state.wearable_floor(wearable_id);
                                 self.engine.update_calibration(cal_state.to_priors(), floor);
-                                self.core.on_session_closed(detail, cal_state);
+                                self.core.on_session_closed(detail.clone(), cal_state);
+                                closed_result = Some(Ok(detail));
                             }
                             Err(err) => {
                                 tracing::error!(error = %err, "failed to close session and recompute calibration");
+                                closed_result = Some(Err(err));
                             }
                         }
                     }
@@ -412,6 +461,7 @@ impl MonitoringContext {
         }
         self.core
             .set_session_close_deadline(self.engine.gap_deadline_ms());
+        closed_result
     }
 }
 

@@ -639,3 +639,132 @@ async fn status_cli_displays_close_countdown_and_json_deadline() {
 
     daemon.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_sessions_end_cli_gap_gated_and_preconditions() {
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let env = MapEnv::new()
+        .with(
+            "XDG_CONFIG_HOME",
+            temp.path().join("cfg").display().to_string(),
+        )
+        .with(
+            "XDG_DATA_HOME",
+            temp.path().join("data").display().to_string(),
+        )
+        .with(
+            "XDG_RUNTIME_DIR",
+            temp.path().join("run").display().to_string(),
+        );
+    let paths = ResolvedPaths::resolve(None, None, None, &env).unwrap();
+
+    // 1. Offline daemon -> ExitCode::DaemonOffline (3)
+    let (code_offline, _, err_offline) = run_inproc_cli(&["bpmute", "sessions", "end"], &env).await;
+    assert_eq!(code_offline, ExitCode::DaemonOffline);
+    assert!(err_offline.contains("offline"));
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 22, 22, 0, 0).unwrap();
+    let t0 = start_utc.timestamp_millis();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (source, wearable_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env.clone()), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let wearable = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:43".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("CLI End Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", serde_json::json!({}))
+        .await
+        .unwrap();
+    let _snap = sub.next_event().await.unwrap();
+
+    // 2. Idle daemon -> ExitCode::PreconditionConflict (4)
+    let (code_idle, _, err_idle) = run_inproc_cli(&["bpmute", "sessions", "end"], &env).await;
+    assert_eq!(code_idle, ExitCode::PreconditionConflict);
+    assert!(err_idle.contains("no active monitoring session to close"));
+
+    let (code_idle_json, _, _) =
+        run_inproc_cli(&["bpmute", "sessions", "end", "--json"], &env).await;
+    assert_eq!(code_idle_json, ExitCode::PreconditionConflict);
+
+    // 3. Start Streaming -> session opens
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: t0 + 1_000,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    let session_id = loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+
+    // 4. Streaming active -> ExitCode::PreconditionConflict (4)
+    let (code_streaming, _, err_streaming) =
+        run_inproc_cli(&["bpmute", "sessions", "end"], &env).await;
+    assert_eq!(code_streaming, ExitCode::PreconditionConflict);
+    assert!(err_streaming.contains("streaming"));
+
+    // 5. Disconnect wearable at t_dc (start gap)
+    let t_dc = t0 + 10_000;
+    tokio::time::advance(Duration::from_secs(9)).await;
+    wearable_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t_dc,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
+            break;
+        }
+    }
+
+    // 6. Manual close via CLI with --json -> ExitCode::Success (0)
+    let (code_close, out_close, err_close) =
+        run_inproc_cli(&["bpmute", "sessions", "end", "--json"], &env).await;
+    assert_eq!(code_close, ExitCode::Success, "stderr: {err_close}");
+    let close_json: Value = serde_json::from_str(out_close.trim()).unwrap();
+    assert_eq!(close_json["session"]["id"], session_id);
+    assert_eq!(close_json["session"]["end_reason"], "manual_close");
+    assert_eq!(close_json["session"]["end_ts_ms"], t_dc);
+
+    // 7. Verify bpmute sessions show renders manual_close
+    let (code_show, out_show, _) =
+        run_inproc_cli(&["bpmute", "sessions", "show", &session_id], &env).await;
+    assert_eq!(code_show, ExitCode::Success);
+    assert!(out_show.contains("manual_close"));
+
+    // 8. Subsequent call on Idle -> ExitCode::PreconditionConflict (4)
+    let (code_after, _, _) = run_inproc_cli(&["bpmute", "sessions", "end"], &env).await;
+    assert_eq!(code_after, ExitCode::PreconditionConflict);
+
+    daemon.shutdown().await;
+}

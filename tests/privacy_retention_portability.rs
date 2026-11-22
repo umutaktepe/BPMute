@@ -1654,3 +1654,132 @@ async fn test_persistence_worker_shutdown_truncates_wal() {
         "PersistenceWorker shutdown must truncate WAL"
     );
 }
+
+#[tokio::test]
+async fn test_manual_close_session_end_reason_persistence_and_bundle_round_trip() {
+    use bpmute::config::PowerAction;
+    use bpmute::sleep_engine::SessionEndReason;
+    use bpmute::storage::{
+        CloseSessionRequest, ExportBundleOptions, ImportMode, LedgerStore, OpenSessionRequest,
+        PersistenceWorker,
+    };
+
+    // 1. SessionEndReason::ManualClose traits & serde contracts
+    assert_eq!(SessionEndReason::ManualClose.as_str(), "manual_close");
+    assert_eq!(SessionEndReason::ManualClose.to_string(), "manual_close");
+    assert_eq!(
+        "manual_close".parse::<SessionEndReason>().unwrap(),
+        SessionEndReason::ManualClose
+    );
+    assert_eq!(
+        serde_json::to_string(&SessionEndReason::ManualClose).unwrap(),
+        "\"manual_close\""
+    );
+    assert_eq!(
+        serde_json::from_str::<SessionEndReason>("\"manual_close\"").unwrap(),
+        SessionEndReason::ManualClose
+    );
+
+    // 2. SQLite persistence via PersistenceWorker / LedgerStore
+    let temp1 = TempDir::new().unwrap();
+    let (paths1, _env1) = test_paths_and_env(&temp1);
+    let db1_path = db_path_in_data_dir(&paths1.data_dir);
+    let lock1_path = lock_path_in_data_dir(&paths1.data_dir);
+
+    let sid = {
+        let (worker, handle, _) =
+            PersistenceWorker::spawn(&db1_path, &lock1_path, 1_000_000).unwrap();
+        let wid = handle
+            .upsert_wearable(
+                WearableDescriptor {
+                    mac: "11:22:33:44:55:66".to_string(),
+                    address_type: "public".to_string(),
+                    alias: Some("ManualCloseWatch".to_string()),
+                    advertised_name: Some("ManualCloseWatch".to_string()),
+                    supports_rr: true,
+                    supports_contact: true,
+                },
+                1_000_000,
+            )
+            .await
+            .unwrap();
+
+        let sid = handle
+            .open_session(OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: 1_000_000,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .await
+            .unwrap();
+
+        let mut summary = sample_summary(1_000_000, 1_060_000, 58.0);
+        summary.end_reason = SessionEndReason::ManualClose;
+
+        handle
+            .close_session_and_recompute(
+                CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                1_060_000,
+            )
+            .await
+            .unwrap();
+
+        drop(handle);
+        worker.shutdown_async().await;
+        sid
+    };
+
+    // Verify detail and list read from store1
+    let store1 = LedgerStore::open_read_only(&db1_path).unwrap().unwrap();
+    let detail1 = store1.get_session(&sid).unwrap();
+    assert_eq!(detail1.session.end_reason, SessionEndReason::ManualClose);
+    assert_eq!(detail1.session.end_ts_ms, 1_060_000);
+
+    let list1 = store1.list_sessions(10, 0).unwrap();
+    assert_eq!(list1.sessions.len(), 1);
+    assert_eq!(
+        list1.sessions[0].end_reason,
+        Some(SessionEndReason::ManualClose)
+    );
+
+    // 3. Export bundle & verify serialized "manual_close"
+    let bundle_path = temp1.path().join("manual_close_bundle.json");
+    store1
+        .export_bundle(
+            &bundle_path,
+            ExportBundleOptions {
+                include_epochs: true,
+                include_wearables: true,
+                include_raw: false,
+            },
+            1_100_000,
+        )
+        .unwrap();
+
+    let bundle_content = fs::read_to_string(&bundle_path).unwrap();
+    let bundle_json: Value = serde_json::from_str(&bundle_content).unwrap();
+    assert_eq!(
+        bundle_json["sessions"][0]["end_reason"].as_str(),
+        Some("manual_close")
+    );
+
+    // 4. Import bundle into store2 and verify round-trip
+    let temp2 = TempDir::new().unwrap();
+    let (paths2, _env2) = test_paths_and_env(&temp2);
+    let db2_path = db_path_in_data_dir(&paths2.data_dir);
+    let lock2_path = lock_path_in_data_dir(&paths2.data_dir);
+
+    let mut store2 = LedgerStore::open_read_write(&db2_path, &lock2_path).unwrap();
+    store2
+        .import_bundle(&bundle_path, ImportMode::Replace, false, 1_200_000)
+        .unwrap();
+
+    let detail2 = store2.get_session(&sid).unwrap();
+    assert_eq!(detail2.session.end_reason, SessionEndReason::ManualClose);
+    assert_eq!(detail2.session.end_ts_ms, 1_060_000);
+}

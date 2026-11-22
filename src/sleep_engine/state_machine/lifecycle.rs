@@ -10,7 +10,7 @@ use crate::sleep_engine::state_machine::{
 };
 use crate::sleep_engine::types::{
     CalibrationMaturity, CalibrationPriors, DetectorState, EngineOutput, GapTier, GraceResult,
-    PresetParams, SessionEndReason, SessionSummary, WearableFloor,
+    ManualCloseError, PresetParams, SessionEndReason, SessionSummary, WearableFloor,
 };
 
 impl SleepEngine {
@@ -38,6 +38,23 @@ impl SleepEngine {
             self.close_session(ts_ms, reason, &mut outputs);
         }
         outputs
+    }
+
+    /// Manually finalizes an active `Monitoring Session` while disconnected or in `Signal Lost`.
+    ///
+    /// Rejects manual closure if the engine is `Idle` or actively `Streaming`.
+    /// On success, closes the session anchored to `end_ts_ms = gap_started_ms` with
+    /// [`SessionEndReason::ManualClose`].
+    pub fn manual_close_session(&mut self) -> Result<Vec<EngineOutput>, ManualCloseError> {
+        if self.state == DetectorState::Idle {
+            return Err(ManualCloseError::NoActiveSession);
+        }
+        let Some(gap) = self.active_gap else {
+            return Err(ManualCloseError::StreamingActive);
+        };
+        let mut outputs = Vec::new();
+        self.close_session(gap.started_ms, SessionEndReason::ManualClose, &mut outputs);
+        Ok(outputs)
     }
 
     pub(super) fn begin_or_tighten_gap(&mut self, ts_ms: i64, window_ms: i64) {

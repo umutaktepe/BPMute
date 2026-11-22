@@ -131,6 +131,27 @@ impl DaemonCore {
                     .map_err(storage_to_ipc_err)?;
                 serialize_json(detail)
             }
+            "session.end" => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if self
+                    .engine_ctrl_tx
+                    .send(crate::daemon::EngineControlEvent::ManualCloseSession { reply: tx })
+                    .await
+                    .is_err()
+                {
+                    return Err(ipc_err(
+                        error_codes::INTERNAL_ERROR,
+                        "daemon engine loop is not running",
+                    ));
+                }
+                let detail = rx.await.map_err(|_| {
+                    ipc_err(
+                        error_codes::INTERNAL_ERROR,
+                        "engine loop dropped session.end reply",
+                    )
+                })??;
+                serialize_json(detail)
+            }
             "session.delete" => {
                 let parsed: SessionDeleteParams = serde_json::from_value(params).map_err(|e| {
                     ipc_err(

@@ -639,3 +639,282 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
 
     daemon.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn virtual_time_gap_gated_manual_session_closure_and_rejections() {
+    use bpmute::ipc::IpcClientError;
+    use bpmute::sleep_engine::{ContactStatus, HrPacket};
+    use bpmute::storage::SessionFullDetail;
+
+    let start_utc = chrono::DateTime::parse_from_rfc3339("2026-11-22T22:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let harness = TestHarness::new(start_utc).await;
+    let paths = harness.paths.clone();
+    let feed_tx = harness.feed_tx.clone();
+    let daemon = harness.daemon;
+    let wearable = harness.wearable.clone();
+    let t0 = harness.t0;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let mut sub_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub_client
+        .request("daemon.subscribe", json!({}))
+        .await
+        .unwrap();
+
+    // 1. Rejection on Idle
+    let idle_err = client.request("session.end", json!({})).await.unwrap_err();
+    assert_eq!(idle_err.code(), Some("PRECONDITION_FAILED"));
+
+    // 2. Start streaming and open session
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Streaming,
+                ts_ms: t0,
+            },
+        })
+        .await
+        .unwrap();
+
+    for i in 0..20 {
+        feed_tx
+            .send(WearableEvent::HrPacket {
+                wearable: wearable.clone(),
+                packet: HrPacket {
+                    ts_ms: t0 + (i * 1000),
+                    bpm: 65.0,
+                    rr_ms: vec![923.0],
+                    contact_status: ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    // Wait for SessionStarted
+    let session_id = loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+
+    // 3. Rejection while Streaming
+    let stream_err = client.request("session.end", json!({})).await.unwrap_err();
+    assert_eq!(stream_err.code(), Some("PRECONDITION_FAILED"));
+    if let IpcClientError::Server { message, .. } = stream_err {
+        assert!(message.contains("streaming"));
+    } else {
+        panic!("expected Server error");
+    }
+
+    // Feed a few trailing raw packets that do not form a complete 15-s epoch
+    let t_trailing = t0 + 20_000;
+    feed_tx
+        .send(WearableEvent::HrPacket {
+            wearable: wearable.clone(),
+            packet: HrPacket {
+                ts_ms: t_trailing,
+                bpm: 64.0,
+                rr_ms: vec![937.0],
+                contact_status: ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+
+    // 4. Disconnect wearable (start gap at t_dc)
+    let t_dc = t0 + 25_000;
+    feed_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t_dc,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+
+    // Await StateChanged with session_close_deadline_ms
+    let expected_deadline = t_dc + 120_001;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
+            assert_eq!(
+                ev.data["session_close_deadline_ms"].as_i64(),
+                Some(expected_deadline)
+            );
+            break;
+        }
+    }
+
+    // Verify session_close_deadline_ms is now exposed
+    let status_in_gap = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(
+        status_in_gap["session_close_deadline_ms"].as_i64(),
+        Some(expected_deadline)
+    );
+
+    // 5. Explicit manual closure during gap
+    let close_resp = client.request("session.end", json!({})).await.unwrap();
+    let detail: SessionFullDetail = serde_json::from_value(close_resp).unwrap();
+    assert_eq!(detail.session.id, session_id);
+    assert_eq!(detail.session.end_reason, SessionEndReason::ManualClose);
+    assert_eq!(detail.session.end_ts_ms, t_dc);
+
+    // Verify SessionClosed event emitted
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionClosed" {
+            assert_eq!(
+                ev.data["session"]["session"]["id"].as_str(),
+                Some(session_id.as_str())
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_reason"].as_str(),
+                Some("manual_close")
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_ts_ms"].as_i64(),
+                Some(t_dc)
+            );
+            break;
+        }
+    }
+
+    // Verify daemon status is Idle and deadline is cleared
+    let final_status = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(final_status["monitoring_state"].as_str(), Some("Idle"));
+    assert!(final_status["session_close_deadline_ms"].is_null());
+    assert!(final_status["active_session_id"].is_null());
+
+    // Verify SQLite persistence
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let stored_detail = store.get_session(&session_id).unwrap();
+    assert_eq!(
+        stored_detail.session.end_reason,
+        SessionEndReason::ManualClose
+    );
+    assert_eq!(stored_detail.session.end_ts_ms, t_dc);
+    // Trailing raw sample was flushed
+    assert!(stored_detail.session.raw_samples_count >= 1);
+
+    // 6. Subsequent call rejected on Idle
+    let subsequent_err = client.request("session.end", json!({})).await.unwrap_err();
+    assert_eq!(subsequent_err.code(), Some("PRECONDITION_FAILED"));
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn virtual_time_manual_session_closure_aborts_active_grace_without_penalty() {
+    use bpmute::sleep_engine::{ContactStatus, HrPacket};
+    use bpmute::storage::SessionFullDetail;
+
+    let start_utc = chrono::DateTime::parse_from_rfc3339("2026-11-22T23:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let harness = TestHarness::new(start_utc).await;
+    let paths = harness.paths.clone();
+    let feed_tx = harness.feed_tx.clone();
+    let daemon = harness.daemon;
+    let wearable = harness.wearable.clone();
+    let t0 = harness.t0;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let mut sub_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub_client
+        .request("daemon.subscribe", json!({}))
+        .await
+        .unwrap();
+
+    // 1. Start streaming and open session
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Streaming,
+                ts_ms: t0,
+            },
+        })
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        feed_tx
+            .send(WearableEvent::HrPacket {
+                wearable: wearable.clone(),
+                packet: HrPacket {
+                    ts_ms: t0 + (i * 1000),
+                    bpm: 62.0,
+                    rr_ms: vec![968.0],
+                    contact_status: ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    let session_id = loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+
+    // 2. Start Grace Period via test trigger
+    let trig_res = client
+        .request("monitor.test_trigger", json!({ "grace_sec": 60 }))
+        .await
+        .unwrap();
+    assert_eq!(trig_res["test_trigger_started"], true);
+    assert!(daemon.core().is_in_grace_period());
+
+    // 3. Disconnect wearable (start gap at t_dc while Grace Period is active)
+    let t_dc = t0 + 20_000;
+    feed_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t_dc,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
+            break;
+        }
+    }
+
+    // 4. Manually close session during disconnect gap
+    let close_resp = client.request("session.end", json!({})).await.unwrap();
+    let detail: SessionFullDetail = serde_json::from_value(close_resp).unwrap();
+    assert_eq!(detail.session.id, session_id);
+    assert_eq!(detail.session.end_reason, SessionEndReason::ManualClose);
+    assert_eq!(detail.session.end_ts_ms, t_dc);
+    assert_eq!(
+        detail.session.grace_cancel_count, 0,
+        "must not record false-positive penalty"
+    );
+
+    // 5. Verify Grace Period was aborted and daemon is Idle
+    assert!(!daemon.core().is_in_grace_period());
+    let final_status = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(final_status["monitoring_state"].as_str(), Some("Idle"));
+    assert!(final_status["session_close_deadline_ms"].is_null());
+
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let stored = store.get_session(&session_id).unwrap();
+    assert_eq!(stored.session.grace_cancel_count, 0);
+    assert_eq!(stored.session.end_reason, SessionEndReason::ManualClose);
+
+    daemon.shutdown().await;
+}

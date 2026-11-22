@@ -253,6 +253,12 @@ pub enum SessionsCommand {
         #[arg(long)]
         no_anonymize: bool,
     },
+    /// Immediately finalize an active Monitoring Session while disconnected or in Signal Lost.
+    End {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

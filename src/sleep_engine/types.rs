@@ -413,6 +413,7 @@ pub enum SessionEndReason {
     StreamEnded,
     HostSuspend,
     HostPoweroff,
+    ManualClose,
 }
 
 impl SessionEndReason {
@@ -425,6 +426,7 @@ impl SessionEndReason {
             Self::StreamEnded => "stream_ended",
             Self::HostSuspend => "host_suspend",
             Self::HostPoweroff => "host_poweroff",
+            Self::ManualClose => "manual_close",
         }
     }
 }
@@ -446,9 +448,21 @@ impl std::str::FromStr for SessionEndReason {
             "stream_ended" => Ok(Self::StreamEnded),
             "host_suspend" => Ok(Self::HostSuspend),
             "host_poweroff" => Ok(Self::HostPoweroff),
+            "manual_close" => Ok(Self::ManualClose),
             _ => Err(format!("invalid session end reason '{s}'")),
         }
     }
+}
+
+/// Error conditions that reject manual `Monitoring Session` closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ManualCloseError {
+    #[error("no active monitoring session to close")]
+    NoActiveSession,
+    #[error(
+        "cannot manually close session while wearable is streaming; disconnect wearable or stop heart rate broadcast first"
+    )]
+    StreamingActive,
 }
 
 /// Reason the engine requested aborting an active `Grace Period`.

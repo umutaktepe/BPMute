@@ -20,11 +20,14 @@ use tokio::task::JoinHandle;
 use crate::actions::traits::{ActionExecutor, Notifier};
 use crate::config::{CliOverrides, LoadedConfig};
 use crate::idle::IdleProbe;
+use crate::ipc::protocol::ErrorPayload;
 use crate::ipc::pubsub::EventBroker;
 use crate::ipc::server::handle_connection;
 use crate::paths::{EnvSource, ResolvedPaths, ensure_private_dir};
 use crate::sleep_engine::GraceOutcome;
-use crate::storage::{PersistenceWorker, StorageError, db_path_in_data_dir, lock_path_in_data_dir};
+use crate::storage::{
+    PersistenceWorker, SessionFullDetail, StorageError, db_path_in_data_dir, lock_path_in_data_dir,
+};
 
 pub use clock::{DaemonClock, SystemClock, VirtualClock};
 pub use state::{
@@ -50,6 +53,9 @@ pub enum EngineControlEvent {
     HardWipe {
         wipe_all: bool,
         reply: oneshot::Sender<()>,
+    },
+    ManualCloseSession {
+        reply: oneshot::Sender<Result<SessionFullDetail, ErrorPayload>>,
     },
 }
 

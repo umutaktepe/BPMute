@@ -28,7 +28,7 @@ pub use state_machine::SleepEngine;
 pub use types::{
     CalibrationMaturity, CalibrationPriors, ContactStatus, DesktopActivity, DesktopActivityKind,
     DetectorState, EngineConfig, EngineEvent, EngineOutput, Epoch, EpochFeatures, GapTier,
-    GraceAbortReason, GraceOutcome, GraceResult, HrPacket, PresetParams, SessionEndReason,
-    SessionSummary, StreamDisconnectReason, StreamDisconnected, StreamState, StreamStatus,
-    WearableFloor,
+    GraceAbortReason, GraceOutcome, GraceResult, HrPacket, ManualCloseError, PresetParams,
+    SessionEndReason, SessionSummary, StreamDisconnectReason, StreamDisconnected, StreamState,
+    StreamStatus, WearableFloor,
 };

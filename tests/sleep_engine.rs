@@ -2284,3 +2284,61 @@ fn tiered_disconnect_close_window_boundaries_and_tightening() {
             if s.end_reason == SessionEndReason::GapExceeded && s.end_ts_ms == 600_000
     )));
 }
+
+#[test]
+fn manual_close_session_during_active_gap_and_precondition_rejections() {
+    use bpmute::sleep_engine::ManualCloseError;
+
+    // 1. Idle engine rejects manual close with NoActiveSession
+    let mut eng = default_engine();
+    assert_eq!(eng.state(), DetectorState::Idle);
+    let idle_err = eng.manual_close_session().unwrap_err();
+    assert_eq!(idle_err, ManualCloseError::NoActiveSession);
+    assert_eq!(eng.state(), DetectorState::Idle);
+
+    // 2. Active streaming engine rejects manual close with StreamingActive
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 600, 68.0, true);
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+    assert_eq!(eng.gap_started_ms(), None);
+
+    let stream_err = eng.manual_close_session().unwrap_err();
+    assert_eq!(stream_err, ManualCloseError::StreamingActive);
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    // 3. Disconnect gap allows immediate manual close anchored to gap_started_ms
+    let dc_ts = 600_000;
+    eng.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: dc_ts,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    assert_eq!(eng.gap_started_ms(), Some(dc_ts));
+    assert_eq!(eng.gap_deadline_ms(), Some(dc_ts + 120_001));
+
+    let close_outputs = eng.manual_close_session().unwrap();
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert_eq!(eng.gap_started_ms(), None);
+    assert_eq!(eng.gap_deadline_ms(), None);
+
+    assert!(close_outputs.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            to: DetectorState::Idle,
+            ..
+        }
+    )));
+    assert!(close_outputs.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.session_index == 1
+                && s.end_reason == SessionEndReason::ManualClose
+                && s.end_ts_ms == dc_ts
+    )));
+
+    // 4. Subsequent manual close rejected as Idle
+    let subsequent_err = eng.manual_close_session().unwrap_err();
+    assert_eq!(subsequent_err, ManualCloseError::NoActiveSession);
+}

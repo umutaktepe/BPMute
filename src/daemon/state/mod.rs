@@ -45,14 +45,14 @@ use super::clock::DaemonClock;
 
 const MAX_HR_RING_BUFFER_LEN: usize = 1_800; // 30 min at 1 Hz
 
-pub(super) fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
+pub(crate) fn ipc_err(code: &str, message: impl Into<String>) -> ErrorPayload {
     ErrorPayload {
         code: code.to_string(),
         message: message.into(),
     }
 }
 
-pub(super) fn storage_to_ipc_err(err: StorageError) -> ErrorPayload {
+pub(crate) fn storage_to_ipc_err(err: StorageError) -> ErrorPayload {
     ipc_err(err.ipc_code(), err.to_string())
 }
 
