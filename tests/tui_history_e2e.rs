@@ -17,7 +17,7 @@ use bpmute::calibration::{
     BoundaryReason, CalibrationBoundaryRecord, FeedbackVerdict, SessionFeedbackRecord,
     SessionLedgerRecord,
 };
-use bpmute::config::{CliOverrides, LoadedConfig, PowerAction, Sensitivity};
+use bpmute::config::{CliOverrides, ClockTime, LoadedConfig, PowerAction, Sensitivity};
 use bpmute::daemon::{
     DaemonHandle, DaemonOptions, VirtualClock, WearableDescriptor, WearableEvent,
 };
@@ -366,15 +366,16 @@ fn test_history_session_modals_and_mutating_guards() {
     // Move to Submit button and press Enter
     app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
     let submit_cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    let expected_clock: ClockTime = local_valid.parse().unwrap();
     assert!(matches!(
         submit_cmd,
         Some(TuiCommand::SessionSetFeedback {
             ref session_id,
             verdict: Some(FeedbackVerdict::FalsePositive),
-            ref onset_hhmm,
+            onset_hhmm: Some(ct),
             avg_sleep_hr: Some(58.5),
             clear: false,
-        }) if session_id == "sess-closed" && onset_hhmm.as_deref() == Some(&local_valid)
+        }) if session_id == "sess-closed" && ct == expected_clock
     ));
     assert_eq!(app.modal, ModalState::None);
 
@@ -791,7 +792,7 @@ fn test_mouse_history_feedback_modal_and_backdrop() {
     }
 
     // 3. Click Avg Sleep HR -> focuses SleepHr input, type "57.5"
-    let (hr_col, hr_row) = find_text_coords(terminal.backend().buffer(), "[ 30–120 ]").unwrap();
+    let (hr_col, hr_row) = find_text_coords(terminal.backend().buffer(), "[ 30–140 ]").unwrap();
     assert_eq!(app.handle_event(mouse_left_click(hr_col + 2, hr_row)), None);
     assert!(app.is_input_focused());
     for c in "57.5".chars() {
@@ -868,7 +869,7 @@ fn test_mouse_history_feedback_modal_and_backdrop() {
         Some(TuiCommand::SessionSetFeedback {
             session_id: "sess-fb-1".into(),
             verdict: Some(FeedbackVerdict::FalsePositive),
-            onset_hhmm: Some(valid_hhmm),
+            onset_hhmm: Some(valid_hhmm.parse().unwrap()),
             avg_sleep_hr: Some(57.5),
             clear: false,
         })
@@ -2773,4 +2774,74 @@ async fn test_real_socket_history_tab_switch_reconciles_sessions_e2e() {
     assert_eq!(h.app.history_sessions[h.app.selected_session_idx].id, s1_id);
 
     h.shutdown().await;
+}
+
+#[test]
+fn test_feedback_modal_canonicalizes_short_hour_rejects_short_minute_and_accepts_135_bpm() {
+    let start_dt = chrono::Local
+        .with_ymd_and_hms(2026, 11, 19, 8, 0, 0)
+        .single()
+        .unwrap();
+    let start_ts = start_dt.timestamp_millis();
+    let end_ts = start_ts + 4 * 3_600_000;
+
+    let session = make_history_session(
+        "s-morning",
+        "Polar H10",
+        start_ts,
+        end_ts,
+        SessionStatus::Closed,
+        10,
+    );
+    let detail = make_session_detail(&session, Vec::new());
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    app.handle_ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![session],
+        boundaries: Vec::new(),
+    });
+    app.handle_ipc(IpcEvent::SessionDetailLoaded(Box::new(detail)));
+
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    assert!(matches!(app.modal, ModalState::FeedbackModal { .. }));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    for c in "9:5".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+    assert!(
+        matches!(
+            app.modal,
+            ModalState::FeedbackModal {
+                error_message: Some(_),
+                ..
+            }
+        ),
+        "single-digit minute like 9:5 must be rejected"
+    );
+
+    for _ in 0..3 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in "9:30".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    for c in "135.0".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::SessionSetFeedback {
+            session_id: "s-morning".to_string(),
+            verdict: None,
+            onset_hhmm: Some(ClockTime::new(9, 30).unwrap()),
+            avg_sleep_hr: Some(135.0),
+            clear: false,
+        })
+    );
 }

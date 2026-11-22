@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use super::super::app::{
-    ActiveHoursField, CorePreference, ModalState, SoftRebaselineField, TuiApp,
+    ActiveHoursField, CorePreference, Day1SeedField, ModalState, SoftRebaselineField, TuiApp,
 };
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::{build_clickable_row_line, build_modal_clickable_row_line, centered_rect};
@@ -45,6 +45,7 @@ pub(crate) fn render_settings(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_ma
         ModalState::SoftRebaselineModal { .. } => {
             render_soft_rebaseline_modal(app, area, buf, hit_map)
         }
+        ModalState::Day1SeedModal { .. } => render_day1_seed_modal(app, area, buf, hit_map),
         ModalState::PurgeRawModal { .. } => render_purge_raw_modal(app, area, buf, hit_map),
         ModalState::HardWipeModal { .. } => render_hard_wipe_modal(app, area, buf, hit_map),
         ModalState::ActiveHoursModal { .. } => render_active_hours_modal(app, area, buf, hit_map),
@@ -346,6 +347,7 @@ fn render_calibration_storage(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_ma
         app.theme.muted()
     };
     let buttons = [
+        ("[S] Set Seed", ClickTarget::SettingsOpenSeed),
         ("[B] Re-baseline", ClickTarget::SettingsOpenRebase),
         ("[P] Purge Raw", ClickTarget::SettingsOpenPurge),
         ("[W] Hard Wipe", ClickTarget::SettingsOpenWipe),
@@ -445,6 +447,115 @@ fn push_modal_button_row<'a>(
     ));
 }
 
+fn push_seed_hr_input_row<'a>(
+    lines: &mut Vec<Line<'a>>,
+    inner: Rect,
+    app: &TuiApp,
+    seed_sleep_hr_input: &'a str,
+    is_focused: bool,
+    target: ClickTarget,
+    hit_map: &mut HitMap,
+) {
+    let seed_disp = if seed_sleep_hr_input.is_empty() {
+        "e.g. 54.0"
+    } else {
+        seed_sleep_hr_input
+    };
+    let seed_style = if is_focused {
+        app.theme.highlight()
+    } else {
+        app.theme.base()
+    };
+    let seed_y = inner.y.saturating_add(lines.len() as u16);
+    lines.push(build_modal_clickable_row_line(
+        inner,
+        seed_y,
+        vec![
+            (
+                Span::styled(" Seed Sleep HR (BPM): ", app.theme.key_hint()),
+                Some(target),
+            ),
+            (
+                Span::styled(format!("[ {seed_disp:<10} ]"), seed_style),
+                Some(target),
+            ),
+        ],
+        hit_map,
+    ));
+}
+
+fn render_day1_seed_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+    let ModalState::Day1SeedModal {
+        ref seed_sleep_hr_input,
+        active_field,
+        ref error_message,
+    } = app.modal
+    else {
+        return;
+    };
+
+    let modal_area = centered_rect(area, 56, 11);
+    hit_map.push_modal_click(modal_area, ClickTarget::Consume);
+    Clear.render(modal_area, buf);
+
+    let block = app
+        .theme
+        .card_block(" Day-1 Sleeping HR Seed ")
+        .border_style(app.theme.primary());
+    let inner = block.inner(modal_area);
+    block.render(modal_area, buf);
+
+    let submit_style = if active_field == Day1SeedField::Submit {
+        app.theme.highlight()
+    } else {
+        app.theme.base()
+    };
+    let cancel_style = if active_field == Day1SeedField::Cancel {
+        app.theme.highlight()
+    } else {
+        app.theme.base()
+    };
+
+    let mut lines = vec![
+        Line::from(vec![Span::styled(
+            " Optional 30–140 BPM prior (+2.5 bpm nadir offset).",
+            app.theme.muted(),
+        )]),
+        Line::from(vec![Span::styled(
+            " Leave blank to clear without adding a boundary.",
+            app.theme.muted(),
+        )]),
+        Line::from(""),
+    ];
+    push_seed_hr_input_row(
+        &mut lines,
+        inner,
+        app,
+        seed_sleep_hr_input,
+        active_field == Day1SeedField::SeedSleepHr,
+        ClickTarget::Day1SeedFocusField(Day1SeedField::SeedSleepHr),
+        hit_map,
+    );
+    lines.push(Line::from(""));
+
+    push_modal_error_line(&mut lines, error_message.as_deref(), app);
+    push_modal_button_row(
+        &mut lines,
+        inner,
+        ModalButtons {
+            leading_pad: "     ",
+            confirm_label: "[ Submit ]",
+            confirm_style: submit_style,
+            between_pad: "     ",
+            cancel_label: "[ Cancel ]",
+            cancel_style,
+        },
+        hit_map,
+    );
+
+    Paragraph::new(lines).render(inner, buf);
+}
+
 fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     let ModalState::SoftRebaselineModal {
         ref seed_sleep_hr_input,
@@ -472,17 +583,6 @@ fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_
     let is_submit_focused = active_field == SoftRebaselineField::Submit;
     let is_cancel_focused = active_field == SoftRebaselineField::Cancel;
 
-    let seed_disp = if seed_sleep_hr_input.is_empty() {
-        "e.g. 54.0"
-    } else {
-        seed_sleep_hr_input
-    };
-    let seed_style = if is_seed_focused {
-        app.theme.highlight()
-    } else {
-        app.theme.base()
-    };
-
     let reset_check = if reset_floors { "[x]" } else { "[ ]" };
     let reset_style = if is_reset_focused {
         app.theme.highlight()
@@ -501,9 +601,6 @@ fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_
         app.theme.base()
     };
 
-    let seed_target = Some(ClickTarget::SoftRebaselineFocusField(
-        SoftRebaselineField::SeedSleepHr,
-    ));
     let mut lines = vec![
         Line::from(vec![Span::styled(
             " Insert calibration boundary to reset baseline filters.",
@@ -511,22 +608,15 @@ fn render_soft_rebaseline_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_
         )]),
         Line::from(""),
     ];
-    let seed_y = inner.y.saturating_add(lines.len() as u16);
-    lines.push(build_modal_clickable_row_line(
+    push_seed_hr_input_row(
+        &mut lines,
         inner,
-        seed_y,
-        vec![
-            (
-                Span::styled(" Seed Sleep HR (BPM): ", app.theme.key_hint()),
-                seed_target,
-            ),
-            (
-                Span::styled(format!("[ {seed_disp:<10} ]"), seed_style),
-                seed_target,
-            ),
-        ],
+        app,
+        seed_sleep_hr_input,
+        is_seed_focused,
+        ClickTarget::SoftRebaselineFocusField(SoftRebaselineField::SeedSleepHr),
         hit_map,
-    ));
+    );
     let reset_y = inner.y.saturating_add(lines.len() as u16);
     lines.push(build_modal_clickable_row_line(
         inner,

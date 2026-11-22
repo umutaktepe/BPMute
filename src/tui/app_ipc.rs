@@ -213,6 +213,7 @@ impl TuiApp {
             }
             IpcEvent::CalibrationUpdated(cal) => {
                 self.calibration_maturity = cal.maturity;
+                self.day1_seed_sleep_hr = cal.day1_seed_sleep_hr;
                 if let Some(mu_wake) = cal.mu_wake {
                     self.sparkline_data.quiet_wake_baseline = Some(mu_wake);
                 }

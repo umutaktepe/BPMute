@@ -108,6 +108,13 @@ pub enum SoftRebaselineField {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Day1SeedField {
+    SeedSleepHr,
+    Submit,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorePreference {
     Sensitivity,
     PauseMedia,
@@ -235,6 +242,11 @@ pub enum ModalState {
         active_field: SoftRebaselineField,
         error_message: Option<String>,
     },
+    Day1SeedModal {
+        seed_sleep_hr_input: String,
+        active_field: Day1SeedField,
+        error_message: Option<String>,
+    },
     PurgeRawModal {
         confirmed: bool,
     },
@@ -276,6 +288,7 @@ pub struct TuiApp {
     pub latest_p_sleep: Option<f64>,
     pub latest_epoch: Option<Epoch>,
     pub calibration_maturity: CalibrationMaturity,
+    pub day1_seed_sleep_hr: Option<f64>,
 
     // Alerts & Grace Period
     pub alerts: Vec<DaemonAlert>,
@@ -345,6 +358,7 @@ impl TuiApp {
             latest_p_sleep: None,
             latest_epoch: None,
             calibration_maturity: CalibrationMaturity::ColdStart,
+            day1_seed_sleep_hr: None,
             alerts: Vec::new(),
             grace_state: None,
             op_feedback: None,
@@ -466,6 +480,10 @@ impl TuiApp {
             } => true,
             ModalState::SoftRebaselineModal {
                 active_field: SoftRebaselineField::SeedSleepHr,
+                ..
+            } => true,
+            ModalState::Day1SeedModal {
+                active_field: Day1SeedField::SeedSleepHr,
                 ..
             } => true,
             ModalState::ActiveHoursModal {

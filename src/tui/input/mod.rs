@@ -2,8 +2,8 @@ use chrono::TimeZone;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::{
-    ActiveHoursField, CorePreference, ExportModalField, FeedbackModalField, ModalState,
-    SoftRebaselineField, Tab, TuiApp, UnenrollButton,
+    ActiveHoursField, CorePreference, Day1SeedField, ExportModalField, FeedbackModalField,
+    ModalState, SoftRebaselineField, Tab, TuiApp, UnenrollButton,
 };
 use super::event::TuiCommand;
 use crate::calibration::FeedbackVerdict;
@@ -152,6 +152,7 @@ impl TuiApp {
                 KeyCode::Char(' ') | KeyCode::Enter if self.daemon_connected => {
                     self.toggle_selected_setting()
                 }
+                KeyCode::Char('S') if self.daemon_connected => self.open_day1_seed_modal(),
                 KeyCode::Char('B') if self.daemon_connected => self.open_soft_rebaseline_modal(),
                 KeyCode::Char('P') if self.daemon_connected => self.open_purge_raw_modal(),
                 KeyCode::Char('W') if self.daemon_connected => self.open_hard_wipe_modal(),
@@ -331,6 +332,22 @@ impl TuiApp {
         self.modal = ModalState::DeleteSessionModal {
             session_id: s.id.clone(),
             confirmed: true,
+        };
+        None
+    }
+
+    pub(super) fn open_day1_seed_modal(&mut self) -> Option<TuiCommand> {
+        if !self.daemon_connected {
+            return None;
+        }
+        let seed_sleep_hr_input = self
+            .day1_seed_sleep_hr
+            .map(|v| format!("{v:.1}"))
+            .unwrap_or_default();
+        self.modal = ModalState::Day1SeedModal {
+            seed_sleep_hr_input,
+            active_field: Day1SeedField::SeedSleepHr,
+            error_message: None,
         };
         None
     }

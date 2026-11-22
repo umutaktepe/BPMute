@@ -57,6 +57,7 @@ impl TuiApp {
                         }
                     }
                     ClickTarget::SettingsEditorHandoff => Some(TuiCommand::EditorHandoff),
+                    ClickTarget::SettingsOpenSeed => self.open_day1_seed_modal(),
                     ClickTarget::SettingsOpenRebase => self.open_soft_rebaseline_modal(),
                     ClickTarget::SettingsOpenPurge => self.open_purge_raw_modal(),
                     ClickTarget::SettingsOpenWipe => self.open_hard_wipe_modal(),
@@ -112,6 +113,10 @@ impl TuiApp {
                         None
                     }
                     ClickTarget::DeleteSessionConfirm => self.delete_session_modal(false),
+                    ClickTarget::Day1SeedFocusField(field) => {
+                        self.focus_day1_seed_field(field);
+                        None
+                    }
                     ClickTarget::SoftRebaselineFocusField(field) => {
                         self.focus_soft_rebaseline_field(field);
                         None

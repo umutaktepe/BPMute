@@ -230,6 +230,16 @@ impl DaemonCore {
             .await;
     }
 
+    async fn deliver_silent_expired(&self, ts_ms: i64) {
+        if !self.is_dry_run() {
+            self.deliver_grace_outcome(GraceOutcome {
+                ts_ms,
+                outcome: GraceResult::Expired,
+            })
+            .await;
+        }
+    }
+
     pub async fn handle_confirmed_sleep_onset(self: &Arc<Self>, ts_ms: i64) {
         let (is_paused, cfg, active_session_id, wearable_id) = {
             let guard = self.inner.lock().unwrap();
@@ -251,11 +261,7 @@ impl DaemonCore {
             tracing::info!(
                 "sleep onset confirmed but triggers are paused; transitioning silently to Sleeping"
             );
-            self.deliver_grace_outcome(GraceOutcome {
-                ts_ms,
-                outcome: GraceResult::Expired,
-            })
-            .await;
+            self.deliver_silent_expired(ts_ms).await;
             return;
         }
 
@@ -267,11 +273,7 @@ impl DaemonCore {
             tracing::info!(
                 "sleep onset confirmed but outside active hours; transitioning silently to Sleeping"
             );
-            self.deliver_grace_outcome(GraceOutcome {
-                ts_ms,
-                outcome: GraceResult::Expired,
-            })
-            .await;
+            self.deliver_silent_expired(ts_ms).await;
             return;
         }
 
@@ -308,11 +310,7 @@ impl DaemonCore {
                 tracing::info!(
                     "strictly pause_media pipeline with 0 active players; skipping Grace Period and transitioning silently to Sleeping"
                 );
-                self.deliver_grace_outcome(GraceOutcome {
-                    ts_ms,
-                    outcome: GraceResult::Expired,
-                })
-                .await;
+                self.deliver_silent_expired(ts_ms).await;
                 return;
             }
         }

@@ -1,8 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::super::app::{
-    ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState, SoftRebaselineField,
-    TuiApp, UnenrollButton,
+    Day1SeedField, ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState,
+    SoftRebaselineField, TuiApp, UnenrollButton,
 };
 use super::super::event::TuiCommand;
 
@@ -301,6 +301,48 @@ impl TuiApp {
                 }
                 _ => None,
             },
+            ModalState::Day1SeedModal { active_field, .. } => match key.code {
+                KeyCode::Esc => {
+                    self.modal = ModalState::None;
+                    None
+                }
+                KeyCode::Tab => {
+                    if let ModalState::Day1SeedModal {
+                        ref mut active_field,
+                        ..
+                    } = self.modal
+                    {
+                        *active_field = match *active_field {
+                            Day1SeedField::SeedSleepHr => Day1SeedField::Submit,
+                            Day1SeedField::Submit => Day1SeedField::Cancel,
+                            Day1SeedField::Cancel => Day1SeedField::SeedSleepHr,
+                        };
+                    }
+                    None
+                }
+                KeyCode::BackTab => {
+                    if let ModalState::Day1SeedModal {
+                        ref mut active_field,
+                        ..
+                    } = self.modal
+                    {
+                        *active_field = match *active_field {
+                            Day1SeedField::SeedSleepHr => Day1SeedField::Cancel,
+                            Day1SeedField::Submit => Day1SeedField::SeedSleepHr,
+                            Day1SeedField::Cancel => Day1SeedField::Submit,
+                        };
+                    }
+                    None
+                }
+                KeyCode::Enter => {
+                    if active_field == Day1SeedField::Cancel {
+                        self.modal = ModalState::None;
+                        return None;
+                    }
+                    self.submit_day1_seed_modal()
+                }
+                _ => None,
+            },
             ModalState::PurgeRawModal { .. } => match key.code {
                 KeyCode::Esc => {
                     self.modal = ModalState::None;
@@ -576,6 +618,39 @@ impl TuiApp {
                     None
                 }
                 KeyCode::Enter => self.submit_soft_rebaseline_modal(),
+                KeyCode::Backspace => {
+                    seed_sleep_hr_input.pop();
+                    *error_message = None;
+                    None
+                }
+                KeyCode::Char(c)
+                    if (c.is_ascii_digit() || c == '.') && seed_sleep_hr_input.len() < 6 =>
+                {
+                    seed_sleep_hr_input.push(c);
+                    *error_message = None;
+                    None
+                }
+                _ => None,
+            },
+            ModalState::Day1SeedModal {
+                ref mut seed_sleep_hr_input,
+                ref mut active_field,
+                ref mut error_message,
+                ..
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.modal = ModalState::None;
+                    None
+                }
+                KeyCode::Tab => {
+                    *active_field = Day1SeedField::Submit;
+                    None
+                }
+                KeyCode::BackTab => {
+                    *active_field = Day1SeedField::Cancel;
+                    None
+                }
+                KeyCode::Enter => self.submit_day1_seed_modal(),
                 KeyCode::Backspace => {
                     seed_sleep_hr_input.pop();
                     *error_message = None;

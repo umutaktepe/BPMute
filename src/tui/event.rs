@@ -1,7 +1,7 @@
 use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::calibration::{CalibrationBoundaryRecord, CalibrationState, FeedbackVerdict};
-use crate::config::{Config, ConfigPatch};
+use crate::config::{ClockTime, Config, ConfigPatch};
 use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams,
     EnrolledWearableStatus, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
@@ -104,7 +104,7 @@ pub enum TuiCommand {
     SessionSetFeedback {
         session_id: String,
         verdict: Option<FeedbackVerdict>,
-        onset_hhmm: Option<String>,
+        onset_hhmm: Option<ClockTime>,
         avg_sleep_hr: Option<f64>,
         clear: bool,
     },

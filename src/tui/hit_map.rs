@@ -1,7 +1,7 @@
 use ratatui::layout::{Position, Rect};
 
 use super::app::{
-    ActiveHoursField, ExportModalField, FeedbackModalField, SoftRebaselineField, Tab,
+    ActiveHoursField, Day1SeedField, ExportModalField, FeedbackModalField, SoftRebaselineField, Tab,
 };
 
 /// Checkbox targeted inside `UnenrollModal`.
@@ -35,6 +35,7 @@ pub(crate) enum ClickTarget {
     SettingsToggleSelected,
     SettingsSelectOrToggle(usize),
     SettingsEditorHandoff,
+    SettingsOpenSeed,
     SettingsOpenRebase,
     SettingsOpenPurge,
     SettingsOpenWipe,
@@ -56,6 +57,7 @@ pub(crate) enum ClickTarget {
     ExportFocusField(ExportModalField),
     ExportToggleAnonymize,
     DeleteSessionConfirm,
+    Day1SeedFocusField(Day1SeedField),
     SoftRebaselineFocusField(SoftRebaselineField),
     SoftRebaselineToggleResetFloors,
     ActiveHoursToggleEnabled,

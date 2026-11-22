@@ -129,3 +129,35 @@ fn student_t_log_pdf_nu5(x: f64, mu: f64, sigma: f64) -> f64 {
     let r = (x - mu) / s;
     LOG_NORM_NU5 - s.ln() - 3.0 * (1.0 + (r * r) / 5.0).ln()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hmm_step_matches_analytical_student_t_worked_example() {
+        let features = EpochFeatures {
+            hr_bpm_60s: 55.0,
+            z_hr: -2.5,
+            hr_slope_4m: -0.25,
+            r_var_120s: 0.35,
+            ln_rmssd_60s: Some(3.8),
+            delta_ln_rmssd_60s: Some(0.22),
+            rmssd_sdnn_120s: Some(1.10),
+        };
+
+        let mut filter_bpm_only = HmmFilter::new();
+        let p_bpm_only = filter_bpm_only.step(&features, false, -2.4);
+        let expected_bpm_only = [0.000_962_618_270, 0.062_025_906_248, 0.937_011_475_482];
+        for (got, exp) in p_bpm_only.iter().zip(expected_bpm_only) {
+            assert!((got - exp).abs() < 1e-11, "got {got}, expected {exp}");
+        }
+
+        let mut filter_bpm_rr = HmmFilter::new();
+        let p_bpm_rr = filter_bpm_rr.step(&features, true, -2.4);
+        let expected_bpm_rr = [0.000_287_220_803, 0.036_548_301_175, 0.963_164_478_022];
+        for (got, exp) in p_bpm_rr.iter().zip(expected_bpm_rr) {
+            assert!((got - exp).abs() < 1e-11, "got {got}, expected {exp}");
+        }
+    }
+}

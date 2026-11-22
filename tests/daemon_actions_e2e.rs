@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
-use common::daemon::TestWearableSource;
+use common::daemon::{TestWearableSource, send_trace_slice};
 use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 use serde_json::json;
 use tempfile::TempDir;
@@ -798,4 +798,137 @@ fn test_stale_recovery_preserves_pre_poweroff_trigger_and_calibration() {
         "stale recovery must preserve pre-poweroff trigger_power_action"
     );
     assert_eq!(store.get_calibration_state().unwrap().valid_sessions, 1);
+}
+
+async fn run_zero_player_pause_media_session(
+    dry_run: bool,
+) -> (
+    ResolvedPaths,
+    Vec<String>,
+    SessionFullDetail,
+    CalibrationState,
+) {
+    let temp = TempDir::new().unwrap();
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let actions_cfg = ActionsConfig {
+        dry_run,
+        pause_media: true,
+        custom_command: vec![],
+        lock_screen: false,
+        power_action: PowerAction::None,
+        grace_period_sec: Some(30),
+        ..ActionsConfig::default()
+    };
+
+    let (source, wearable_tx) = TestWearableSource::new();
+    let executor = Arc::new(FakeActionExecutor::new());
+    executor.set_playing_players(&[]);
+    let notifier = Arc::new(FakeNotifier::new());
+
+    let (daemon, paths, _clock) = spawn_test_daemon(
+        &temp,
+        start_utc,
+        actions_cfg,
+        ScheduleConfig::default(),
+        Arc::clone(&executor),
+        Arc::clone(&notifier),
+        Arc::new(source),
+    )
+    .await;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _ = client.next_event().await.unwrap();
+
+    let base_ts = start_utc.timestamp_millis();
+    let desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:11".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Polar Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+    let trace = generate_paired_trace(
+        101,
+        Phenotype::typical(),
+        &[
+            StageKind::QuietWake { duration_sec: 900 },
+            StageKind::N1Onset { duration_sec: 420 },
+            StageKind::N2Sleep {
+                duration_sec: 1_800,
+            },
+        ],
+    );
+    let split_idx = trace.bpm_rr.len() / 2;
+    let target_state = if dry_run { "Confirmed" } else { "Sleeping" };
+    send_trace_slice(&wearable_tx, &desc, &trace.bpm_rr[..split_idx], base_ts).await;
+    for _ in 0..10_000 {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == target_state {
+            break;
+        }
+    }
+
+    send_trace_slice(&wearable_tx, &desc, &trace.bpm_rr[split_idx..], base_ts).await;
+    let last_ts = match trace.bpm_rr.last().unwrap() {
+        EngineEvent::HrPacket(p) => base_ts + p.ts_ms,
+        EngineEvent::StreamState(s) => base_ts + s.ts_ms,
+        _ => unreachable!(),
+    };
+    for _ in 0..10_000 {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "EpochUpdate"
+            && ev.data["epoch"]["ts_ms"]
+                .as_i64()
+                .is_some_and(|t| t >= last_ts - 15_000)
+        {
+            break;
+        }
+    }
+
+    daemon.shutdown().await;
+    let (detail, cal) = load_single_session_and_cal(&paths);
+    let rw_store = LedgerStore::open_read_write(
+        &db_path_in_data_dir(&paths.data_dir),
+        &lock_path_in_data_dir(&paths.data_dir),
+    )
+    .unwrap();
+    let recomputed = rw_store.recompute_from_scratch().unwrap();
+    assert_eq!(recomputed.valid_sessions, cal.valid_sessions);
+    assert_eq!(
+        recomputed.mu_sleep.map(f64::to_bits),
+        cal.mu_sleep.map(f64::to_bits)
+    );
+    (paths, notifier.events(), detail, cal)
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_dry_run_pause_media_zero_players_live_session_records_zero_calibration() {
+    let (_paths, _events, detail, cal) = run_zero_player_pause_media_session(true).await;
+    assert!(
+        detail.session.sleeping_ts_ms.is_none(),
+        "dry_run must not transition SleepEngine to Sleeping"
+    );
+    assert_eq!(
+        detail.session.post_trigger_sleep_sec, 0,
+        "dry_run must not accumulate post-trigger sleep seconds"
+    );
+    assert_eq!(
+        cal.valid_sessions, 0,
+        "dry_run live session with pause_media and 0 players must record 0 calibration sessions"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_silent_pause_media_zero_players_calibration_session_e2e() {
+    let (_paths, events, detail, cal) = run_zero_player_pause_media_session(false).await;
+    assert!(
+        events.is_empty(),
+        "silent pause_media with 0 players must emit zero notifications"
+    );
+    assert!(detail.session.sleeping_ts_ms.is_some());
+    assert!(detail.session.post_trigger_sleep_sec >= 900);
+    assert!(detail.session.sleep_mu_hr.is_some());
+    assert_eq!(cal.valid_sessions, 1);
 }

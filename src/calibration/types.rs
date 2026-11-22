@@ -4,9 +4,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
+use chrono::{Duration, Local, LocalResult, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{PowerAction, Sensitivity};
+use crate::config::{ClockTime, PowerAction, Sensitivity};
 use crate::sleep_engine::{
     CalibrationMaturity, CalibrationPriors, Epoch, SessionEndReason, WearableFloor,
 };
@@ -335,4 +336,177 @@ pub fn validate_sleep_hr_bpm(label: &str, hr: f64) -> Result<f64, String> {
         ));
     }
     Ok(hr)
+}
+
+/// Parses an optional sleeping-HR text field, validating within `[30, 140]` BPM.
+pub fn parse_optional_sleep_hr_input(raw: &str, label: &str) -> Result<Option<f64>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let hr = trimmed
+        .parse::<f64>()
+        .map_err(|_| format!("{label} must be a valid number"))?;
+    validate_sleep_hr_bpm(label, hr)
+        .map(Some)
+        .map_err(|_| format!("{label} must be between 30 and 140 BPM"))
+}
+
+/// Resolves a local `HH:MM` onset clock time onto a timestamp within `[start_ts_ms, end_ts_ms]`.
+pub fn resolve_onset_hhmm_ms(
+    start_ts_ms: i64,
+    end_ts_ms: i64,
+    onset: ClockTime,
+) -> Result<i64, String> {
+    resolve_onset_hhmm_ms_in_tz(&Local, start_ts_ms, end_ts_ms, onset)
+}
+
+/// Timezone-parameterized onset resolver handling midnight crossings and DST ambiguity.
+pub fn resolve_onset_hhmm_ms_in_tz<Tz: TimeZone>(
+    tz: &Tz,
+    start_ts_ms: i64,
+    end_ts_ms: i64,
+    onset: ClockTime,
+) -> Result<i64, String> {
+    let start_local = match tz.timestamp_millis_opt(start_ts_ms) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+        LocalResult::None => {
+            return Err("session start timestamp out of local range".to_string());
+        }
+    };
+    let end_local = match tz.timestamp_millis_opt(end_ts_ms) {
+        LocalResult::Single(dt) | LocalResult::Ambiguous(dt, _) => dt,
+        LocalResult::None => start_local.clone() + Duration::hours(12),
+    };
+
+    let target_time = onset.to_naive_time();
+    let mut date = start_local
+        .date_naive()
+        .pred_opt()
+        .unwrap_or_else(|| start_local.date_naive());
+    let limit_date = end_local
+        .date_naive()
+        .succ_opt()
+        .unwrap_or_else(|| end_local.date_naive());
+
+    while date <= limit_date {
+        let naive = NaiveDateTime::new(date, target_time);
+        let candidate_dt = match tz.from_local_datetime(&naive) {
+            LocalResult::Single(dt) => Some(dt),
+            LocalResult::Ambiguous(earliest, latest) => {
+                let e_ms = earliest.timestamp_millis();
+                if e_ms >= start_ts_ms && e_ms <= end_ts_ms {
+                    Some(earliest)
+                } else {
+                    Some(latest)
+                }
+            }
+            LocalResult::None => None,
+        };
+        if let Some(dt) = candidate_dt {
+            let ts = dt.timestamp_millis();
+            if ts >= start_ts_ms && ts <= end_ts_ms {
+                return Ok(ts);
+            }
+        }
+        let Some(next) = date.succ_opt() else {
+            break;
+        };
+        date = next;
+    }
+
+    Err(format!(
+        "manual onset time {onset} falls outside session bounds"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{FixedOffset, NaiveDate};
+
+    #[derive(Clone, Copy)]
+    struct FallBackDstTz;
+
+    impl TimeZone for FallBackDstTz {
+        type Offset = FixedOffset;
+
+        fn from_offset(_offset: &Self::Offset) -> Self {
+            Self
+        }
+
+        fn offset_from_local_date(&self, _local: &NaiveDate) -> LocalResult<Self::Offset> {
+            LocalResult::Single(FixedOffset::east_opt(3600).unwrap())
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<Self::Offset> {
+            let amb_start = NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(1, 0, 0)
+                .unwrap();
+            let amb_end = NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(2, 0, 0)
+                .unwrap();
+            let edt = FixedOffset::east_opt(2 * 3600).unwrap();
+            let est = FixedOffset::east_opt(3600).unwrap();
+            if *local >= amb_start && *local < amb_end {
+                LocalResult::Ambiguous(edt, est)
+            } else if *local < amb_start {
+                LocalResult::Single(edt)
+            } else {
+                LocalResult::Single(est)
+            }
+        }
+
+        fn offset_from_utc_date(&self, _utc: &NaiveDate) -> Self::Offset {
+            FixedOffset::east_opt(3600).unwrap()
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> Self::Offset {
+            let switch_utc = NaiveDate::from_ymd_opt(2026, 10, 31)
+                .unwrap()
+                .and_hms_opt(23, 0, 0)
+                .unwrap();
+            if *utc < switch_utc {
+                FixedOffset::east_opt(2 * 3600).unwrap()
+            } else {
+                FixedOffset::east_opt(3600).unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_onset_hhmm_handles_ambiguous_fallback_dst_hour() {
+        let tz = FallBackDstTz;
+        // Session starts during second 01:15 (UTC+1) and ends at 04:00 (UTC+1).
+        let start_dt = tz
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 11, 1)
+                    .unwrap()
+                    .and_hms_opt(1, 15, 0)
+                    .unwrap(),
+            )
+            .latest()
+            .unwrap();
+        let end_dt = tz
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 11, 1)
+                    .unwrap()
+                    .and_hms_opt(4, 0, 0)
+                    .unwrap(),
+            )
+            .single()
+            .unwrap();
+
+        // 01:30 occurs twice; earliest is before session start, so latest (second 01:30) is selected.
+        let resolved = resolve_onset_hhmm_ms_in_tz(
+            &tz,
+            start_dt.timestamp_millis(),
+            end_dt.timestamp_millis(),
+            ClockTime::new(1, 30).unwrap(),
+        )
+        .expect("second ambiguous 01:30 inside session bounds must resolve");
+        assert!(resolved >= start_dt.timestamp_millis() && resolved <= end_dt.timestamp_millis());
+    }
 }

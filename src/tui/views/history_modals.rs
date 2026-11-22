@@ -188,7 +188,7 @@ pub(super) fn render_feedback_modal(
     }
 
     let hr_disp = if avg_sleep_hr_input.is_empty() {
-        "30–120"
+        "30–140"
     } else {
         avg_sleep_hr_input
     };

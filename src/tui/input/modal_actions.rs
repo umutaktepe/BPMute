@@ -1,13 +1,13 @@
 use chrono::TimeZone;
 
 use super::super::app::{
-    ActiveHoursField, ExportModalField, FeedbackModalField, ModalState, PairingPromptModalState,
-    SoftRebaselineField, TuiApp, UnenrollButton,
+    ActiveHoursField, Day1SeedField, ExportModalField, FeedbackModalField, ModalState,
+    PairingPromptModalState, SoftRebaselineField, TuiApp, UnenrollButton,
 };
 use super::super::event::TuiCommand;
 use super::super::hit_map::UnenrollCheckbox;
 use super::step_index;
-use crate::calibration::FeedbackVerdict;
+use crate::calibration::{FeedbackVerdict, parse_optional_sleep_hr_input, resolve_onset_hhmm_ms};
 use crate::config::{ClockTime, ConfigPatch, SchedulePatch};
 use crate::ipc::protocol::{EnrollAuthResponseParams, PauseMode, PauseParams};
 use crate::replay::TraceFormat;
@@ -240,6 +240,7 @@ impl TuiApp {
             ModalState::ExportTraceModal { .. } => self.submit_export_trace_modal(),
             ModalState::DeleteSessionModal { .. } => self.delete_session_modal(true),
             ModalState::SoftRebaselineModal { .. } => self.submit_soft_rebaseline_modal(),
+            ModalState::Day1SeedModal { .. } => self.submit_day1_seed_modal(),
             ModalState::PurgeRawModal { .. } => self.confirm_purge_raw_modal(),
             ModalState::HardWipeModal { .. } => self.submit_hard_wipe_modal(),
             ModalState::ActiveHoursModal { .. } => self.submit_active_hours_modal(),
@@ -362,39 +363,39 @@ impl TuiApp {
         }
     }
 
-    pub(super) fn submit_feedback_modal(&mut self) -> Option<TuiCommand> {
-        let ModalState::FeedbackModal {
-            ref session_id,
-            session_start_ts_ms,
-            session_end_ts_ms,
-            epochs_pruned,
-            verdict_idx,
-            ref onset_hhmm_input,
-            ref avg_sleep_hr_input,
-            ref mut error_message,
-            ..
-        } = self.modal
-        else {
-            return None;
-        };
-        match validate_and_submit_feedback(
-            session_id,
-            session_start_ts_ms,
-            session_end_ts_ms,
-            epochs_pruned,
-            verdict_idx,
-            onset_hhmm_input,
-            avg_sleep_hr_input,
-        ) {
+    fn apply_validated_modal_result(
+        &mut self,
+        res: Result<TuiCommand, String>,
+    ) -> Option<TuiCommand> {
+        match res {
             Ok(cmd) => {
                 self.modal = ModalState::None;
                 Some(cmd)
             }
             Err(err) => {
-                *error_message = Some(err);
+                match self.modal {
+                    ModalState::FeedbackModal {
+                        ref mut error_message,
+                        ..
+                    }
+                    | ModalState::SoftRebaselineModal {
+                        ref mut error_message,
+                        ..
+                    }
+                    | ModalState::Day1SeedModal {
+                        ref mut error_message,
+                        ..
+                    } => *error_message = Some(err),
+                    _ => {}
+                }
                 None
             }
         }
+    }
+
+    pub(super) fn submit_feedback_modal(&mut self) -> Option<TuiCommand> {
+        let res = self.modal.validate_feedback_modal()?;
+        self.apply_validated_modal_result(res)
     }
 
     pub(super) fn cycle_export_format(&mut self) {
@@ -476,6 +477,16 @@ impl TuiApp {
             Some(TuiCommand::SessionDelete { id: sid })
         } else {
             None
+        }
+    }
+
+    pub(super) fn focus_day1_seed_field(&mut self, field: Day1SeedField) {
+        if let ModalState::Day1SeedModal {
+            ref mut active_field,
+            ..
+        } = self.modal
+        {
+            *active_field = field;
         }
     }
 
@@ -601,32 +612,13 @@ impl TuiApp {
     }
 
     pub(super) fn submit_soft_rebaseline_modal(&mut self) -> Option<TuiCommand> {
-        let ModalState::SoftRebaselineModal {
-            ref seed_sleep_hr_input,
-            reset_floors,
-            ref mut error_message,
-            ..
-        } = self.modal
-        else {
-            return None;
-        };
-        let seed = if seed_sleep_hr_input.trim().is_empty() {
-            None
-        } else {
-            match seed_sleep_hr_input.trim().parse::<f64>() {
-                Ok(v) if (30.0..=120.0).contains(&v) => Some(v),
-                _ => {
-                    *error_message = Some("Seed HR must be between 30 and 120 BPM".into());
-                    return None;
-                }
-            }
-        };
-        self.modal = ModalState::None;
-        Some(TuiCommand::CalibrationSetBoundary {
-            effective_ts_ms: None,
-            seed_sleep_hr: seed,
-            reset_floors,
-        })
+        let res = self.modal.validate_soft_rebaseline_modal()?;
+        self.apply_validated_modal_result(res)
+    }
+
+    pub(super) fn submit_day1_seed_modal(&mut self) -> Option<TuiCommand> {
+        let res = self.modal.validate_day1_seed_modal()?;
+        self.apply_validated_modal_result(res)
     }
 
     pub(super) fn confirm_purge_raw_modal(&mut self) -> Option<TuiCommand> {
@@ -700,97 +692,126 @@ fn update_export_path_extension(path: &mut String, ext: &str) {
     }
 }
 
-fn validate_and_submit_feedback(
-    session_id: &str,
-    session_start_ts_ms: i64,
-    session_end_ts_ms: i64,
-    epochs_pruned: bool,
-    verdict_idx: usize,
-    onset_input: &str,
-    hr_input: &str,
-) -> Result<TuiCommand, String> {
-    let verdict = match verdict_idx {
-        1 => Some(FeedbackVerdict::FalsePositive),
-        2 => Some(FeedbackVerdict::MissedSleep),
-        3 => Some(FeedbackVerdict::AnomalousExclude),
-        _ => None,
+fn parse_onset_clock_time(raw: &str) -> Result<ClockTime, String> {
+    let trimmed = raw.trim();
+    if let Ok(ct) = trimmed.parse::<ClockTime>() {
+        return Ok(ct);
+    }
+    let Some((hour_str, min_str)) = trimmed.split_once(':') else {
+        return Err("Sleep-onset time must be in HH:MM format".into());
     };
+    if !(1..=2).contains(&hour_str.len())
+        || min_str.len() != 2
+        || !hour_str.bytes().all(|b| b.is_ascii_digit())
+        || !min_str.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("Sleep-onset time must be in HH:MM format".into());
+    }
+    let (Ok(h), Ok(m)) = (hour_str.parse::<u8>(), min_str.parse::<u8>()) else {
+        return Err("Sleep-onset time must be valid numbers (HH:MM)".into());
+    };
+    ClockTime::new(h, m)
+        .map_err(|_| "Sleep-onset time must be a valid 24h time (00:00–23:59)".into())
+}
 
-    let onset_hhmm = if !epochs_pruned && !onset_input.trim().is_empty() {
-        let trimmed = onset_input.trim();
-        let parts: Vec<&str> = trimmed.split(':').collect();
-        if parts.len() != 2 {
-            return Err("Sleep-onset time must be in HH:MM format".into());
-        }
-        let (Ok(h), Ok(m)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) else {
-            return Err("Sleep-onset time must be valid numbers (HH:MM)".into());
-        };
-        if h > 23 || m > 59 {
-            return Err("Sleep-onset time must be a valid 24h time (00:00–23:59)".into());
-        }
+fn format_local_hhmm(ts_ms: i64) -> Option<String> {
+    chrono::Local
+        .timestamp_millis_opt(ts_ms)
+        .earliest()
+        .map(|dt| dt.format("%H:%M").to_string())
+}
 
-        let Some(start_dt) = chrono::Local
-            .timestamp_millis_opt(session_start_ts_ms)
-            .single()
+impl ModalState {
+    pub(super) fn validate_soft_rebaseline_modal(&self) -> Option<Result<TuiCommand, String>> {
+        let ModalState::SoftRebaselineModal {
+            seed_sleep_hr_input,
+            reset_floors,
+            ..
+        } = self
         else {
-            return Err("Invalid session start timestamp".into());
+            return None;
         };
-        let Some(candidate_today) = start_dt.date_naive().and_hms_opt(h, m, 0) else {
-            return Err("Invalid time".into());
-        };
-        let ts_today = chrono::Local
-            .from_local_datetime(&candidate_today)
-            .single()
-            .map(|dt| dt.timestamp_millis());
-        let candidate_tomorrow = start_dt
-            .date_naive()
-            .succ_opt()
-            .and_then(|d| d.and_hms_opt(h, m, 0));
-        let ts_tomorrow = candidate_tomorrow
-            .and_then(|dt| chrono::Local.from_local_datetime(&dt).single())
-            .map(|dt| dt.timestamp_millis());
+        Some(
+            parse_optional_sleep_hr_input(seed_sleep_hr_input, "Seed HR").map(|seed| {
+                TuiCommand::CalibrationSetBoundary {
+                    effective_ts_ms: None,
+                    seed_sleep_hr: seed,
+                    reset_floors: *reset_floors,
+                }
+            }),
+        )
+    }
 
-        let valid_ts = match (ts_today, ts_tomorrow) {
-            (Some(t1), _) if t1 >= session_start_ts_ms && t1 <= session_end_ts_ms => Some(t1),
-            (_, Some(t2)) if t2 >= session_start_ts_ms && t2 <= session_end_ts_ms => Some(t2),
+    pub(super) fn validate_day1_seed_modal(&self) -> Option<Result<TuiCommand, String>> {
+        let ModalState::Day1SeedModal {
+            seed_sleep_hr_input,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(
+            parse_optional_sleep_hr_input(seed_sleep_hr_input, "Seed HR")
+                .map(TuiCommand::CalibrationSetSeed),
+        )
+    }
+
+    pub(super) fn validate_feedback_modal(&self) -> Option<Result<TuiCommand, String>> {
+        let ModalState::FeedbackModal {
+            session_id,
+            session_start_ts_ms,
+            session_end_ts_ms,
+            epochs_pruned,
+            verdict_idx,
+            onset_hhmm_input,
+            avg_sleep_hr_input,
+            ..
+        } = self
+        else {
+            return None;
+        };
+
+        let verdict = match verdict_idx {
+            1 => Some(FeedbackVerdict::FalsePositive),
+            2 => Some(FeedbackVerdict::MissedSleep),
+            3 => Some(FeedbackVerdict::AnomalousExclude),
             _ => None,
         };
 
-        if valid_ts.is_none() {
-            let start_hhmm = start_dt.format("%H:%M").to_string();
-            let end_hhmm = chrono::Local
-                .timestamp_millis_opt(session_end_ts_ms)
-                .single()
-                .map(|dt| dt.format("%H:%M").to_string())
-                .unwrap_or_default();
-            return Err(format!(
-                "Sleep-onset time must fall within session window ({start_hhmm}–{end_hhmm})"
-            ));
-        }
-        Some(trimmed.to_string())
-    } else {
-        None
-    };
-
-    let avg_sleep_hr = if !hr_input.trim().is_empty() {
-        let Ok(hr) = hr_input.trim().parse::<f64>() else {
-            return Err("Average sleeping HR must be a valid number".into());
+        let onset_hhmm = if !epochs_pruned && !onset_hhmm_input.trim().is_empty() {
+            let clock_time = match parse_onset_clock_time(onset_hhmm_input) {
+                Ok(ct) => ct,
+                Err(err) => return Some(Err(err)),
+            };
+            if resolve_onset_hhmm_ms(*session_start_ts_ms, *session_end_ts_ms, clock_time).is_err()
+            {
+                let Some(start_hhmm) = format_local_hhmm(*session_start_ts_ms) else {
+                    return Some(Err("Invalid session start timestamp".to_string()));
+                };
+                let end_hhmm = format_local_hhmm(*session_end_ts_ms).unwrap_or_default();
+                return Some(Err(format!(
+                    "Sleep-onset time must fall within session window ({start_hhmm}–{end_hhmm})"
+                )));
+            }
+            Some(clock_time)
+        } else {
+            None
         };
-        if !(30.0..=120.0).contains(&hr) {
-            return Err("Average sleeping HR must be between 30 and 120 BPM".into());
-        }
-        Some(hr)
-    } else {
-        None
-    };
 
-    let clear = verdict.is_none() && onset_hhmm.is_none() && avg_sleep_hr.is_none();
+        let avg_sleep_hr =
+            match parse_optional_sleep_hr_input(avg_sleep_hr_input, "Average sleeping HR") {
+                Ok(hr) => hr,
+                Err(err) => return Some(Err(err)),
+            };
 
-    Ok(TuiCommand::SessionSetFeedback {
-        session_id: session_id.to_string(),
-        verdict,
-        onset_hhmm,
-        avg_sleep_hr,
-        clear,
-    })
+        let clear = verdict.is_none() && onset_hhmm.is_none() && avg_sleep_hr.is_none();
+
+        Some(Ok(TuiCommand::SessionSetFeedback {
+            session_id: session_id.clone(),
+            verdict,
+            onset_hhmm,
+            avg_sleep_hr,
+            clear,
+        }))
+    }
 }

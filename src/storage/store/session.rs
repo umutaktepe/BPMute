@@ -1,6 +1,5 @@
 //! Monitoring Session persistence, epoch queries, raw samples, and session feedback.
 
-use chrono::{Duration, Local, LocalResult, NaiveDateTime, TimeZone};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::calibration::{
@@ -749,58 +748,6 @@ pub(crate) fn resolve_onset_hhmm_ms(
     end_ts_ms: i64,
     onset: ClockTime,
 ) -> Result<i64, StorageError> {
-    let start_local = match Local.timestamp_millis_opt(start_ts_ms) {
-        LocalResult::Single(dt) => dt,
-        LocalResult::Ambiguous(dt, _) => dt,
-        LocalResult::None => {
-            return Err(StorageError::Validation(
-                "session start timestamp out of local range".to_string(),
-            ));
-        }
-    };
-    let end_local = match Local.timestamp_millis_opt(end_ts_ms) {
-        LocalResult::Single(dt) => dt,
-        LocalResult::Ambiguous(dt, _) => dt,
-        LocalResult::None => start_local + Duration::hours(12),
-    };
-
-    let target_time = onset.to_naive_time();
-    let mut date = start_local
-        .date_naive()
-        .pred_opt()
-        .unwrap_or_else(|| start_local.date_naive());
-    let limit_date = end_local
-        .date_naive()
-        .succ_opt()
-        .unwrap_or_else(|| end_local.date_naive());
-
-    while date <= limit_date {
-        let naive = NaiveDateTime::new(date, target_time);
-        let candidate_dt = match Local.from_local_datetime(&naive) {
-            LocalResult::Single(dt) => Some(dt),
-            LocalResult::Ambiguous(earliest, latest) => {
-                let e_ms = earliest.timestamp_millis();
-                if e_ms >= start_ts_ms && e_ms <= end_ts_ms {
-                    Some(earliest)
-                } else {
-                    Some(latest)
-                }
-            }
-            LocalResult::None => None,
-        };
-        if let Some(dt) = candidate_dt {
-            let ts = dt.timestamp_millis();
-            if ts >= start_ts_ms && ts <= end_ts_ms {
-                return Ok(ts);
-            }
-        }
-        let Some(next) = date.succ_opt() else {
-            break;
-        };
-        date = next;
-    }
-
-    Err(StorageError::Validation(format!(
-        "manual onset time {onset} falls outside session bounds"
-    )))
+    crate::calibration::types::resolve_onset_hhmm_ms(start_ts_ms, end_ts_ms, onset)
+        .map_err(StorageError::Validation)
 }

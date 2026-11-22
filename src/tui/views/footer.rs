@@ -168,6 +168,10 @@ pub(crate) fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map:
             writer.push_hint("[Space]", " Toggle");
             writer.push_modal_confirm_cancel(" Submit");
         }
+        ModalState::Day1SeedModal { .. } => {
+            writer.push_hint("[Tab]", " Field");
+            writer.push_modal_confirm_cancel(" Submit");
+        }
         ModalState::PurgeRawModal { .. } => {
             writer.push_modal_confirm_cancel(" Confirm Purge");
         }

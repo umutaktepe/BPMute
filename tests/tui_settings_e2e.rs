@@ -1528,3 +1528,112 @@ fn test_settings_active_hours_validation_submission_and_roundtrip() {
         "Updated disabled config must render Off 08:00-08:00:\n{out_final}"
     );
 }
+
+#[test]
+fn test_soft_rebaseline_modal_accepts_up_to_140_bpm() {
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('4'))));
+    assert_eq!(app.active_tab, Tab::Settings);
+
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('B'))));
+    assert!(matches!(app.modal, ModalState::SoftRebaselineModal { .. }));
+    for c in "135.0".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Enter)));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::CalibrationSetBoundary {
+            effective_ts_ms: None,
+            seed_sleep_hr: Some(135.0),
+            reset_floors: false,
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_day1_seed_modal_validation_and_real_socket_roundtrip_e2e() {
+    let mut h = RealSocketTuiHarness::spawn(1, false).await;
+    h.cmd_tx.send(TuiCommand::DataStats).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.storage_stats.is_some()
+    })
+    .await;
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('4'))));
+    assert_eq!(h.app.active_tab, Tab::Settings);
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| h.app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+
+    let (seed_col, seed_row) =
+        find_text_coords(terminal.backend().buffer(), "[S] Set Seed").unwrap();
+    assert_eq!(
+        h.app.handle_event(mouse_left_click(seed_col + 2, seed_row)),
+        None
+    );
+    assert!(matches!(h.app.modal, ModalState::Day1SeedModal { .. }));
+
+    // Out-of-range BPM (> 140) stays open with validation error
+    for c in "150".chars() {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    assert_eq!(h.app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+    assert!(matches!(
+        h.app.modal,
+        ModalState::Day1SeedModal {
+            error_message: Some(_),
+            ..
+        }
+    ));
+
+    // Fix to "135.0" and submit over real socket -> sets seed without inserting boundary
+    for _ in 0..3 {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    for c in "135.0".chars() {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    let set_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("Day1SeedModal should emit CalibrationSetSeed(Some(135.0))");
+    assert_eq!(set_cmd, TuiCommand::CalibrationSetSeed(Some(135.0)));
+    h.cmd_tx.send(set_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.day1_seed_sleep_hr
+            .is_some_and(|hr| (hr - 135.0).abs() < 1e-6)
+    })
+    .await;
+    assert!(
+        h.app.history_boundaries.is_empty(),
+        "CalibrationSetSeed must not insert a CalibrationBoundary"
+    );
+
+    // Re-open via 'S' -> pre-populated with "135.0"; clear and submit CalibrationSetSeed(None)
+    h.app.handle_event(TuiEvent::Key(key(KeyCode::Char('S'))));
+    assert!(matches!(
+        h.app.modal,
+        ModalState::Day1SeedModal {
+            ref seed_sleep_hr_input,
+            ..
+        } if seed_sleep_hr_input == "135.0"
+    ));
+    for _ in 0..5 {
+        h.app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    let clear_cmd = h
+        .app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("Day1SeedModal should emit CalibrationSetSeed(None)");
+    assert_eq!(clear_cmd, TuiCommand::CalibrationSetSeed(None));
+    h.cmd_tx.send(clear_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut h.app, &mut h.event_rx, Some(&h.cmd_tx), |a| {
+        a.day1_seed_sleep_hr.is_none()
+    })
+    .await;
+
+    h.shutdown().await;
+}

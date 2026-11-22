@@ -8,7 +8,7 @@ use super::client::{
 };
 use super::event::{IpcEvent, TuiCommand, TuiEvent};
 use crate::calibration::CalibrationState;
-use crate::config::{ClockTime, PatchField};
+use crate::config::PatchField;
 use crate::ipc::protocol::{
     AlertDismissParams, CalibrationSetBoundaryParams, ConfigSnapshotPayload, DaemonStatus,
     DataHardWipeParams, DiscoveredWearable, EnrollSelectParams, EnrollSelectResponse,
@@ -249,10 +249,7 @@ pub(super) async fn execute_command(
                 SetFeedbackParams {
                     session_id: session_id.clone(),
                     verdict: verdict.map_or(PatchField::Unchanged, PatchField::Set),
-                    onset_hhmm: onset_hhmm
-                        .as_deref()
-                        .and_then(|s| s.parse::<ClockTime>().ok())
-                        .map_or(PatchField::Unchanged, PatchField::Set),
+                    onset_hhmm: onset_hhmm.map_or(PatchField::Unchanged, PatchField::Set),
                     avg_sleep_hr: avg_sleep_hr.map_or(PatchField::Unchanged, PatchField::Set),
                     clear: false,
                 }

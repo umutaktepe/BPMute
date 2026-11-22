@@ -657,3 +657,222 @@ fn hybrid_wearable_scoping_and_bitwise_round_trip_determinism() {
     });
     assert_state_bitwise_eq(&st, &reverted);
 }
+
+#[test]
+fn worked_example_eb_ewma_huber_and_low_sqi_onset_evidence() {
+    use bpmute::sleep_engine::EpochFeatures;
+
+    let wearables = vec![WearableSeedMeta {
+        wearable_id: "w-1".to_string(),
+        supports_rr: true,
+        supports_contact: true,
+    }];
+    let day_ms = 86_400_000_i64;
+    let mut sessions = Vec::new();
+    for idx in 0..6 {
+        let start_ts_ms = (idx as i64 + 1) * day_ms;
+        sessions.push(SessionReplayInput {
+            session: SessionLedgerRecord {
+                id: format!("01900000-0000-7000-8000-{idx:012}"),
+                wearable_id: "w-1".to_string(),
+                start_ts_ms,
+                end_ts_ms: start_ts_ms + 3_600_000,
+                end_reason: SessionEndReason::HostSuspend,
+                detection_sensitivity: Sensitivity::Balanced,
+                had_rr: true,
+                warmup_mu_hr: Some(70.0),
+                warmup_sigma_hr: Some(2.4),
+                warmup_ln_rmssd: Some(3.45),
+                onset_candidate_ts_ms: Some(start_ts_ms + 900_000),
+                onset_confirmed_ts_ms: Some(start_ts_ms + 1_080_000),
+                sleeping_ts_ms: Some(start_ts_ms + 1_110_000),
+                sleep_mu_hr: None,
+                onset_hr_bpm: Some(64.0),
+                delta_hr_onset: Some(-6.0),
+                sleep_ln_rmssd: None,
+                sleep_hr_var_ratio: Some(0.30),
+                typical_sqi: Some(0.95),
+                post_trigger_sleep_sec: 0,
+                trigger_power_action: PowerAction::Suspend,
+                rapid_resume_within_5m: false,
+                grace_cancel_count: 0,
+                rapid_wake_fp_count: 0,
+                snooze_count: 0,
+                auto_anomalous: false,
+                epochs_count: 100,
+                raw_samples_count: 1_500,
+            },
+            feedback: None,
+            epochs: Vec::new(),
+            wearable_supports_rr: true,
+            wearable_supports_contact: true,
+        });
+    }
+
+    // First 6 HostSuspend sessions (EB phase with Day-1 seed 55.0 -> 57.5):
+    // prior_delta = -0.08 * 70.0 = -5.6, kappa_0 = 4.0, total_w = 6 * 0.35 = 2.1
+    // delta_hr_onset = (4.0 * (-5.6) + 2.1 * (-6.0)) / 6.1 = -35.0 / 6.1
+    let after_6 = recompute_calibration(&LedgerRecomputeInput {
+        day1_seed_sleep_hr: Some(55.0),
+        wearables: wearables.clone(),
+        sessions: sessions.clone(),
+        ..Default::default()
+    });
+    assert_eq!(after_6.valid_sessions, 6);
+    assert_eq!(after_6.maturity, CalibrationMaturity::Learning);
+    assert!((after_6.mu_sleep.unwrap() - 57.5).abs() < 1e-12);
+    assert!((after_6.delta_hr_onset.unwrap() - (-35.0 / 6.1)).abs() < 1e-12);
+
+    // 7th session enters EWMA (valid_sessions == 6 -> 7) with manual_avg_sleep_hr = 52.0 (obs = 54.5).
+    // scale_s = 2.0 (floored MAD) => huber_hr_delta = 4.0, alpha = 0.25.
+    // mu_sleep: 57.5 + 0.25 * (54.5 - 57.5) = 56.75 (unclipped).
+    // delta_hr_onset: diff = -15.5 - (-35/6.1) = -9.762... => Huber-clipped to -4.0 => prev - 1.0.
+    let mut s7 = sessions[0].clone();
+    s7.session.id = "01900000-0000-7000-8000-000000000006".to_string();
+    s7.session.start_ts_ms = 7 * day_ms;
+    s7.session.end_ts_ms = 7 * day_ms + 3_600_000;
+    s7.session.end_reason = SessionEndReason::SustainedWakefulness;
+    s7.session.trigger_power_action = PowerAction::None;
+    s7.session.post_trigger_sleep_sec = 0;
+    s7.session.onset_hr_bpm = None;
+    s7.session.delta_hr_onset = None;
+    s7.feedback = Some(SessionFeedbackRecord {
+        id: "fb-7".to_string(),
+        session_id: s7.session.id.clone(),
+        verdict: None,
+        manual_onset_ts_ms: None,
+        manual_avg_sleep_hr: Some(52.0),
+        notes: None,
+        updated_at_ms: 1_000,
+    });
+    sessions.push(s7);
+
+    let after_7_seeded = recompute_calibration(&LedgerRecomputeInput {
+        day1_seed_sleep_hr: Some(55.0),
+        wearables: wearables.clone(),
+        sessions: sessions.clone(),
+        ..Default::default()
+    });
+    assert_eq!(after_7_seeded.valid_sessions, 7);
+    assert_eq!(after_7_seeded.maturity, CalibrationMaturity::Calibrated);
+    assert!((after_7_seeded.mu_sleep.unwrap() - 56.75).abs() < 1e-12);
+    assert!((after_7_seeded.delta_hr_onset.unwrap() - ((-35.0 / 6.1) - 1.0)).abs() < 1e-12);
+
+    // Without Day-1 seed, mu_sleep was None across the 6 HostSuspend sessions and initializes cleanly via seed on the 7th EWMA session.
+    let after_7_unseeded = recompute_calibration(&LedgerRecomputeInput {
+        day1_seed_sleep_hr: None,
+        wearables: wearables.clone(),
+        sessions,
+        ..Default::default()
+    });
+    assert!((after_7_unseeded.mu_sleep.unwrap() - 54.5).abs() < 1e-12);
+
+    // Manual onset epoch extraction: low-SQI (hrv_valid=false, !accumulators_frozen) still extracts BPM, leaving ln_rmssd=None;
+    // all-frozen epochs yield no onset evidence and only apply the -0.005 manual onset tau nudge.
+    let make_ep = |ts_ms: i64, hr: f64, frozen: bool, hrv_valid: bool| Epoch {
+        session_index: 1,
+        ts_ms,
+        features: EpochFeatures {
+            hr_bpm_60s: hr,
+            z_hr: -1.5,
+            hr_slope_4m: -0.2,
+            r_var_120s: 0.4,
+            ln_rmssd_60s: Some(3.9),
+            delta_ln_rmssd_60s: Some(0.2),
+            rmssd_sdnn_120s: Some(1.0),
+        },
+        baseline_mu_hr: 70.0,
+        baseline_sigma_hr: 2.2,
+        baseline_frozen: true,
+        coverage: 1.0,
+        hrv_valid,
+        rr_artifact_frac: if hrv_valid { 0.01 } else { 0.25 },
+        flatline_stale: false,
+        accumulators_frozen: frozen,
+        p_active_wake: 0.05,
+        p_quiet_wake: 0.25,
+        p_sleep: 0.70,
+        state: bpmute::sleep_engine::DetectorState::Monitoring,
+    };
+    let mut onset_sess = make_clean_session(0, "w-1", 70.0, 58.0, 0.35);
+    onset_sess.session.onset_confirmed_ts_ms = None;
+    onset_sess.session.sleeping_ts_ms = None;
+    onset_sess.session.sleep_mu_hr = None;
+    onset_sess.session.post_trigger_sleep_sec = 0;
+    let onset_ts = onset_sess.session.start_ts_ms + 600_000;
+    onset_sess.feedback = Some(SessionFeedbackRecord {
+        id: "fb-low-sqi".to_string(),
+        session_id: onset_sess.session.id.clone(),
+        verdict: None,
+        manual_onset_ts_ms: Some(onset_ts),
+        manual_avg_sleep_hr: None,
+        notes: None,
+        updated_at_ms: 2_000,
+    });
+    onset_sess.epochs = vec![
+        make_ep(onset_ts + 60_000, 56.0, false, false),
+        make_ep(onset_ts + 120_000, 58.0, false, false),
+    ];
+
+    let low_sqi_cal = recompute_calibration(&LedgerRecomputeInput {
+        wearables: wearables.clone(),
+        sessions: vec![onset_sess.clone()],
+        ..Default::default()
+    });
+    assert_eq!(low_sqi_cal.valid_sessions, 1);
+    assert!((low_sqi_cal.mu_sleep.unwrap() - 57.0).abs() < 1e-12);
+    assert_eq!(low_sqi_cal.mu_ln_rmssd_sleep, None);
+    assert!((low_sqi_cal.tau_p_sleep_offset - (-0.005)).abs() < 1e-12);
+
+    onset_sess.epochs = vec![
+        make_ep(onset_ts + 60_000, 56.0, true, false),
+        make_ep(onset_ts + 120_000, 58.0, true, false),
+    ];
+    let frozen_cal = recompute_calibration(&LedgerRecomputeInput {
+        wearables: wearables.clone(),
+        sessions: vec![onset_sess.clone()],
+        ..Default::default()
+    });
+    assert_eq!(frozen_cal.valid_sessions, 1);
+    assert_eq!(frozen_cal.mu_sleep, None);
+    assert!((frozen_cal.tau_p_sleep_offset - (-0.005)).abs() < 1e-12);
+
+    // MissedSleep tau_p_sleep_offset worked example:
+    // without --onset: ETA_MISSED_TAU (-0.010), dwell_adjust_sec (-15);
+    // with --onset on unconfirmed session: ETA_MISSED_TAU (-0.010) + manual onset nudge (-0.005) = -0.015.
+    let mut missed_no_onset = onset_sess.clone();
+    missed_no_onset.feedback = Some(SessionFeedbackRecord {
+        id: "fb-missed-no-onset".to_string(),
+        session_id: missed_no_onset.session.id.clone(),
+        verdict: Some(FeedbackVerdict::MissedSleep),
+        manual_onset_ts_ms: None,
+        manual_avg_sleep_hr: None,
+        notes: None,
+        updated_at_ms: 3_000,
+    });
+    let missed_only_cal = recompute_calibration(&LedgerRecomputeInput {
+        wearables: wearables.clone(),
+        sessions: vec![missed_no_onset],
+        ..Default::default()
+    });
+    assert!((missed_only_cal.tau_p_sleep_offset - (-0.010)).abs() < 1e-12);
+    assert_eq!(missed_only_cal.dwell_adjust_sec, -15);
+
+    let mut missed_with_onset = onset_sess;
+    missed_with_onset.feedback = Some(SessionFeedbackRecord {
+        id: "fb-missed-with-onset".to_string(),
+        session_id: missed_with_onset.session.id.clone(),
+        verdict: Some(FeedbackVerdict::MissedSleep),
+        manual_onset_ts_ms: Some(onset_ts),
+        manual_avg_sleep_hr: None,
+        notes: None,
+        updated_at_ms: 4_000,
+    });
+    let missed_onset_cal = recompute_calibration(&LedgerRecomputeInput {
+        wearables,
+        sessions: vec![missed_with_onset],
+        ..Default::default()
+    });
+    assert!((missed_onset_cal.tau_p_sleep_offset - (-0.015)).abs() < 1e-12);
+    assert_eq!(missed_onset_cal.dwell_adjust_sec, -15);
+}
