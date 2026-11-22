@@ -418,7 +418,9 @@ async fn live_daemon_wearable_stream_records_ledger_and_publishes_ipc_events() {
                     .await
                     .unwrap();
             }
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => {}
         }
     }
 
@@ -815,7 +817,9 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
                     .await
                     .unwrap();
             }
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => {}
         }
     }
     // Insert > 15 min gap to close Session A while keeping WearableSource open
@@ -888,7 +892,9 @@ async fn cli_sessions_calibration_online_offline_and_dual_fidelity_replay() {
                     .await
                     .unwrap();
             }
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => {}
         }
     }
     drop(wearable_tx);

@@ -432,7 +432,9 @@ async fn send_trace_slice(
                     .await
                     .unwrap();
             }
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => {}
         }
     }
 }

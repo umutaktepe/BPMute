@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -7,10 +9,12 @@ use std::time::Duration;
 
 use bpmute::cli::{Cli, execute_cli};
 use bpmute::config::{CliOverrides, LoadedConfig};
-use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
+use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock, WearableEvent};
 use bpmute::exit_code::ExitCode;
 use bpmute::ipc::IpcClient;
 use bpmute::paths::{EnvSource, MapEnv, ProcessEnv, ResolvedPaths};
+use bpmute::sleep_engine::{StreamDisconnectReason, StreamState, StreamStatus};
+use bpmute::storage::WearableDescriptor;
 use chrono::{Local, TimeZone, Timelike, Utc};
 use clap::Parser;
 use serde_json::Value;
@@ -482,4 +486,156 @@ fn log_biometrics_flag_emits_prominent_startup_warn_banner() {
         stderr.contains("WARN") && stderr.contains("BIOMETRIC LOGGING ENABLED"),
         "expected prominent startup WARN banner in stderr, got:\n{stderr}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_cli_displays_close_countdown_and_json_deadline() {
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let env = MapEnv::new()
+        .with(
+            "XDG_CONFIG_HOME",
+            temp.path().join("cfg").display().to_string(),
+        )
+        .with(
+            "XDG_DATA_HOME",
+            temp.path().join("data").display().to_string(),
+        )
+        .with(
+            "XDG_RUNTIME_DIR",
+            temp.path().join("run").display().to_string(),
+        );
+    let paths = ResolvedPaths::resolve(None, None, None, &env).unwrap();
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let t0 = start_utc.timestamp_millis();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (source, wearable_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env.clone()), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let wearable = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:41".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("CLI Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", serde_json::json!({}))
+        .await
+        .unwrap();
+    let _snap = sub.next_event().await.unwrap();
+
+    // Idle: no deadline in JSON or text output.
+    let (code, json_idle, _) = run_inproc_cli(&["bpmute", "status", "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success);
+    let parsed_idle: Value = serde_json::from_str(json_idle.trim()).unwrap();
+    assert!(parsed_idle.get("session_close_deadline_ms").is_none());
+
+    let (code, text_idle, _) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success);
+    assert!(!text_idle.contains("session_closing_in"));
+
+    // Start Streaming -> session opens, still no close deadline.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: t0 + 1_000,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break;
+        }
+    }
+
+    // Remote disconnect at t0 + 2_000 -> deadline = t0 + 122_001.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wearable_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t0 + 2_000,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+    let expected_deadline = t0 + 2_000 + 120_001;
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged"
+            && ev.data["session_close_deadline_ms"].as_i64() == Some(expected_deadline)
+        {
+            break;
+        }
+    }
+
+    let (code, json_dc, err) = run_inproc_cli(&["bpmute", "status", "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let parsed_dc: Value = serde_json::from_str(json_dc.trim()).unwrap();
+    assert_eq!(
+        parsed_dc["session_close_deadline_ms"].as_i64(),
+        Some(expected_deadline)
+    );
+
+    let (code, text_dc, err) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(
+        text_dc.contains("session_closing_in: 2m 0s"),
+        "expected initial 2m 0s countdown in status output:\n{text_dc}"
+    );
+
+    // Advance 45 seconds -> remaining should be 1m 15s.
+    tokio::time::advance(Duration::from_secs(45)).await;
+    let (code, text_mid, err) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(
+        text_mid.contains("session_closing_in: 1m 15s"),
+        "expected 1m 15s countdown in status output:\n{text_mid}"
+    );
+
+    // Reconnect -> countdown clears in both JSON and text output.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: t0 + 48_000,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_none() {
+            break;
+        }
+    }
+
+    let (code, json_resumed, _) = run_inproc_cli(&["bpmute", "status", "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success);
+    let parsed_resumed: Value = serde_json::from_str(json_resumed.trim()).unwrap();
+    assert!(parsed_resumed.get("session_close_deadline_ms").is_none());
+
+    let (code, text_resumed, _) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success);
+    assert!(!text_resumed.contains("session_closing_in"));
+
+    daemon.shutdown().await;
 }

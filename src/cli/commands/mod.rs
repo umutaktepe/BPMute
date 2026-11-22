@@ -12,7 +12,7 @@ use crate::config::{CliOverrides, LoadedConfig, Sensitivity, init_config_file};
 use crate::daemon::{DaemonError, DaemonHandle, DaemonOptions, SystemClock};
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::{ConfigSnapshotPayload, PauseMode, PauseParams};
-use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus};
+use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus, SnapshotEvent};
 use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, resolve_config_file, split_shell_words};
 use crate::storage::{LedgerStore, StorageError, db_exists, db_path_in_data_dir};
@@ -255,6 +255,13 @@ async fn run_status<WOut: Write, WErr: Write>(
                 if let Some(until) = status.paused_until {
                     let _ = writeln!(stdout, "paused_until: {until}");
                 }
+                if let Some(deadline_ms) = status.session_close_deadline_ms {
+                    let now_ms = fetch_daemon_now_ms(&mut client).await;
+                    let remaining_ms = deadline_ms.saturating_sub(now_ms).max(0) as u64;
+                    let rem_sec = remaining_ms.saturating_sub(1).div_ceil(1000);
+                    let formatted = format_close_countdown(rem_sec);
+                    let _ = writeln!(stdout, "session_closing_in: {formatted}");
+                }
             } else {
                 let _ = serde_json::to_writer(&mut *stdout, &data);
                 let _ = writeln!(stdout);
@@ -262,6 +269,36 @@ async fn run_status<WOut: Write, WErr: Write>(
             ExitCode::Success
         }
         Err(err) => report_ipc_error(err, stderr),
+    }
+}
+
+async fn fetch_daemon_now_ms(client: &mut IpcClient) -> i64 {
+    if client.request("daemon.subscribe", json!({})).await.is_ok() {
+        for _ in 0..8 {
+            let Ok(ev) = client.next_event().await else {
+                break;
+            };
+            if ev.event == "Snapshot"
+                && let Ok(snap) = serde_json::from_value::<SnapshotEvent>(ev.data)
+                && let Some(server_now_ms) = snap.server_now_ms
+            {
+                return server_now_ms;
+            }
+        }
+    }
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn format_close_countdown(sec: u64) -> String {
+    if sec >= 3600 {
+        let h = sec / 3600;
+        let m = (sec % 3600) / 60;
+        let s = sec % 60;
+        format!("{h}h {m}m {s}s")
+    } else if sec >= 60 {
+        format!("{}m {}s", sec / 60, sec % 60)
+    } else {
+        format!("{sec}s")
     }
 }
 

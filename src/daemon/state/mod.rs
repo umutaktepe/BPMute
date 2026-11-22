@@ -1,7 +1,12 @@
+mod alerts;
 mod enrollment;
 mod grace;
 mod ipc;
 
+pub(super) use alerts::upsert_alert;
+use alerts::{
+    clear_reload_alert, sync_idle_alerts_locked, sync_shift_alert_locked, upsert_reload_alert,
+};
 pub use enrollment::{BluezEnrollmentDriver, EnrollmentPairingHook, NoopEnrollmentDriver};
 
 use std::collections::{HashMap, VecDeque};
@@ -22,13 +27,13 @@ use crate::config::{
     patch_config_file,
 };
 use crate::daemon::EngineControlEvent;
-use crate::idle::{IdleBackendKind, IdleProbe};
+use crate::idle::IdleProbe;
 use crate::ipc::protocol::{
-    AlertChangedEvent, AlertSeverity, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert,
-    DaemonStatus, DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus,
-    EpochUpdateEvent, ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode,
-    PauseParams, PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, SnapshotEvent,
-    WearablesUpdatedEvent, alert_ids, error_codes,
+    AlertChangedEvent, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
+    DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus, EpochUpdateEvent,
+    ErrorPayload, HrSampleEvent, MonitoringState, PROTOCOL_VERSION, PauseMode, PauseParams,
+    PushEventEnvelope, SessionClosedEvent, SessionStartedEvent, SnapshotEvent,
+    WearablesUpdatedEvent, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -91,6 +96,7 @@ pub(super) struct InnerState {
     pub(super) pause_mode: Option<PauseMode>,
     pub(super) pause_generation: u64,
     pub(super) detector_state: DetectorState,
+    pub(super) session_close_deadline_ms: Option<i64>,
     pub(super) active_session_id: Option<String>,
     pub(super) active_wearable_id: Option<String>,
     pub(super) calibration_state: CalibrationState,
@@ -212,6 +218,7 @@ impl DaemonCore {
                 pause_mode: None,
                 pause_generation: 0,
                 detector_state: DetectorState::Idle,
+                session_close_deadline_ms: None,
                 active_session_id: None,
                 active_wearable_id: None,
                 calibration_state: initial_calibration,
@@ -299,6 +306,7 @@ impl DaemonCore {
             alerts: guard.alerts.clone(),
             idle_backend: Some(self.idle_probe.backend_kind().display_name().to_string()),
             playing_players_count: guard.playing_players_count,
+            session_close_deadline_ms: guard.session_close_deadline_ms,
         }
     }
 
@@ -443,13 +451,47 @@ impl DaemonCore {
         active_session_id: Option<String>,
         active_wearable_id: Option<String>,
     ) {
-        let status_opt = {
-            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+        self.apply_detector_and_deadline(|guard| {
             let changed = guard.detector_state != detector_state;
             guard.detector_state = detector_state;
             guard.active_session_id = active_session_id;
             guard.active_wearable_id = active_wearable_id;
-            changed.then(|| self.build_status_locked(&guard))
+            changed
+        });
+    }
+
+    /// Atomically updates detector state, active session/wearable IDs, and close deadline, publishing `StateChanged` if state or deadline changed.
+    pub fn sync_detector_and_deadline(
+        &self,
+        detector_state: DetectorState,
+        active_session_id: Option<String>,
+        active_wearable_id: Option<String>,
+        session_close_deadline_ms: Option<i64>,
+    ) {
+        self.apply_detector_and_deadline(|guard| {
+            let changed = guard.detector_state != detector_state
+                || guard.session_close_deadline_ms != session_close_deadline_ms;
+            guard.detector_state = detector_state;
+            guard.active_session_id = active_session_id;
+            guard.active_wearable_id = active_wearable_id;
+            guard.session_close_deadline_ms = session_close_deadline_ms;
+            changed
+        });
+    }
+
+    /// Updates the active session close deadline, publishing `StateChanged` if changed.
+    pub fn set_session_close_deadline(&self, session_close_deadline_ms: Option<i64>) {
+        self.apply_detector_and_deadline(|guard| {
+            let changed = guard.session_close_deadline_ms != session_close_deadline_ms;
+            guard.session_close_deadline_ms = session_close_deadline_ms;
+            changed
+        });
+    }
+
+    fn apply_detector_and_deadline(&self, mutate: impl FnOnce(&mut InnerState) -> bool) {
+        let status_opt = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            mutate(&mut guard).then(|| self.build_status_locked(&guard))
         };
         if let Some(status) = status_opt {
             self.publish_state_changed(&status);
@@ -772,106 +814,5 @@ fn is_armed_locked(guard: &InnerState, clock: &dyn DaemonClock) -> bool {
             .schedule
             .is_within_active_hours(clock.now_local().time());
     }
-    true
-}
-
-fn clear_reload_alert(alerts: &mut Vec<DaemonAlert>) -> bool {
-    let before = alerts.len();
-    alerts.retain(|a| a.id != alert_ids::CONFIG_RELOAD_FAILED);
-    alerts.len() != before
-}
-
-fn upsert_reload_alert(alerts: &mut Vec<DaemonAlert>, err_msg: &str) -> bool {
-    let message = format!("Configuration reload failed (keeping last valid config): {err_msg}");
-    upsert_alert(
-        alerts,
-        DaemonAlert {
-            id: alert_ids::CONFIG_RELOAD_FAILED.to_string(),
-            kind: alert_ids::CONFIG_RELOAD_FAILED.to_string(),
-            severity: AlertSeverity::Error,
-            message,
-            dismissible: true,
-        },
-    )
-}
-
-fn sync_shift_alert_locked(alerts: &mut Vec<DaemonAlert>, state: &CalibrationState) -> bool {
-    if let Some(ref shift) = state.pending_shift_alert {
-        let message = format!(
-            "Persistent {} baseline shift detected across {} consecutive sessions; accept or dismiss via calibration controls",
-            shift.direction, shift.session_count
-        );
-        upsert_alert(
-            alerts,
-            DaemonAlert {
-                id: alert_ids::PERSISTENT_SHIFT.to_string(),
-                kind: alert_ids::PERSISTENT_SHIFT.to_string(),
-                severity: AlertSeverity::Warn,
-                message,
-                dismissible: true,
-            },
-        )
-    } else {
-        let before = alerts.len();
-        alerts.retain(|a| a.id != alert_ids::PERSISTENT_SHIFT);
-        alerts.len() != before
-    }
-}
-
-fn sync_idle_alerts_locked(
-    alerts: &mut Vec<DaemonAlert>,
-    backend: IdleBackendKind,
-    power_action: PowerAction,
-) -> bool {
-    let mut changed = false;
-
-    let needs_degraded = backend.is_degraded()
-        && matches!(power_action, PowerAction::Suspend | PowerAction::Poweroff);
-    if needs_degraded {
-        changed |= upsert_alert(
-            alerts,
-            DaemonAlert {
-                id: alert_ids::DEGRADED_IDLE.to_string(),
-                kind: alert_ids::DEGRADED_IDLE.to_string(),
-                severity: AlertSeverity::Warn,
-                message: "No desktop idle backend available. Destructive power actions run in degraded mode with a 90s Grace Period safety floor.".to_string(),
-                dismissible: false,
-            },
-        );
-    } else {
-        let before = alerts.len();
-        alerts.retain(|a| a.id != alert_ids::DEGRADED_IDLE);
-        changed |= alerts.len() != before;
-    }
-
-    if backend.is_inhibitor_sensitive() {
-        changed |= upsert_alert(
-            alerts,
-            DaemonAlert {
-                id: alert_ids::INHIBITOR_SENSITIVE.to_string(),
-                kind: alert_ids::INHIBITOR_SENSITIVE.to_string(),
-                severity: AlertSeverity::Info,
-                message: "Idle detection using Wayland ext-idle-notify-v1 v1 (inhibitor-sensitive: media playback idle inhibitors may suppress idle detection).".to_string(),
-                dismissible: false,
-            },
-        );
-    } else {
-        let before = alerts.len();
-        alerts.retain(|a| a.id != alert_ids::INHIBITOR_SENSITIVE);
-        changed |= alerts.len() != before;
-    }
-
-    changed
-}
-
-pub(super) fn upsert_alert(alerts: &mut Vec<DaemonAlert>, next: DaemonAlert) -> bool {
-    if let Some(existing) = alerts.iter_mut().find(|a| a.id == next.id) {
-        if *existing == next {
-            return false;
-        }
-        *existing = next;
-        return true;
-    }
-    alerts.push(next);
     true
 }

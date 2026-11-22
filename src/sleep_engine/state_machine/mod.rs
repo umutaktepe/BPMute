@@ -7,7 +7,7 @@ use crate::sleep_engine::ppg::{
 };
 use crate::sleep_engine::types::{
     DetectorState, EngineConfig, EngineEvent, EngineOutput, Epoch, EpochFeatures, GraceAbortReason,
-    HrPacket, PresetParams, SessionEndReason, StreamStatus,
+    HrPacket, PresetParams, SessionEndReason, StreamDisconnectReason, StreamStatus,
 };
 
 mod lifecycle;
@@ -124,6 +124,12 @@ impl SleepSampleBuffers {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveGap {
+    started_ms: i64,
+    deadline_ms: i64,
+}
+
 /// Pure-synchronous sleep-onset detection engine.
 pub struct SleepEngine {
     config: EngineConfig,
@@ -154,7 +160,7 @@ pub struct SleepEngine {
     sqi_count: usize,
 
     suppress_candidate_until_ms: Option<i64>,
-    gap_started_ms: Option<i64>,
+    active_gap: Option<ActiveGap>,
     last_any_packet_ts_ms: Option<i64>,
     last_valid_packet_ts_ms: Option<i64>,
 
@@ -210,7 +216,7 @@ impl SleepEngine {
             sqi_sum: 0.0,
             sqi_count: 0,
             suppress_candidate_until_ms: None,
-            gap_started_ms: None,
+            active_gap: None,
             last_any_packet_ts_ms: None,
             last_valid_packet_ts_ms: None,
             candidate_epochs: 0,
@@ -238,6 +244,9 @@ impl SleepEngine {
             EngineEvent::StreamState(st) => {
                 self.handle_stream_state(st.ts_ms, st.status, &mut outputs);
             }
+            EngineEvent::StreamDisconnected(dc) => {
+                self.handle_stream_disconnected(dc.ts_ms, dc.reason);
+            }
             EngineEvent::HrPacket(pkt) => self.handle_hr_packet(pkt, &mut outputs),
             EngineEvent::DesktopActivity(act) => {
                 self.handle_desktop_activity(act.ts_ms, &mut outputs);
@@ -259,17 +268,23 @@ impl SleepEngine {
             StreamStatus::Streaming => {
                 if self.state == DetectorState::Idle {
                     self.open_session(ts_ms, "stream started", outputs);
-                } else if self.gap_started_ms.is_some() {
+                } else if self.active_gap.is_some() {
                     self.resolve_active_gap(ts_ms, true, outputs);
                 }
             }
             StreamStatus::SignalLost | StreamStatus::Disconnected => {
-                if self.state != DetectorState::Idle && self.gap_started_ms.is_none() {
-                    self.gap_started_ms = Some(ts_ms);
-                }
+                self.begin_or_tighten_gap(ts_ms, MEDIUM_GAP_MAX_MS);
             }
             StreamStatus::Connecting | StreamStatus::Acquiring | StreamStatus::PassiveStandby => {}
         }
+    }
+
+    fn handle_stream_disconnected(&mut self, ts_ms: i64, reason: StreamDisconnectReason) {
+        let window_ms = match reason {
+            StreamDisconnectReason::Remote => SHORT_GAP_MAX_MS,
+            StreamDisconnectReason::Timeout => MEDIUM_GAP_MAX_MS,
+        };
+        self.begin_or_tighten_gap(ts_ms, window_ms);
     }
 
     fn handle_hr_packet(&mut self, pkt: HrPacket, outputs: &mut Vec<EngineOutput>) {
@@ -287,17 +302,17 @@ impl SleepEngine {
             }
             self.open_session(pkt.ts_ms, "hr packet stream started", outputs);
         } else if pkt_valid {
-            if self.gap_started_ms.is_some() {
+            if self.active_gap.is_some() {
                 self.resolve_active_gap(pkt.ts_ms, true, outputs);
             } else if let Some(prev_any) = self.last_any_packet_ts_ms
                 && pkt.ts_ms - prev_any > IMPLICIT_SILENCE_GAP_MS
             {
-                self.gap_started_ms = Some(prev_any);
+                self.begin_or_tighten_gap(prev_any, MEDIUM_GAP_MAX_MS);
                 self.resolve_active_gap(pkt.ts_ms, true, outputs);
             } else if let Some(prev_valid) = self.last_valid_packet_ts_ms
                 && pkt.ts_ms - prev_valid > IMPLICIT_INVALID_GAP_MS
             {
-                self.gap_started_ms = Some(prev_valid);
+                self.begin_or_tighten_gap(prev_valid, MEDIUM_GAP_MAX_MS);
                 self.resolve_active_gap(pkt.ts_ms, true, outputs);
             }
         }
@@ -654,7 +669,7 @@ impl SleepEngine {
         } else if let Some(prev_ts) = self.last_any_packet_ts_ms
             && ts_ms - prev_ts > SHORT_GAP_MAX_MS
         {
-            self.gap_started_ms = Some(prev_ts);
+            self.begin_or_tighten_gap(prev_ts, MEDIUM_GAP_MAX_MS);
             self.resolve_active_gap(ts_ms, true, &mut outputs);
         }
         let frozen = flatline_stale || coverage < MIN_EPOCH_COVERAGE;

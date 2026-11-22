@@ -29,5 +29,6 @@ pub use types::{
     CalibrationMaturity, CalibrationPriors, ContactStatus, DesktopActivity, DesktopActivityKind,
     DetectorState, EngineConfig, EngineEvent, EngineOutput, Epoch, EpochFeatures, GapTier,
     GraceAbortReason, GraceOutcome, GraceResult, HrPacket, PresetParams, SessionEndReason,
-    SessionSummary, StreamState, StreamStatus, WearableFloor,
+    SessionSummary, StreamDisconnectReason, StreamDisconnected, StreamState, StreamStatus,
+    WearableFloor,
 };

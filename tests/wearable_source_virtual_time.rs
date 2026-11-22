@@ -7,7 +7,7 @@ use bpmute::daemon::{
 };
 use bpmute::ipc::IpcClient;
 use bpmute::paths::{MapEnv, ResolvedPaths};
-use bpmute::sleep_engine::{SessionEndReason, StreamState, StreamStatus};
+use bpmute::sleep_engine::{SessionEndReason, StreamDisconnectReason, StreamState, StreamStatus};
 use bpmute::storage::{LedgerStore, db_path_in_data_dir, lock_path_in_data_dir};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
@@ -355,6 +355,287 @@ async fn virtual_time_sustained_disconnection_gap_timeout_closes_session() {
     let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
     let detail = store.get_session(&session_id).unwrap();
     assert_eq!(detail.session.end_reason, SessionEndReason::GapExceeded);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydration() {
+    use std::time::Duration;
+
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let h = TestHarness::new(start_utc).await;
+    let paths = h.paths;
+    let t0 = h.t0;
+    let feed_tx = h.feed_tx;
+    let daemon = h.daemon;
+    let wearable = h.wearable;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let mut sub_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub_client
+        .request("daemon.subscribe", json!({}))
+        .await
+        .unwrap();
+    let initial_snap = sub_client.next_event().await.unwrap();
+    assert_eq!(initial_snap.event, "Snapshot");
+    assert!(
+        initial_snap.data["status"]
+            .get("session_close_deadline_ms")
+            .is_none(),
+        "Idle Snapshot must omit session_close_deadline_ms"
+    );
+
+    // 1. Start Streaming + valid packet at t0 + 1_000 -> session 1 opens.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Streaming,
+                ts_ms: t0 + 1_000,
+            },
+        })
+        .await
+        .unwrap();
+    feed_tx
+        .send(WearableEvent::HrPacket {
+            wearable: wearable.clone(),
+            packet: parse_hr_measurement(&[0x00, 68], t0 + 1_500).unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let session_1_id = loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+
+    // 2. Explicit Remote disconnect at t0 + 2_000 -> deadline = t0 + 122_001 via StateChanged, daemon.status, and Snapshot.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    feed_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t0 + 2_000,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+
+    let expected_remote_deadline = t0 + 2_000 + 120_001;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
+            assert_eq!(
+                ev.data["session_close_deadline_ms"].as_i64(),
+                Some(expected_remote_deadline)
+            );
+            break;
+        }
+    }
+
+    let status_dc = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(
+        status_dc["session_close_deadline_ms"].as_i64(),
+        Some(expected_remote_deadline)
+    );
+
+    let mut late_sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    late_sub
+        .request("daemon.subscribe", json!({}))
+        .await
+        .unwrap();
+    let late_snap = late_sub.next_event().await.unwrap();
+    assert_eq!(late_snap.event, "Snapshot");
+    assert_eq!(
+        late_snap.data["status"]["session_close_deadline_ms"].as_i64(),
+        Some(expected_remote_deadline)
+    );
+
+    // 3. Reconnect within 2 minutes (at t0 + 62_000) -> clears deadline and continues session 1.
+    tokio::time::advance(Duration::from_secs(60)).await;
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Streaming,
+                ts_ms: t0 + 62_000,
+            },
+        })
+        .await
+        .unwrap();
+
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_none() {
+            break;
+        }
+    }
+    let status_resumed = client.request("daemon.status", json!({})).await.unwrap();
+    assert!(status_resumed.get("session_close_deadline_ms").is_none());
+
+    // 4. SignalLost at t0 + 70_000 (+15 min), then Remote at t0 + 100_000 (tightens to +2 min from t0 + 100_000).
+    tokio::time::advance(Duration::from_secs(8)).await;
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::SignalLost,
+                ts_ms: t0 + 70_000,
+            },
+        })
+        .await
+        .unwrap();
+
+    let expected_sig_deadline = t0 + 70_000 + 900_001;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged"
+            && ev.data["session_close_deadline_ms"].as_i64() == Some(expected_sig_deadline)
+        {
+            break;
+        }
+    }
+
+    tokio::time::advance(Duration::from_secs(30)).await;
+    feed_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t0 + 100_000,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+
+    let expected_tight_deadline = t0 + 100_000 + 120_001;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged"
+            && ev.data["session_close_deadline_ms"].as_i64() == Some(expected_tight_deadline)
+        {
+            break;
+        }
+    }
+
+    // Still active at +115s after Remote disconnect.
+    tokio::time::advance(Duration::from_secs(115)).await;
+    tokio::task::yield_now().await;
+    let status_pre_close = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(status_pre_close["monitoring_state"], "Warmup");
+    assert_eq!(
+        status_pre_close["session_close_deadline_ms"].as_i64(),
+        Some(expected_tight_deadline)
+    );
+
+    // Advance past tightened 2-min deadline (+6s -> t0 + 221_000) -> closes with end_ts_ms = t0 + 70_000 (original SignalLost).
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let mut saw_idle_clear = false;
+    let mut saw_closed = false;
+    while !(saw_idle_clear && saw_closed) {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Idle" {
+            assert!(ev.data.get("session_close_deadline_ms").is_none());
+            saw_idle_clear = true;
+        } else if ev.event == "SessionClosed" {
+            assert_eq!(
+                ev.data["session"]["session"]["id"].as_str(),
+                Some(session_1_id.as_str())
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_reason"].as_str(),
+                Some("gap_exceeded")
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_ts_ms"].as_i64(),
+                Some(t0 + 70_000)
+            );
+            saw_closed = true;
+        }
+    }
+
+    // 5. Timeout disconnect preserves 15-minute tolerance (> 2 min stays open, > 15 min closes).
+    let t_s2 = t0 + 300_000;
+    tokio::time::advance(Duration::from_secs(79)).await;
+    feed_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                status: StreamStatus::Streaming,
+                ts_ms: t_s2,
+            },
+        })
+        .await
+        .unwrap();
+    let session_2_id = loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+    assert_ne!(session_2_id, session_1_id);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    feed_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t_s2 + 1_000,
+            reason: StreamDisconnectReason::Timeout,
+        })
+        .await
+        .unwrap();
+
+    let expected_timeout_deadline = t_s2 + 1_000 + 900_001;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged"
+            && ev.data["session_close_deadline_ms"].as_i64() == Some(expected_timeout_deadline)
+        {
+            break;
+        }
+    }
+
+    // Advance 130s (past 2 min) -> must remain open!
+    tokio::time::advance(Duration::from_secs(130)).await;
+    tokio::task::yield_now().await;
+    let status_mid_timeout = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(status_mid_timeout["monitoring_state"], "Warmup");
+    assert_eq!(
+        status_mid_timeout["session_close_deadline_ms"].as_i64(),
+        Some(expected_timeout_deadline)
+    );
+
+    // Advance remaining 771s (total 901s > 900s) -> closes session 2 with GapExceeded at t_s2 + 1_000.
+    tokio::time::advance(Duration::from_secs(771)).await;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "SessionClosed" {
+            assert_eq!(
+                ev.data["session"]["session"]["id"].as_str(),
+                Some(session_2_id.as_str())
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_reason"].as_str(),
+                Some("gap_exceeded")
+            );
+            assert_eq!(
+                ev.data["session"]["session"]["end_ts_ms"].as_i64(),
+                Some(t_s2 + 1_000)
+            );
+            break;
+        }
+    }
+
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let d1 = store.get_session(&session_1_id).unwrap();
+    assert_eq!(d1.session.end_reason, SessionEndReason::GapExceeded);
+    assert_eq!(d1.session.end_ts_ms, t0 + 70_000);
+    let d2 = store.get_session(&session_2_id).unwrap();
+    assert_eq!(d2.session.end_reason, SessionEndReason::GapExceeded);
+    assert_eq!(d2.session.end_ts_ms, t_s2 + 1_000);
 
     daemon.shutdown().await;
 }

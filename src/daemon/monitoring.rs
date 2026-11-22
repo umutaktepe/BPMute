@@ -14,7 +14,7 @@ use crate::ipc::protocol::{EpochUpdateEvent, HrSampleEvent, SessionStartedEvent}
 use crate::logging::BiometricLogContext;
 use crate::sleep_engine::{
     DetectorState, EngineConfig, EngineEvent, EngineOutput, GraceAbortReason, HrPacket,
-    SessionEndReason, SleepEngine, StreamStatus,
+    SessionEndReason, SleepEngine, StreamDisconnected, StreamStatus,
 };
 use crate::storage::{CloseSessionRequest, OpenSessionRequest};
 
@@ -104,27 +104,53 @@ impl MonitoringContext {
             .update_calibration(cal.to_priors(), cal.wearable_floor(wearable_id));
     }
 
+    async fn process_stream_transition(
+        &mut self,
+        wearable: &WearableDescriptor,
+        status: StreamStatus,
+        ts_ms: i64,
+        engine_event: EngineEvent,
+    ) {
+        self.core.set_wearable_status(&wearable.mac, status);
+        self.core.publish_wearables_updated().await;
+        if status == StreamStatus::PassiveStandby {
+            return;
+        }
+        self.last_event_ts_ms = Some(ts_ms);
+        let Some(wearable_id) = self.resolve_wearable(wearable, ts_ms).await else {
+            return;
+        };
+        self.switch_wearable_if_needed(&wearable_id, ts_ms).await;
+        if status == StreamStatus::SignalLost || status == StreamStatus::Disconnected {
+            self.core.signal_signal_lost().await;
+        }
+        let outputs = self.engine.handle_event(engine_event);
+        self.process_outputs(&wearable_id, outputs).await;
+    }
+
     async fn handle_wearable_event(&mut self, ev: WearableEvent) {
         match ev {
             WearableEvent::StreamState { wearable, state } => {
-                self.core.set_wearable_status(&wearable.mac, state.status);
-                self.core.publish_wearables_updated().await;
-                if state.status == StreamStatus::PassiveStandby {
-                    return;
-                }
-                self.last_event_ts_ms = Some(state.ts_ms);
-                let Some(wearable_id) = self.resolve_wearable(&wearable, state.ts_ms).await else {
-                    return;
-                };
-                self.switch_wearable_if_needed(&wearable_id, state.ts_ms)
-                    .await;
-                if state.status == StreamStatus::SignalLost
-                    || state.status == StreamStatus::Disconnected
-                {
-                    self.core.signal_signal_lost().await;
-                }
-                let outputs = self.engine.handle_event(EngineEvent::StreamState(state));
-                self.process_outputs(&wearable_id, outputs).await;
+                self.process_stream_transition(
+                    &wearable,
+                    state.status,
+                    state.ts_ms,
+                    EngineEvent::StreamState(state),
+                )
+                .await;
+            }
+            WearableEvent::StreamDisconnected {
+                wearable,
+                ts_ms,
+                reason,
+            } => {
+                self.process_stream_transition(
+                    &wearable,
+                    StreamStatus::Disconnected,
+                    ts_ms,
+                    EngineEvent::StreamDisconnected(StreamDisconnected { ts_ms, reason }),
+                )
+                .await;
             }
             WearableEvent::Metadata {
                 wearable,
@@ -219,8 +245,12 @@ impl MonitoringContext {
             priors: cal.to_priors(),
             wearable_floor: floor,
         });
-        self.core
-            .set_detector_phase(DetectorState::Idle, None, self.active_wearable_id.clone());
+        self.core.sync_detector_and_deadline(
+            DetectorState::Idle,
+            None,
+            self.active_wearable_id.clone(),
+            None,
+        );
     }
 
     async fn flush_close_latest(&mut self, reason: SessionEndReason) {
@@ -270,10 +300,11 @@ impl MonitoringContext {
                             self.epoch_seq = 0;
                             self.raw_seq = 0;
                             self.pending_raw.clear();
-                            self.core.set_detector_phase(
+                            self.core.sync_detector_and_deadline(
                                 self.engine.state(),
                                 self.active_session_id.clone(),
                                 self.active_wearable_id.clone(),
+                                self.engine.gap_deadline_ms(),
                             );
                             self.core.publish_session_started(SessionStartedEvent {
                                 session_id: sid,
@@ -307,10 +338,11 @@ impl MonitoringContext {
                     }
                 }
                 EngineOutput::StateChanged { to, ts_ms, .. } => {
-                    self.core.set_detector_phase(
+                    self.core.sync_detector_and_deadline(
                         to,
                         self.active_session_id.clone(),
                         self.active_wearable_id.clone(),
+                        self.engine.gap_deadline_ms(),
                     );
                     if to == DetectorState::Confirmed {
                         self.core.handle_confirmed_sleep_onset(ts_ms).await;
@@ -363,10 +395,11 @@ impl MonitoringContext {
                     }
                     self.epoch_seq = 0;
                     self.raw_seq = 0;
-                    self.core.set_detector_phase(
+                    self.core.sync_detector_and_deadline(
                         self.engine.state(),
                         None,
                         self.active_wearable_id.clone(),
+                        self.engine.gap_deadline_ms(),
                     );
                 }
                 EngineOutput::GraceAbortRequested { reason, .. } => {
@@ -377,6 +410,8 @@ impl MonitoringContext {
                 EngineOutput::FalsePositiveRecorded { .. } | EngineOutput::GapResolved { .. } => {}
             }
         }
+        self.core
+            .set_session_close_deadline(self.engine.gap_deadline_ms());
     }
 }
 

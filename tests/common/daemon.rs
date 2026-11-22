@@ -67,6 +67,16 @@ pub async fn send_trace_slice(
                     .await
                     .unwrap();
             }
+            EngineEvent::StreamDisconnected(dc) => {
+                wearable_tx
+                    .send(WearableEvent::StreamDisconnected {
+                        wearable: desc.clone(),
+                        ts_ms: dc.ts_ms + base_ts,
+                        reason: dc.reason,
+                    })
+                    .await
+                    .unwrap();
+            }
             EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
         }
     }

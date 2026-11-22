@@ -119,6 +119,7 @@ pub fn make_daemon_status(schedule: ScheduleConfig) -> DaemonStatus {
         alerts: Vec::new(),
         idle_backend: Some("test-idle".into()),
         playing_players_count: Some(0),
+        session_close_deadline_ms: None,
     }
 }
 

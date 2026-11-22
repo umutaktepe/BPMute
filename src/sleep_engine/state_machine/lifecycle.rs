@@ -5,9 +5,8 @@ use crate::sleep_engine::baseline::QuietWakeBaseline;
 use crate::sleep_engine::hmm::STATE_SLEEP_NREM;
 use crate::sleep_engine::ppg::{PpgPipeline, SIGMA_MIN_BPM};
 use crate::sleep_engine::state_machine::{
-    CANCEL_COOLDOWN_MS, DEFAULT_EXPECTED_Z_SLEEP, MEDIUM_GAP_MAX_MS,
-    MEDIUM_GAP_STABILIZATION_EPOCHS, SHORT_GAP_MAX_MS, SleepEngine, WARMUP_EPOCHS_CALIBRATED,
-    WARMUP_EPOCHS_COLD_OR_LEARNING,
+    ActiveGap, CANCEL_COOLDOWN_MS, DEFAULT_EXPECTED_Z_SLEEP, MEDIUM_GAP_STABILIZATION_EPOCHS,
+    SHORT_GAP_MAX_MS, SleepEngine, WARMUP_EPOCHS_CALIBRATED, WARMUP_EPOCHS_COLD_OR_LEARNING,
 };
 use crate::sleep_engine::types::{
     CalibrationMaturity, CalibrationPriors, DetectorState, EngineOutput, GapTier, GraceResult,
@@ -41,19 +40,48 @@ impl SleepEngine {
         outputs
     }
 
+    pub(super) fn begin_or_tighten_gap(&mut self, ts_ms: i64, window_ms: i64) {
+        if self.state == DetectorState::Idle {
+            return;
+        }
+        let candidate_deadline = ts_ms.saturating_add(window_ms).saturating_add(1);
+        match &mut self.active_gap {
+            Some(gap) => {
+                gap.deadline_ms = gap.deadline_ms.min(candidate_deadline);
+            }
+            None => {
+                self.active_gap = Some(ActiveGap {
+                    started_ms: ts_ms,
+                    deadline_ms: candidate_deadline,
+                });
+            }
+        }
+    }
+
     pub(super) fn resolve_active_gap(
         &mut self,
         ts_ms: i64,
         reopen_on_close: bool,
         outputs: &mut Vec<EngineOutput>,
     ) {
-        let Some(gap_start) = self.gap_started_ms.take() else {
+        let Some(gap) = self.active_gap.take() else {
             return;
         };
-        let duration_ms = (ts_ms - gap_start).max(0);
+        let duration_ms = (ts_ms - gap.started_ms).max(0);
         let session_idx = self.session_index.unwrap_or(1);
 
-        if duration_ms <= SHORT_GAP_MAX_MS {
+        if ts_ms >= gap.deadline_ms {
+            outputs.push(EngineOutput::GapResolved {
+                session_index: session_idx,
+                ts_ms,
+                tier: GapTier::LongSessionClose,
+                duration_ms,
+            });
+            self.close_session(gap.started_ms, SessionEndReason::GapExceeded, outputs);
+            if reopen_on_close {
+                self.open_session(ts_ms, "stream resumed after gap exceeded", outputs);
+            }
+        } else if duration_ms <= SHORT_GAP_MAX_MS {
             self.ppg.on_short_gap_resume(ts_ms);
             self.last_any_packet_ts_ms = Some(ts_ms);
             self.last_valid_packet_ts_ms = Some(ts_ms);
@@ -63,7 +91,7 @@ impl SleepEngine {
                 tier: GapTier::ShortPause,
                 duration_ms,
             });
-        } else if duration_ms <= MEDIUM_GAP_MAX_MS {
+        } else {
             self.ppg.clear_rolling_windows(ts_ms);
             self.last_any_packet_ts_ms = Some(ts_ms);
             self.last_valid_packet_ts_ms = Some(ts_ms);
@@ -85,17 +113,6 @@ impl SleepEngine {
                 tier: GapTier::MediumStabilize,
                 duration_ms,
             });
-        } else {
-            outputs.push(EngineOutput::GapResolved {
-                session_index: session_idx,
-                ts_ms,
-                tier: GapTier::LongSessionClose,
-                duration_ms,
-            });
-            self.close_session(gap_start, SessionEndReason::GapExceeded, outputs);
-            if reopen_on_close {
-                self.open_session(ts_ms, "stream resumed after >15 min gap", outputs);
-            }
         }
     }
 
@@ -312,7 +329,7 @@ impl SleepEngine {
         self.sqi_sum = 0.0;
         self.sqi_count = 0;
         self.suppress_candidate_until_ms = None;
-        self.gap_started_ms = None;
+        self.active_gap = None;
         self.last_any_packet_ts_ms = None;
         self.last_valid_packet_ts_ms = None;
         self.reset_candidate_counters();
@@ -443,6 +460,7 @@ impl SleepEngine {
         let summary = self.build_summary(session_index, end_ts_ms, end_reason, medians);
         let prev = self.state;
         self.state = DetectorState::Idle;
+        self.active_gap = None;
         if prev != DetectorState::Idle {
             outputs.push(EngineOutput::StateChanged {
                 session_index,
@@ -473,24 +491,26 @@ impl SleepEngine {
 
     /// Returns the active gap start timestamp in milliseconds, if the engine is currently in a gap.
     pub fn gap_started_ms(&self) -> Option<i64> {
-        self.gap_started_ms
+        if self.state == DetectorState::Idle {
+            return None;
+        }
+        self.active_gap.map(|gap| gap.started_ms)
     }
 
-    /// Returns the millisecond timestamp when the active gap will exceed the 15-minute threshold.
+    /// Returns the millisecond timestamp when the active gap will exceed its disconnect-reason-aware closure window.
     pub fn gap_deadline_ms(&self) -> Option<i64> {
         if self.state == DetectorState::Idle {
             return None;
         }
-        let start = self.gap_started_ms?;
-        Some(start.saturating_add(MEDIUM_GAP_MAX_MS).saturating_add(1))
+        self.active_gap.map(|gap| gap.deadline_ms)
     }
 
-    /// Checks whether an active gap has exceeded 15 minutes, closing the session if so.
+    /// Checks whether an active gap has exceeded its active closure deadline, closing the session if so.
     pub fn check_gap_timeout(&mut self, now_ms: i64) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         if self.state != DetectorState::Idle
-            && let Some(start) = self.gap_started_ms
-            && now_ms.saturating_sub(start) > MEDIUM_GAP_MAX_MS
+            && let Some(deadline_ms) = self.gap_deadline_ms()
+            && now_ms >= deadline_ms
         {
             self.resolve_active_gap(now_ms, false, &mut outputs);
         }

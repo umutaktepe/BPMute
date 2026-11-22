@@ -4,8 +4,8 @@ use bpmute::config::{DetectionAdvancedConfig, DetectionConfig, Sensitivity};
 use bpmute::sleep_engine::{
     CalibrationMaturity, CalibrationPriors, ContactStatus, DesktopActivity, DesktopActivityKind,
     DetectorState, EngineConfig, EngineEvent, EngineOutput, Epoch, GapTier, GraceAbortReason,
-    GraceOutcome, GraceResult, HrPacket, SessionEndReason, SleepEngine, StreamState, StreamStatus,
-    WearableFloor,
+    GraceOutcome, GraceResult, HrPacket, SessionEndReason, SleepEngine, StreamDisconnectReason,
+    StreamDisconnected, StreamState, StreamStatus, WearableFloor,
 };
 
 fn default_engine() -> SleepEngine {
@@ -2081,4 +2081,206 @@ fn rem_cycle_quiet_wake_plateau_does_not_split_sleeping_session() {
         sleep_mu <= target_sleep_hr + 4.0,
         "morning wake tail must be excluded from sleep_mu_hr (got {sleep_mu:.2})"
     );
+}
+
+#[test]
+fn tiered_disconnect_close_window_boundaries_and_tightening() {
+    // 1. Explicit Remote disconnect closes at 2 min + 1 ms (120_001 ms), NOT 120_000 ms,
+    // with end_ts_ms = gap_started_ms and SessionEndReason::GapExceeded.
+    let mut eng_remote = default_engine();
+    eng_remote.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_remote, 1, 600, 68.0, true);
+    assert_eq!(eng_remote.state(), DetectorState::Monitoring);
+
+    let dc_ts = 600_000;
+    eng_remote.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: dc_ts,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    assert_eq!(eng_remote.gap_started_ms(), Some(dc_ts));
+    assert_eq!(eng_remote.gap_deadline_ms(), Some(dc_ts + 120_001));
+    assert!(eng_remote.check_gap_timeout(dc_ts + 120_000).is_empty());
+    assert_eq!(eng_remote.state(), DetectorState::Monitoring);
+
+    let closed_out = eng_remote.check_gap_timeout(dc_ts + 120_001);
+    assert!(closed_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::GapResolved {
+            tier: GapTier::LongSessionClose,
+            ..
+        }
+    )));
+    assert!(closed_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.session_index == 1
+                && s.end_reason == SessionEndReason::GapExceeded
+                && s.end_ts_ms == dc_ts
+    )));
+    assert_eq!(eng_remote.state(), DetectorState::Idle);
+    assert_eq!(eng_remote.gap_started_ms(), None);
+    assert_eq!(eng_remote.gap_deadline_ms(), None);
+
+    // 2. Resuming within 2 min (<= 120_000 ms) after Remote disconnect continues same session without resetting Warmup.
+    let mut eng_resume = default_engine();
+    eng_resume.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_resume, 1, 600, 68.0, true);
+    assert_eq!(eng_resume.state(), DetectorState::Monitoring);
+
+    eng_resume.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 600_000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    let resume_out = eng_resume.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 600_000 + 120_000,
+        status: StreamStatus::Streaming,
+    }));
+    assert!(resume_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::GapResolved {
+            tier: GapTier::ShortPause,
+            ..
+        }
+    )));
+    assert_eq!(eng_resume.current_session_index(), Some(1));
+    assert_eq!(eng_resume.state(), DetectorState::Monitoring);
+    assert_eq!(eng_resume.gap_started_ms(), None);
+    assert_eq!(eng_resume.gap_deadline_ms(), None);
+
+    // Resuming at 120_001 ms after Remote disconnect closes session 1 (GapExceeded) and opens session 2 (Warmup).
+    eng_resume.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 800_000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    let late_resume_out = eng_resume.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 800_000 + 120_001,
+        status: StreamStatus::Streaming,
+    }));
+    assert!(late_resume_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.session_index == 1
+                && s.end_reason == SessionEndReason::GapExceeded
+                && s.end_ts_ms == 800_000
+    )));
+    assert_eq!(eng_resume.current_session_index(), Some(2));
+    assert_eq!(eng_resume.state(), DetectorState::Warmup);
+
+    // 3. Explicit Timeout disconnect keeps 15 min tolerance (900_000 ms open, 900_001 ms closes).
+    let mut eng_timeout = default_engine();
+    eng_timeout.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_timeout, 1, 600, 68.0, true);
+    eng_timeout.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 600_000,
+        reason: StreamDisconnectReason::Timeout,
+    }));
+    assert_eq!(eng_timeout.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_timeout.gap_deadline_ms(), Some(600_000 + 900_001));
+    assert!(eng_timeout.check_gap_timeout(600_000 + 900_000).is_empty());
+    let timeout_out = eng_timeout.check_gap_timeout(600_000 + 900_001);
+    assert!(timeout_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.end_reason == SessionEndReason::GapExceeded && s.end_ts_ms == 600_000
+    )));
+    assert_eq!(eng_timeout.state(), DetectorState::Idle);
+
+    // 4. SignalLost followed by Remote tightens deadline while preserving original gap_started_ms.
+    let mut eng_tighten = default_engine();
+    eng_tighten.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_tighten, 1, 600, 68.0, true);
+    eng_tighten.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 600_000,
+        status: StreamStatus::SignalLost,
+    }));
+    assert_eq!(eng_tighten.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_tighten.gap_deadline_ms(), Some(600_000 + 900_001));
+
+    eng_tighten.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 660_000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    assert_eq!(eng_tighten.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_tighten.gap_deadline_ms(), Some(660_000 + 120_001));
+    assert!(eng_tighten.check_gap_timeout(660_000 + 120_000).is_empty());
+    let tighten_out = eng_tighten.check_gap_timeout(660_000 + 120_001);
+    assert!(tighten_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.end_reason == SessionEndReason::GapExceeded && s.end_ts_ms == 600_000
+    )));
+
+    // 5. Late Remote disconnect must never extend an already-closer SignalLost deadline.
+    let mut eng_no_extend = default_engine();
+    eng_no_extend.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_no_extend, 1, 600, 68.0, true);
+    eng_no_extend.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 600_000,
+        status: StreamStatus::SignalLost,
+    }));
+    eng_no_extend.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 600_000 + 850_000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    assert_eq!(eng_no_extend.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_no_extend.gap_deadline_ms(), Some(600_000 + 900_001));
+
+    // 6. Remote disconnect followed by StreamState(Disconnected) must never extend the 2-min deadline.
+    let mut eng_order = default_engine();
+    eng_order.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_order, 1, 600, 68.0, true);
+    eng_order.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 600_000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    eng_order.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 600_050,
+        status: StreamStatus::Disconnected,
+    }));
+    assert_eq!(eng_order.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_order.gap_deadline_ms(), Some(600_000 + 120_001));
+
+    // 7. Timeout disconnect upgraded to Remote preserves gap_started_ms and tightens deadline.
+    let mut eng_upgrade = default_engine();
+    eng_upgrade.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng_upgrade, 1, 600, 68.0, true);
+    eng_upgrade.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 600_000,
+        reason: StreamDisconnectReason::Timeout,
+    }));
+    assert_eq!(eng_upgrade.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_upgrade.gap_deadline_ms(), Some(600_000 + 900_001));
+    eng_upgrade.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 600_050,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    assert_eq!(eng_upgrade.gap_started_ms(), Some(600_000));
+    assert_eq!(eng_upgrade.gap_deadline_ms(), Some(600_050 + 120_001));
+    let upgrade_out = eng_upgrade.check_gap_timeout(600_050 + 120_001);
+    assert!(upgrade_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.end_reason == SessionEndReason::GapExceeded && s.end_ts_ms == 600_000
+    )));
 }

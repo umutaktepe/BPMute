@@ -89,7 +89,9 @@ fn events_to_csv(events: &[EngineEvent]) -> String {
                     stream_status_label(st.status)
                 ));
             }
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => {}
         }
     }
     out
@@ -111,7 +113,9 @@ fn events_to_jsonl(events: &[EngineEvent]) -> String {
                 "event": stream_status_label(st.status),
             })
             .to_string(),
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => continue,
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => continue,
         };
         out.push_str(&line);
         out.push('\n');

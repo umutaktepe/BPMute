@@ -94,6 +94,7 @@ async fn test_cli_tui_flags_are_scoped_and_80x24_baseline_renders_cleanly() {
         alerts: Vec::new(),
         idle_backend: Some("ext-idle-notify".into()),
         playing_players_count: Some(1),
+        session_close_deadline_ms: None,
     });
     app.enrolled_wearables = vec![make_wearable(
         "w-1",
@@ -1200,6 +1201,7 @@ custom_command = ["notify-send", "sleepy"]
         alerts: Vec::new(),
         idle_backend: Some("test-idle".into()),
         playing_players_count: Some(0),
+        session_close_deadline_ms: None,
     }))));
     assert!(app.daemon_connected);
 
@@ -2500,6 +2502,7 @@ fn test_mouse_dashboard_system_card_diagnostics_and_readonly_cards() {
         alerts: Vec::new(),
         idle_backend: Some("ext-idle-notify".into()),
         playing_players_count: Some(1),
+        session_close_deadline_ms: None,
     });
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

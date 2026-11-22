@@ -609,7 +609,9 @@ async fn feed_until_confirmed(
                     .await
                     .unwrap();
             }
-            EngineEvent::DesktopActivity(_) | EngineEvent::GraceOutcome(_) => {}
+            EngineEvent::StreamDisconnected(_)
+            | EngineEvent::DesktopActivity(_)
+            | EngineEvent::GraceOutcome(_) => {}
         }
     }
 

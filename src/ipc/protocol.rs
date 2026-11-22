@@ -330,6 +330,8 @@ pub struct DaemonStatus {
     pub idle_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub playing_players_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_close_deadline_ms: Option<i64>,
 }
 
 /// Offline `bpmute status --json` payload (ADR-0002, ADR-0009).

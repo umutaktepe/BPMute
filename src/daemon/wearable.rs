@@ -2,7 +2,7 @@
 
 use tokio::sync::{mpsc, watch};
 
-use crate::sleep_engine::{HrPacket, StreamState};
+use crate::sleep_engine::{HrPacket, StreamDisconnectReason, StreamState};
 
 pub use crate::storage::WearableDescriptor;
 
@@ -12,6 +12,11 @@ pub enum WearableEvent {
     StreamState {
         wearable: WearableDescriptor,
         state: StreamState,
+    },
+    StreamDisconnected {
+        wearable: WearableDescriptor,
+        ts_ms: i64,
+        reason: StreamDisconnectReason,
     },
     HrPacket {
         wearable: WearableDescriptor,

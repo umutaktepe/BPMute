@@ -100,6 +100,25 @@ pub struct StreamState {
     pub status: StreamStatus,
 }
 
+/// Disconnect classification determining `Monitoring Session` gap tolerance (ADR-0012).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamDisconnectReason {
+    /// Explicit remote Wearable termination (`org.bluez.Reason.Remote`): 2-minute tolerance.
+    Remote,
+    /// RF timeout, link loss, or legacy BlueZ fallback: 15-minute tolerance.
+    #[default]
+    Timeout,
+}
+
+/// Explicit Wearable disconnect transition carrying disconnect-reason semantics (ADR-0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamDisconnected {
+    pub ts_ms: i64,
+    #[serde(default)]
+    pub reason: StreamDisconnectReason,
+}
+
 /// Desktop user activity classification observed outside the pure engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +158,7 @@ pub struct GraceOutcome {
 pub enum EngineEvent {
     HrPacket(HrPacket),
     StreamState(StreamState),
+    StreamDisconnected(StreamDisconnected),
     DesktopActivity(DesktopActivity),
     GraceOutcome(GraceOutcome),
 }
@@ -149,6 +169,7 @@ impl EngineEvent {
         match self {
             Self::HrPacket(ev) => ev.ts_ms,
             Self::StreamState(ev) => ev.ts_ms,
+            Self::StreamDisconnected(ev) => ev.ts_ms,
             Self::DesktopActivity(ev) => ev.ts_ms,
             Self::GraceOutcome(ev) => ev.ts_ms,
         }
