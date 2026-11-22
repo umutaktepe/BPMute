@@ -629,6 +629,7 @@ async fn test_poweroff_race_preserves_trigger_metadata_and_calibration() {
     let _ = client.next_event().await.unwrap();
 
     feed_until_confirmed(&wearable_tx, &mut client, start_utc.timestamp_millis()).await;
+    drop(client);
 
     assert_eq!(power_rx.recv().await, Some(PowerAction::Poweroff));
 
