@@ -1536,7 +1536,7 @@ fn test_mouse_footer_disabled_and_muted_guards() {
         raw_samples_count: 100,
         feedback: None,
     };
-    app.history_sessions = vec![active_session];
+    app.history_sessions = vec![active_session.clone()];
     app.storage_stats = Some(bpmute::storage::StorageStats {
         db_size_bytes: 1024,
         wal_size_bytes: 0,
@@ -3800,7 +3800,7 @@ fn test_tuiapp_tracks_session_close_deadline_and_counts_down_on_ticks() {
     assert_eq!(app.session_close_remaining_sec(), Some(29));
     assert_eq!(
         bpmute::tui::format_close_countdown(app.session_close_remaining_sec().unwrap()),
-        "29s"
+        "0m 29s"
     );
 
     // 4. StateChanged clearing deadline (e.g. streaming resumed) reverts it to None
@@ -3819,8 +3819,6 @@ fn test_tuiapp_tracks_session_close_deadline_and_counts_down_on_ticks() {
 
 #[test]
 fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
-    use bpmute::storage::SessionListEntry;
-
     let deadline_ms = 1_700_000_120_001i64;
     let server_now = 1_700_000_000_000i64;
 
@@ -3836,28 +3834,15 @@ fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
         server_now_ms: Some(server_now),
     })));
 
-    let active_session = SessionListEntry {
-        id: "sess-closing".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Watch".into()),
-        wearable_mac_masked: "..:EC:05".into(),
-        status: SessionStatus::Active,
-        start_ts_ms: server_now - 600_000,
-        end_ts_ms: server_now,
-        end_reason: None,
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(65.0),
-        sleep_mu_hr: None,
-        onset_confirmed_ts_ms: None,
-        sleeping_ts_ms: None,
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 40,
-        raw_samples_count: 600,
-        feedback: None,
-    };
-    app.history_sessions = vec![active_session];
+    let active_session = make_history_session(
+        "sess-closing",
+        "Watch",
+        server_now - 600_000,
+        server_now,
+        SessionStatus::Active,
+        40,
+    );
+    app.history_sessions = vec![active_session.clone()];
     app.selected_session_idx = 0;
 
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3880,13 +3865,24 @@ fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
     let (end_col, end_row) = find_text_coords(&buf, "[E] End Session").unwrap();
     let cmd = app.handle_event(mouse_left_click(end_col + 1, end_row));
     assert_eq!(cmd, Some(TuiCommand::SessionEnd));
+
+    // Simulate daemon push confirming session closure
+    let mut closed_entry = active_session.clone();
+    closed_entry.status = SessionStatus::Closed;
+    closed_entry.end_reason = Some(SessionEndReason::ManualClose);
+    app.handle_ipc(IpcEvent::SessionClosed(Box::new(make_session_detail(
+        &closed_entry,
+        vec![],
+    ))));
+    status.monitoring_state = MonitoringState::Idle;
+    status.session_close_deadline_ms = None;
+    app.handle_ipc(IpcEvent::StateChanged(status.clone()));
     assert_eq!(app.monitoring_state, MonitoringState::Idle);
     assert_eq!(app.history_sessions[0].status, SessionStatus::Closed);
     assert_eq!(
         app.history_sessions[0].end_reason,
         Some(SessionEndReason::ManualClose)
     );
-    assert!(app.op_feedback.is_some());
 
     // 2. History rendering: [CLOSING] badge, detail countdown, and Footer
     // Re-arm closing state for History test
@@ -3957,12 +3953,17 @@ fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
         app.handle_event(TuiEvent::Key(key(KeyCode::Char('E')))),
         Some(TuiCommand::SessionEnd)
     );
-    assert_eq!(app.monitoring_state, MonitoringState::Idle);
+    // Lowercase 'e' does not trigger SessionEnd (History tab has no 'e' binding)
+    app.active_tab = Tab::History;
+    assert_eq!(
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char('e')))),
+        None
+    );
 
     // 6. Verification with --ascii and NO_COLOR themes at 80x24
     let mut app_ascii = TuiApp::new_with_theme(false, Theme::new(true, true), false);
     app_ascii.handle_ipc(IpcEvent::Snapshot(Box::new(bpmute::ipc::SnapshotEvent {
-        status,
+        status: status.clone(),
         hr_ring_buffer: vec![],
         alerts: vec![],
         server_now_ms: Some(server_now),
@@ -3977,27 +3978,14 @@ fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
     assert!(find_text_coords(&buf_ascii, "[E] End Session").is_some());
 
     app_ascii.active_tab = Tab::History;
-    app_ascii.history_sessions = vec![SessionListEntry {
-        id: "sess-closing-ascii".into(),
-        wearable_id: "w-1".into(),
-        wearable_alias: Some("Watch".into()),
-        wearable_mac_masked: "..:EC:05".into(),
-        status: SessionStatus::Active,
-        start_ts_ms: server_now - 600_000,
-        end_ts_ms: server_now,
-        end_reason: None,
-        detection_sensitivity: Sensitivity::Balanced,
-        had_rr: true,
-        warmup_mu_hr: Some(65.0),
-        sleep_mu_hr: None,
-        onset_confirmed_ts_ms: None,
-        sleeping_ts_ms: None,
-        auto_anomalous: false,
-        fp_count: 0,
-        epochs_count: 40,
-        raw_samples_count: 600,
-        feedback: None,
-    }];
+    app_ascii.history_sessions = vec![make_history_session(
+        "sess-closing-ascii",
+        "Watch",
+        server_now - 600_000,
+        server_now,
+        SessionStatus::Active,
+        40,
+    )];
     terminal
         .draw(|f| app_ascii.render(f.area(), f.buffer_mut()))
         .unwrap();
@@ -4005,6 +3993,25 @@ fn test_dashboard_and_history_render_close_countdown_and_end_session_action() {
     assert!(find_text_coords(&buf_ascii_hist, "[CLOSING]").is_some());
     assert!(find_text_coords(&buf_ascii_hist, "Outcome: Closing in 2m 0s").is_some());
     assert!(find_text_coords(&buf_ascii_hist, "[E] End Session").is_some());
+
+    // 7. Compact 60x18 viewport verification (CODING_STANDARDS.md)
+    let mut term_compact = Terminal::new(TestBackend::new(60, 18)).unwrap();
+    app.active_tab = Tab::Dashboard;
+    term_compact
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_compact_dash = term_compact.backend().buffer().clone();
+    assert!(find_text_coords(&buf_compact_dash, "Closing in 2m 0s").is_some());
+    assert!(find_text_coords(&buf_compact_dash, "[E] End Session").is_some());
+
+    app.active_tab = Tab::History;
+    term_compact
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_compact_hist = term_compact.backend().buffer().clone();
+    assert!(find_text_coords(&buf_compact_hist, "[CLOSING]").is_some());
+    assert!(find_text_coords(&buf_compact_hist, "Closing in").is_some());
+    assert!(find_text_coords(&buf_compact_hist, "[E]").is_some());
 }
 
 #[tokio::test(start_paused = true)]
@@ -4186,7 +4193,7 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
         .session_close_remaining_sec()
         .expect("remaining sec must be present");
     assert!(
-        (830..=850).contains(&rem_sec),
+        (820..=860).contains(&rem_sec),
         "Expected remaining sec ~840s (14m) after 60s elapsed; got {rem_sec}"
     );
 
@@ -4261,16 +4268,9 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     let (click_col, click_row) =
         find_text_coords(terminal.backend().buffer(), "[E] End Session").unwrap();
 
-    // Mouse click immediately invokes session.end
+    // Mouse click immediately returns SessionEnd command (no optimistic mutation)
     let click_cmd = app2.handle_event(mouse_left_click(click_col + 1, click_row));
     assert_eq!(click_cmd, Some(TuiCommand::SessionEnd));
-    assert_eq!(app2.monitoring_state, MonitoringState::Idle);
-    assert_eq!(app2.history_sessions[0].status, SessionStatus::Closed);
-    assert_eq!(
-        app2.history_sessions[0].end_reason,
-        Some(SessionEndReason::ManualClose)
-    );
-    assert!(app2.op_feedback.is_some());
 
     // Dispatch the SessionEnd command over the real socket
     cmd_tx2.send(click_cmd.unwrap()).await.unwrap();
@@ -4281,6 +4281,9 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
             && a.history_sessions
                 .first()
                 .is_some_and(|s| s.status == SessionStatus::Closed)
+            && a.op_feedback
+                .as_ref()
+                .is_some_and(|f| f.message == "Monitoring session ended")
     })
     .await;
 

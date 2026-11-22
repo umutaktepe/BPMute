@@ -16,6 +16,7 @@ use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus, Snapsho
 use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, resolve_config_file, split_shell_words};
 use crate::storage::{LedgerStore, StorageError, db_exists, db_path_in_data_dir};
+use crate::tui::format_close_countdown;
 
 pub mod completions;
 pub mod data;
@@ -287,19 +288,6 @@ async fn fetch_daemon_now_ms(client: &mut IpcClient) -> i64 {
         }
     }
     chrono::Utc::now().timestamp_millis()
-}
-
-fn format_close_countdown(sec: u64) -> String {
-    if sec >= 3600 {
-        let h = sec / 3600;
-        let m = (sec % 3600) / 60;
-        let s = sec % 60;
-        format!("{h}h {m}m {s}s")
-    } else if sec >= 60 {
-        format!("{}m {}s", sec / 60, sec % 60)
-    } else {
-        format!("{sec}s")
-    }
 }
 
 async fn run_pause<WOut: Write, WErr: Write>(

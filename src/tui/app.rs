@@ -21,8 +21,8 @@ use crate::ipc::protocol::{
     DaemonAlert, DaemonStatus, DiscoveredWearable, EnrolledWearableStatus, MonitoringState,
     alert_ids,
 };
-use crate::sleep_engine::{CalibrationMaturity, Epoch, SessionEndReason, StreamStatus};
-use crate::storage::{SessionFullDetail, SessionListEntry, SessionStatus, StorageStats};
+use crate::sleep_engine::{CalibrationMaturity, Epoch, StreamStatus};
+use crate::storage::{SessionFullDetail, SessionListEntry, StorageStats};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -636,27 +636,6 @@ impl TuiApp {
             return None;
         }
 
-        self.monitoring_state = MonitoringState::Idle;
-        self.session_close_deadline_ms = None;
-
-        for s in &mut self.history_sessions {
-            if s.status == SessionStatus::Active {
-                s.status = SessionStatus::Closed;
-                s.end_reason = Some(SessionEndReason::ManualClose);
-            }
-        }
-        if let Some(ref mut detail) = self.selected_session_detail
-            && detail.status == SessionStatus::Active
-        {
-            detail.status = SessionStatus::Closed;
-            detail.session.end_reason = SessionEndReason::ManualClose;
-        }
-
-        self.op_feedback = Some(OpFeedback {
-            is_error: false,
-            message: "Monitoring session ended".to_string(),
-        });
-
         Some(TuiCommand::SessionEnd)
     }
 
@@ -754,16 +733,7 @@ fn render_resize_notice(area: Rect, buf: &mut Buffer, theme: Theme) {
     Paragraph::new(lines).render(inner, buf);
 }
 
-/// Formats remaining seconds as compact countdown string (e.g. `2m 0s`, `1m 59s`, `29s`, `1h 2m 3s`).
+/// Formats remaining seconds as compact countdown string in `Xm Ys` format (e.g. `2m 0s`, `1m 59s`, `0m 29s`).
 pub fn format_close_countdown(sec: u64) -> String {
-    if sec >= 3600 {
-        let h = sec / 3600;
-        let m = (sec % 3600) / 60;
-        let s = sec % 60;
-        format!("{h}h {m}m {s}s")
-    } else if sec >= 60 {
-        format!("{}m {}s", sec / 60, sec % 60)
-    } else {
-        format!("{sec}s")
-    }
+    format!("{}m {}s", sec / 60, sec % 60)
 }
