@@ -12,9 +12,9 @@ use tempfile::TempDir;
 use tokio::sync::{mpsc, watch};
 
 use bpmute::calibration::SessionLedgerRecord;
-use bpmute::config::{CliOverrides, LoadedConfig, PowerAction};
+use bpmute::config::{CliOverrides, LoadedConfig, PowerAction, ScheduleConfig};
 use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock, WearableEvent, WearableSource};
-use bpmute::ipc::protocol::EnrolledWearableStatus;
+use bpmute::ipc::protocol::{DaemonStatus, EnrolledWearableStatus, MonitoringState};
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
     ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason, SessionSummary,
@@ -94,6 +94,30 @@ pub fn mouse_scroll_up(col: u16, row: u16) -> TuiEvent {
 
 pub fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::empty())
+}
+
+pub fn make_daemon_status(schedule: ScheduleConfig) -> DaemonStatus {
+    DaemonStatus {
+        v: 1,
+        daemon_running: true,
+        version: "0.1.0".into(),
+        pid: 1234,
+        uptime_sec: 10,
+        monitoring_state: MonitoringState::Monitoring,
+        armed: true,
+        paused: false,
+        paused_until: None,
+        pause_mode: None,
+        dry_run: false,
+        schedule,
+        config_path: String::new(),
+        config_loaded_from_file: false,
+        socket_path: String::new(),
+        log_biometrics: false,
+        alerts: Vec::new(),
+        idle_backend: Some("test-idle".into()),
+        playing_players_count: Some(0),
+    }
 }
 
 pub fn make_wearable(

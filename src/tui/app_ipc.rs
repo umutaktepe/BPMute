@@ -20,6 +20,9 @@ impl TuiApp {
         {
             self.grace_state = None;
         }
+        if let Some(ref mut cfg) = self.active_config {
+            cfg.schedule = status.schedule.clone();
+        }
         self.daemon_status = Some(status);
     }
 
@@ -369,6 +372,9 @@ impl TuiApp {
                 self.selected_session_detail = Some(*detail);
             }
             IpcEvent::ConfigLoaded(cfg) => {
+                if let Some(ref mut status) = self.daemon_status {
+                    status.schedule = cfg.schedule.clone();
+                }
                 self.active_config = Some(cfg);
                 self.config_error = None;
             }

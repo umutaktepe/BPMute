@@ -18,8 +18,8 @@ use crate::actions::pipeline::SleepActionPipeline;
 use crate::actions::traits::{ActionExecutor, Notifier};
 use crate::calibration::CalibrationState;
 use crate::config::{
-    CliOverrides, ClockTime, ConfigPatch, DetectionConfig, LoadedConfig, PowerAction,
-    RawSamplesRetention, patch_config_file,
+    CliOverrides, ConfigPatch, DetectionConfig, LoadedConfig, PowerAction, RawSamplesRetention,
+    patch_config_file,
 };
 use crate::daemon::EngineControlEvent;
 use crate::idle::{IdleBackendKind, IdleProbe};
@@ -545,11 +545,7 @@ impl DaemonCore {
                     ));
                 }
                 let now_local = self.clock.now_local();
-                let target_clock = if guard.loaded_config.config.schedule.active_hours_enabled {
-                    guard.loaded_config.config.schedule.end
-                } else {
-                    ClockTime::new(8, 0).expect("08:00 is valid")
-                };
+                let target_clock = guard.loaded_config.config.schedule.end;
                 let target_local = target_clock.next_occurrence_after(now_local);
                 let delta = target_local.with_timezone(&Utc) - now_local.with_timezone(&Utc);
                 let wait = delta.to_std().unwrap_or(Duration::from_secs(1));

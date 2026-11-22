@@ -2703,7 +2703,7 @@ fn test_mouse_pause_popover_two_click_wheel_and_backdrop() {
         ),
         (
             4usize,
-            "5. Pause until next morning",
+            "5. Pause until 08:00 (Active Hours end)",
             TuiCommand::Pause(PauseParams {
                 mode: Some(PauseMode::UntilMorning),
                 duration_sec: None,
@@ -2817,6 +2817,63 @@ fn test_mouse_pause_popover_two_click_wheel_and_backdrop() {
     assert_eq!(app_nm.handle_event(mouse_scroll_down(0, 5)), None);
     assert_eq!(app_nm.handle_event(mouse_left_click(0, 0)), None);
     assert_eq!(app_nm.modal, ModalState::PausePopover { selected_idx: 0 });
+}
+
+#[test]
+fn test_dashboard_active_hours_24_7_and_pause_popover_end_time() {
+    use bpmute::config::{ClockTime, Config, ScheduleConfig};
+
+    let mut app = TuiApp::new(false, false, false);
+    app.handle_ipc(IpcEvent::Connected(make_daemon_status(
+        ScheduleConfig::default(),
+    )));
+    app.active_config = Some(Config::default());
+
+    let mut term80 = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term80
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_default = buffer_to_string(term80.backend().buffer());
+    assert!(
+        out_default.contains("Active: 24/7") && !out_default.contains("Sched: Off"),
+        "System card must render glossary-aligned 24/7 status:\n{out_default}"
+    );
+
+    // ConfigLoaded updates schedule.end to 12:00 while Active Hours stays disabled.
+    let cfg_12 = Config {
+        schedule: ScheduleConfig {
+            active_hours_enabled: false,
+            start: ClockTime::new(23, 0).unwrap(),
+            end: ClockTime::new(12, 0).unwrap(),
+        },
+        ..Default::default()
+    };
+    app.handle_ipc(IpcEvent::ConfigLoaded(cfg_12.clone()));
+
+    app.modal = ModalState::PausePopover { selected_idx: 4 };
+    for (w, h) in [(80, 24), (60, 18)] {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+        let out_pop = buffer_to_string(term.backend().buffer());
+        assert!(
+            out_pop.contains("5. Pause until 12:00 (Active Hours end)"),
+            "PausePopover at {w}x{h} must show dynamic schedule.end without clipping:\n{out_pop}"
+        );
+    }
+
+    // Enabling Active Hours switches System card to the configured window.
+    let mut cfg_on = cfg_12;
+    cfg_on.schedule.active_hours_enabled = true;
+    app.handle_ipc(IpcEvent::ConfigLoaded(cfg_on));
+    app.modal = ModalState::None;
+    term80
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let out_on = buffer_to_string(term80.backend().buffer());
+    assert!(
+        out_on.contains("23:00-12:00"),
+        "System card must reflect ConfigLoaded Active Hours window:\n{out_on}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

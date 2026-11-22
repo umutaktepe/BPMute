@@ -365,7 +365,7 @@ impl TuiApp {
                     self.focus_active_hours_field(active_field.prev());
                     None
                 }
-                KeyCode::Char(' ')
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
                     if active_field == super::super::app::ActiveHoursField::Enabled =>
                 {
                     self.toggle_active_hours_enabled();

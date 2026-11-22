@@ -792,7 +792,12 @@ fn render_active_hours_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map
         }
     };
 
-    let enabled_check = if enabled { "[x]" } else { "[ ]" };
+    let enabled_label = match (enabled, app.theme.ascii) {
+        (false, false) => "[ ] Off — Armed 24/7  (Space)",
+        (false, true) => "[ ] Off -- Armed 24/7  (Space)",
+        (true, false) => "[x] On — Window only  (Space)",
+        (true, true) => "[x] On -- Window only  (Space)",
+    };
     let enabled_target = Some(ClickTarget::ActiveHoursToggleEnabled);
     let step_hint = if app.theme.ascii {
         "  (HH:MM, <-/-> +/-15m)"
@@ -818,10 +823,7 @@ fn render_active_hours_modal(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map
                 enabled_target,
             ),
             (
-                Span::styled(
-                    format!("{enabled_check} Arm Grace Period during window"),
-                    field_style(ActiveHoursField::Enabled),
-                ),
+                Span::styled(enabled_label, field_style(ActiveHoursField::Enabled)),
                 enabled_target,
             ),
         ],

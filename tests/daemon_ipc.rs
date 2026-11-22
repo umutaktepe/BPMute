@@ -261,6 +261,74 @@ async fn subscribe_snapshot_pause_until_morning_and_virtual_time_auto_resume() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn pause_until_morning_uses_configured_end_when_active_hours_disabled_and_keeps_active_timer()
+{
+    let temp = TempDir::new().unwrap();
+    let local_start = Local.with_ymd_and_hms(2026, 11, 22, 4, 0, 0).unwrap();
+    let (daemon, paths) = start_virtual_daemon(&temp, local_start.with_timezone(&Utc)).await;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+
+    // Configure end = "12:00" with active_hours_enabled = false.
+    client
+        .request(
+            "config.update",
+            json!({
+                "schedule": {
+                    "active_hours_enabled": false,
+                    "start": "23:00",
+                    "end": "12:00"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    // UntilMorning must use configured schedule.end ("12:00") even when Active Hours is disabled.
+    let pause_resp = client
+        .request("monitor.pause", json!({ "mode": "until_morning" }))
+        .await
+        .unwrap();
+    let paused_until: chrono::DateTime<Local> =
+        chrono::DateTime::parse_from_rfc3339(pause_resp["paused_until"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Local);
+    assert_eq!((paused_until.hour(), paused_until.minute()), (12, 0));
+
+    // Updating schedule.end while already paused must leave the active timer untouched.
+    client
+        .request(
+            "config.update",
+            json!({
+                "schedule": {
+                    "end": "13:30"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let mid_status = client.request("daemon.status", json!({})).await.unwrap();
+    let mid_until: chrono::DateTime<Local> =
+        chrono::DateTime::parse_from_rfc3339(mid_status["paused_until"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Local);
+    assert_eq!((mid_until.hour(), mid_until.minute()), (12, 0));
+
+    // Re-pausing with UntilMorning picks up the new schedule.end ("13:30").
+    let next_pause = client
+        .request("monitor.pause", json!({ "mode": "until_morning" }))
+        .await
+        .unwrap();
+    let next_until: chrono::DateTime<Local> =
+        chrono::DateTime::parse_from_rfc3339(next_pause["paused_until"].as_str().unwrap())
+            .unwrap()
+            .with_timezone(&Local);
+    assert_eq!((next_until.hour(), next_until.minute()), (13, 30));
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn config_reload_preserves_last_valid_config_and_keeps_connections_alive() {
     let temp = TempDir::new().unwrap();
     let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 12, 0, 0).unwrap();

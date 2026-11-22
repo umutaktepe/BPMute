@@ -287,11 +287,11 @@ fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
         "Disarmed"
     };
     let dry_str = if app.dry_run { " [DRY]" } else { "" };
-    let sched_str = match app.daemon_status.as_ref() {
-        Some(st) if st.schedule.active_hours_enabled => {
-            format!("{}-{}", st.schedule.start, st.schedule.end)
+    let active_hours_str = match active_hours_config(app) {
+        Some(ah) if ah.active_hours_enabled => {
+            format!("{}-{}", ah.start, ah.end)
         }
-        _ => "Sched: Off".to_string(),
+        _ => "Active: 24/7".to_string(),
     };
 
     let lines = vec![
@@ -307,11 +307,18 @@ fn render_system_card(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
         ]),
         Line::from(vec![
             Span::styled(format!(" {arm_str}{dry_str}"), app.theme.primary()),
-            Span::styled(format!(" | {sched_str}"), app.theme.muted()),
+            Span::styled(format!(" | {active_hours_str}"), app.theme.muted()),
         ]),
     ];
 
     Paragraph::new(lines).render(inner, buf);
+}
+
+fn active_hours_config(app: &TuiApp) -> Option<&crate::config::ScheduleConfig> {
+    app.active_config
+        .as_ref()
+        .map(|c| &c.schedule)
+        .or_else(|| app.daemon_status.as_ref().map(|s| &s.schedule))
 }
 
 fn truncate_label(s: &str, max_chars: usize) -> String {
@@ -467,7 +474,7 @@ pub(crate) fn render_pause_popover(
     buf: &mut Buffer,
     hit_map: &mut HitMap,
 ) {
-    let popover_area = centered_rect(content_area, 44, 9);
+    let popover_area = centered_rect(content_area, 48, 9);
     // Register backdrop close + wheel navigation before popover body absorber and option rows
     hit_map.push_modal_click(full_area, ClickTarget::CloseModal);
     hit_map.push_modal_scroll(full_area, ScrollTarget::PausePopover);
@@ -479,12 +486,16 @@ pub(crate) fn render_pause_popover(
     let inner = block.inner(popover_area);
     block.render(popover_area, buf);
 
+    let until_end = active_hours_config(app)
+        .map(|ah| ah.end)
+        .unwrap_or_else(|| crate::config::ScheduleConfig::default().end);
+    let until_label = format!("5. Pause until {until_end} (Active Hours end)");
     let options = [
         "1. Resume monitoring",
         "2. Pause indefinitely",
         "3. Pause 1 hour",
         "4. Pause 2 hours",
-        "5. Pause until next morning",
+        until_label.as_str(),
     ];
 
     let mut lines = Vec::new();

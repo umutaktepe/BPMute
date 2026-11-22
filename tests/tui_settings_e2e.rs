@@ -1530,6 +1530,73 @@ fn test_settings_active_hours_validation_submission_and_roundtrip() {
 }
 
 #[test]
+fn test_active_hours_modal_copy_and_left_right_toggle() {
+    use bpmute::config::ClockTime;
+
+    for ascii in [false, true] {
+        let mut app = TuiApp::new(false, ascii, false);
+        app.daemon_connected = true;
+        app.active_tab = Tab::Settings;
+        app.active_config = Some(bpmute::config::Config {
+            schedule: ScheduleConfig {
+                active_hours_enabled: false,
+                start: ClockTime::new(23, 0).unwrap(),
+                end: ClockTime::new(12, 0).unwrap(),
+            },
+            ..Default::default()
+        });
+        app.selected_setting_idx = 6;
+
+        // Open ActiveHoursModal
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Enter))), None);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let out_off = buffer_to_string(terminal.backend().buffer());
+        let expected_off = if ascii {
+            "[ ] Off -- Armed 24/7  (Space)"
+        } else {
+            "[ ] Off — Armed 24/7  (Space)"
+        };
+        assert!(
+            out_off.contains(expected_off),
+            "Disabled ActiveHoursModal must clarify 24/7 arming (ascii={ascii}):\n{out_off}"
+        );
+        if ascii {
+            assert!(out_off.is_ascii());
+        }
+
+        // Right/Left arrows toggle Enabled when Enabled is focused
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Right))), None);
+        for (w, h) in [(80, 24), (60, 18)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+            let out_on = buffer_to_string(term.backend().buffer());
+            let expected_on = if ascii {
+                "[x] On -- Window only  (Space)"
+            } else {
+                "[x] On — Window only  (Space)"
+            };
+            assert!(
+                out_on.contains(expected_on),
+                "Enabled ActiveHoursModal must clarify window-only arming at {w}x{h} (ascii={ascii}):\n{out_on}"
+            );
+            if ascii {
+                assert!(out_on.is_ascii());
+            }
+        }
+
+        assert_eq!(app.handle_event(TuiEvent::Key(key(KeyCode::Left))), None);
+        assert!(matches!(
+            app.modal,
+            ModalState::ActiveHoursModal { enabled: false, .. }
+        ));
+    }
+}
+
+#[test]
 fn test_soft_rebaseline_modal_accepts_up_to_140_bpm() {
     let mut app = TuiApp::new(false, false, false);
     app.daemon_connected = true;
