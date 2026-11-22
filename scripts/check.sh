@@ -162,6 +162,7 @@ for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
             )
 PY
 
+# shellcheck disable=SC2016
 if find src tests -name '*.rs' -print0 | xargs -0 awk '
   FNR == 1 { in_test = 0; paused = 0; test_indent = 0 }
   /^[[:space:]]*#\[tokio::test/ {
