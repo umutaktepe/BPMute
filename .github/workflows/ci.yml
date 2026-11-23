@@ -1,9 +1,11 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+  # To re-enable automatic CI on push or pull request, uncomment:
+  # push:
+  #   branches: [main]
+  # pull_request:
 
 jobs:
   check:
