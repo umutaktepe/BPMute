@@ -46,7 +46,7 @@ impl SleepEngine {
     /// On success, closes the session anchored to `end_ts_ms = gap_started_ms` with
     /// [`SessionEndReason::ManualClose`].
     pub fn manual_close_session(&mut self) -> Result<Vec<EngineOutput>, ManualCloseError> {
-        if self.state == DetectorState::Idle {
+        if self.state == DetectorState::Idle || self.state == DetectorState::Standby {
             return Err(ManualCloseError::NoActiveSession);
         }
         let Some(gap) = self.active_gap else {
@@ -58,7 +58,7 @@ impl SleepEngine {
     }
 
     pub(super) fn begin_or_tighten_gap(&mut self, ts_ms: i64, window_ms: i64) {
-        if self.state == DetectorState::Idle {
+        if self.state == DetectorState::Idle || self.state == DetectorState::Standby {
             return;
         }
         let candidate_deadline = ts_ms.saturating_add(window_ms).saturating_add(1);
@@ -381,7 +381,7 @@ impl SleepEngine {
         if from != to {
             self.state = to;
             outputs.push(EngineOutput::StateChanged {
-                session_index: self.session_index.unwrap_or(1),
+                session_index: self.session_index.unwrap_or(0),
                 ts_ms,
                 from,
                 to,
@@ -480,6 +480,19 @@ impl SleepEngine {
         outputs: &mut Vec<EngineOutput>,
     ) {
         let Some(session_index) = self.session_index else {
+            let prev = self.state;
+            self.state = DetectorState::Idle;
+            self.active_gap = None;
+            if prev != DetectorState::Idle {
+                outputs.push(EngineOutput::StateChanged {
+                    session_index: 0,
+                    ts_ms: end_ts_ms,
+                    from: prev,
+                    to: DetectorState::Idle,
+                    p_sleep: self.hmm.probs()[STATE_SLEEP_NREM],
+                    reason: "standby ended".to_string(),
+                });
+            }
             return;
         };
         let medians = self.sleep_samples.finalize_medians();
@@ -517,7 +530,7 @@ impl SleepEngine {
 
     /// Returns the active gap start timestamp in milliseconds, if the engine is currently in a gap.
     pub fn gap_started_ms(&self) -> Option<i64> {
-        if self.state == DetectorState::Idle {
+        if self.state == DetectorState::Idle || self.state == DetectorState::Standby {
             return None;
         }
         self.active_gap.map(|gap| gap.started_ms)
@@ -525,7 +538,7 @@ impl SleepEngine {
 
     /// Returns the millisecond timestamp when the active gap will exceed its disconnect-reason-aware closure window.
     pub fn gap_deadline_ms(&self) -> Option<i64> {
-        if self.state == DetectorState::Idle {
+        if self.state == DetectorState::Idle || self.state == DetectorState::Standby {
             return None;
         }
         self.active_gap.map(|gap| gap.deadline_ms)
@@ -535,6 +548,7 @@ impl SleepEngine {
     pub fn check_gap_timeout(&mut self, now_ms: i64) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         if self.state != DetectorState::Idle
+            && self.state != DetectorState::Standby
             && let Some(deadline_ms) = self.gap_deadline_ms()
             && now_ms >= deadline_ms
         {

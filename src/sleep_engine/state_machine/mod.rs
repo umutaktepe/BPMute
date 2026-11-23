@@ -185,6 +185,7 @@ pub struct SleepEngine {
     ppg: PpgPipeline,
     baseline: QuietWakeBaseline,
     hmm: HmmFilter,
+    within_active_hours: bool,
 }
 
 impl SleepEngine {
@@ -240,7 +241,58 @@ impl SleepEngine {
             ppg: PpgPipeline::new(),
             baseline: QuietWakeBaseline::new(),
             hmm: HmmFilter::new(),
+            within_active_hours: true,
         }
+    }
+
+    /// Sets whether the local clock is within configured Active Hours.
+    pub fn set_active_hours(&mut self, within: bool) {
+        self.within_active_hours = within;
+    }
+
+    pub(super) fn enter_standby_internal(
+        &mut self,
+        ts_ms: i64,
+        reason: &str,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        let prev = self.state;
+        if prev != DetectorState::Standby {
+            self.state = DetectorState::Standby;
+            self.active_gap = None;
+            outputs.push(EngineOutput::StateChanged {
+                session_index: self.session_index.unwrap_or(0),
+                ts_ms,
+                from: prev,
+                to: DetectorState::Standby,
+                p_sleep: self.hmm.probs()[STATE_SLEEP_NREM],
+                reason: reason.to_string(),
+            });
+        }
+    }
+
+    fn open_session_or_enter_standby(
+        &mut self,
+        ts_ms: i64,
+        session_reason: &str,
+        standby_reason: &str,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        if !self.within_active_hours {
+            self.enter_standby_internal(ts_ms, standby_reason, outputs);
+        } else {
+            self.open_session(ts_ms, session_reason, outputs);
+        }
+    }
+
+    fn exit_standby_to_idle(&mut self, ts_ms: i64, reason: &str, outputs: &mut Vec<EngineOutput>) {
+        self.transition_to(
+            ts_ms,
+            DetectorState::Idle,
+            self.hmm.probs()[STATE_SLEEP_NREM],
+            reason,
+            outputs,
+        );
     }
 
     /// Processes one explicit timestamped input event synchronously.
@@ -251,7 +303,7 @@ impl SleepEngine {
                 self.handle_stream_state(st.ts_ms, st.status, &mut outputs);
             }
             EngineEvent::StreamDisconnected(dc) => {
-                self.handle_stream_disconnected(dc.ts_ms, dc.reason);
+                self.handle_stream_disconnected(dc.ts_ms, dc.reason, &mut outputs);
             }
             EngineEvent::HrPacket(pkt) => self.handle_hr_packet(pkt, &mut outputs),
             EngineEvent::DesktopActivity(act) => {
@@ -273,19 +325,39 @@ impl SleepEngine {
         match status {
             StreamStatus::Streaming => {
                 if self.state == DetectorState::Idle {
-                    self.open_session(ts_ms, "stream started", outputs);
+                    self.open_session_or_enter_standby(
+                        ts_ms,
+                        "stream started",
+                        "stream started outside active hours",
+                        outputs,
+                    );
+                } else if self.state == DetectorState::Standby {
+                    // Already in Standby
                 } else if self.active_gap.is_some() {
                     self.resolve_active_gap(ts_ms, true, outputs);
                 }
             }
             StreamStatus::SignalLost | StreamStatus::Disconnected => {
-                self.begin_or_tighten_gap(ts_ms, MEDIUM_GAP_MAX_MS);
+                if self.state == DetectorState::Standby {
+                    self.exit_standby_to_idle(ts_ms, "stream disconnected during standby", outputs);
+                } else {
+                    self.begin_or_tighten_gap(ts_ms, MEDIUM_GAP_MAX_MS);
+                }
             }
             StreamStatus::Connecting | StreamStatus::Acquiring | StreamStatus::PassiveStandby => {}
         }
     }
 
-    fn handle_stream_disconnected(&mut self, ts_ms: i64, reason: StreamDisconnectReason) {
+    fn handle_stream_disconnected(
+        &mut self,
+        ts_ms: i64,
+        reason: StreamDisconnectReason,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        if self.state == DetectorState::Standby {
+            self.exit_standby_to_idle(ts_ms, "stream disconnected during standby", outputs);
+            return;
+        }
         let window_ms = match reason {
             StreamDisconnectReason::Remote => SHORT_GAP_MAX_MS,
             StreamDisconnectReason::Timeout => MEDIUM_GAP_MAX_MS,
@@ -306,20 +378,27 @@ impl SleepEngine {
             if !pkt_valid {
                 return;
             }
-            self.open_session(pkt.ts_ms, "hr packet stream started", outputs);
+            self.open_session_or_enter_standby(
+                pkt.ts_ms,
+                "hr packet stream started",
+                "hr packet stream started outside active hours",
+                outputs,
+            );
         } else if pkt_valid {
             if self.active_gap.is_some() {
                 self.resolve_active_gap(pkt.ts_ms, true, outputs);
-            } else if let Some(prev_any) = self.last_any_packet_ts_ms
-                && pkt.ts_ms - prev_any > IMPLICIT_SILENCE_GAP_MS
-            {
-                self.begin_or_tighten_gap(prev_any, MEDIUM_GAP_MAX_MS);
-                self.resolve_active_gap(pkt.ts_ms, true, outputs);
-            } else if let Some(prev_valid) = self.last_valid_packet_ts_ms
-                && pkt.ts_ms - prev_valid > IMPLICIT_INVALID_GAP_MS
-            {
-                self.begin_or_tighten_gap(prev_valid, MEDIUM_GAP_MAX_MS);
-                self.resolve_active_gap(pkt.ts_ms, true, outputs);
+            } else if self.state != DetectorState::Standby {
+                if let Some(prev_any) = self.last_any_packet_ts_ms
+                    && pkt.ts_ms - prev_any > IMPLICIT_SILENCE_GAP_MS
+                {
+                    self.begin_or_tighten_gap(prev_any, MEDIUM_GAP_MAX_MS);
+                    self.resolve_active_gap(pkt.ts_ms, true, outputs);
+                } else if let Some(prev_valid) = self.last_valid_packet_ts_ms
+                    && pkt.ts_ms - prev_valid > IMPLICIT_INVALID_GAP_MS
+                {
+                    self.begin_or_tighten_gap(prev_valid, MEDIUM_GAP_MAX_MS);
+                    self.resolve_active_gap(pkt.ts_ms, true, outputs);
+                }
             }
         }
 
@@ -383,7 +462,10 @@ impl SleepEngine {
         let mu_hr = self.baseline.mu_hr_or(features.hr_bpm_60s);
         let sigma_hr = self.baseline.sigma_hr();
 
-        let probs = if accumulators_frozen || self.state == DetectorState::Warmup {
+        let probs = if accumulators_frozen
+            || self.state == DetectorState::Warmup
+            || self.state == DetectorState::Standby
+        {
             self.hmm.probs()
         } else {
             let expected_z = self.expected_z_sleep(mu_hr, sigma_hr);
@@ -433,7 +515,7 @@ impl SleepEngine {
 
         if !accumulators_frozen {
             match self.state {
-                DetectorState::Idle => {}
+                DetectorState::Idle | DetectorState::Standby => {}
                 DetectorState::Warmup => {
                     if raw_opt.is_none() {
                         self.baseline.accept_warmup(raw_ref);
@@ -527,24 +609,26 @@ impl SleepEngine {
             }
         }
 
-        self.epochs_count += 1;
-        outputs.push(EngineOutput::EpochEmitted(Epoch {
-            session_index: self.session_index.unwrap_or(1),
-            ts_ms,
-            features,
-            hrv_valid,
-            rr_artifact_frac,
-            coverage,
-            flatline_stale,
-            accumulators_frozen,
-            baseline_mu_hr: self.baseline.mu_hr_or(mu_hr),
-            baseline_sigma_hr: self.baseline.sigma_hr(),
-            baseline_frozen: self.baseline.is_frozen(),
-            p_active_wake: probs[STATE_ACTIVE_WAKE],
-            p_quiet_wake: probs[STATE_QUIET_WAKE],
-            p_sleep,
-            state: self.state,
-        }));
+        if self.state != DetectorState::Standby {
+            self.epochs_count += 1;
+            outputs.push(EngineOutput::EpochEmitted(Epoch {
+                session_index: self.session_index.unwrap_or(1),
+                ts_ms,
+                features,
+                hrv_valid,
+                rr_artifact_frac,
+                coverage,
+                flatline_stale,
+                accumulators_frozen,
+                baseline_mu_hr: self.baseline.mu_hr_or(mu_hr),
+                baseline_sigma_hr: self.baseline.sigma_hr(),
+                baseline_frozen: self.baseline.is_frozen(),
+                p_active_wake: probs[STATE_ACTIVE_WAKE],
+                p_quiet_wake: probs[STATE_QUIET_WAKE],
+                p_sleep,
+                state: self.state,
+            }));
+        }
 
         if let Some(reason) = split_reason {
             self.close_session(ts_ms, reason, outputs);
@@ -636,7 +720,10 @@ impl SleepEngine {
 
     fn handle_desktop_activity(&mut self, ts_ms: i64, outputs: &mut Vec<EngineOutput>) {
         match self.state {
-            DetectorState::Idle | DetectorState::Warmup | DetectorState::Confirmed => {}
+            DetectorState::Idle
+            | DetectorState::Standby
+            | DetectorState::Warmup
+            | DetectorState::Confirmed => {}
             DetectorState::Monitoring => {
                 self.baseline.on_desktop_wake_hint();
             }
@@ -674,8 +761,14 @@ impl SleepEngine {
     ) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
         if self.state == DetectorState::Idle {
-            self.open_session(ts_ms, "epoch feature replay started", &mut outputs);
-        } else if let Some(prev_ts) = self.last_any_packet_ts_ms
+            self.open_session_or_enter_standby(
+                ts_ms,
+                "epoch feature replay started",
+                "epoch feature replay started outside active hours",
+                &mut outputs,
+            );
+        } else if self.state != DetectorState::Standby
+            && let Some(prev_ts) = self.last_any_packet_ts_ms
             && ts_ms - prev_ts > SHORT_GAP_MAX_MS
         {
             self.begin_or_tighten_gap(prev_ts, MEDIUM_GAP_MAX_MS);

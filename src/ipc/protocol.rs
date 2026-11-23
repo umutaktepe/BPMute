@@ -276,6 +276,7 @@ pub enum MonitoringState {
     Confirmed,
     Sleeping,
     Paused,
+    Standby,
 }
 
 impl From<DetectorState> for MonitoringState {
@@ -287,6 +288,7 @@ impl From<DetectorState> for MonitoringState {
             DetectorState::Candidate => Self::Candidate,
             DetectorState::Confirmed => Self::Confirmed,
             DetectorState::Sleeping => Self::Sleeping,
+            DetectorState::Standby => Self::Standby,
         }
     }
 }
@@ -301,6 +303,7 @@ impl std::fmt::Display for MonitoringState {
             Self::Confirmed => "Confirmed",
             Self::Sleeping => "Sleeping",
             Self::Paused => "Paused",
+            Self::Standby => "Standby",
         };
         f.write_str(label)
     }

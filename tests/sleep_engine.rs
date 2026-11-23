@@ -2426,3 +2426,163 @@ fn pre_candidate_cleared_when_candidate_reset_to_monitoring() {
     assert_eq!(summary.pre_candidate_sigma_hr, None);
     assert_eq!(summary.pre_candidate_ln_rmssd, None);
 }
+
+#[test]
+fn standby_entered_directly_when_streaming_outside_active_hours() {
+    let mut eng = default_engine();
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert_eq!(eng.current_session_index(), None);
+
+    eng.set_active_hours(false);
+
+    let out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 1000,
+        status: StreamStatus::Streaming,
+    }));
+
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert_eq!(eng.current_session_index(), None);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            from: DetectorState::Idle,
+            to: DetectorState::Standby,
+            ..
+        }
+    )));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, EngineOutput::SessionStarted { .. }))
+    );
+}
+
+#[test]
+fn standby_entered_directly_on_hr_packet_outside_active_hours() {
+    let mut eng = default_engine();
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert_eq!(eng.current_session_index(), None);
+
+    eng.set_active_hours(false);
+
+    let out = eng.handle_event(EngineEvent::HrPacket(HrPacket {
+        ts_ms: 1000,
+        bpm: 72.0,
+        rr_ms: vec![833.0],
+        contact_status: ContactStatus::Contact,
+    }));
+
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert_eq!(eng.current_session_index(), None);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            from: DetectorState::Idle,
+            to: DetectorState::Standby,
+            ..
+        }
+    )));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, EngineOutput::SessionStarted { .. }))
+    );
+}
+
+#[test]
+fn standby_bypasses_candidate_evaluation_under_sleep_hr() {
+    let mut eng = default_engine();
+    eng.set_active_hours(false);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Standby);
+
+    // Feed 30 minutes (1800s) of sleep-inducing heart rate (50 bpm, low variability)
+    let out = push_sleep(&mut eng, 1, 1800, 52.0, 48.0, true);
+
+    // Engine must remain in Standby and never transition to Candidate, Confirmed, or Sleeping
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert_eq!(eng.current_session_index(), None);
+    assert!(out.iter().all(|o| !matches!(
+        o,
+        EngineOutput::StateChanged {
+            to: DetectorState::Candidate | DetectorState::Confirmed | DetectorState::Sleeping,
+            ..
+        }
+    )));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, EngineOutput::SessionStarted { .. }))
+    );
+}
+
+#[test]
+fn standby_disconnect_transitions_cleanly_to_idle_without_gap() {
+    let mut eng = default_engine();
+    eng.set_active_hours(false);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 1000,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Standby);
+
+    // Feed some packets while in Standby
+    let _ = push_sleep(&mut eng, 2, 60, 70.0, 68.0, false);
+    assert_eq!(eng.state(), DetectorState::Standby);
+
+    // Disconnect wearable
+    let out = eng.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: 61_000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert_eq!(eng.gap_started_ms(), None);
+    assert_eq!(eng.gap_deadline_ms(), None);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            from: DetectorState::Standby,
+            to: DetectorState::Idle,
+            ..
+        }
+    )));
+    assert!(
+        !out.iter()
+            .any(|o| matches!(o, EngineOutput::SessionEnded(_)))
+    );
+
+    // Reconnecting enters Standby again when still outside active hours
+    let re_out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 65_000,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(re_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            from: DetectorState::Idle,
+            to: DetectorState::Standby,
+            ..
+        }
+    )));
+
+    // Disconnecting via StreamStatus::Disconnected also transitions cleanly to Idle
+    let dis_out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 70_000,
+        status: StreamStatus::Disconnected,
+    }));
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert_eq!(eng.gap_started_ms(), None);
+    assert_eq!(eng.gap_deadline_ms(), None);
+    assert!(dis_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            from: DetectorState::Standby,
+            to: DetectorState::Idle,
+            ..
+        }
+    )));
+}

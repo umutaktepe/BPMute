@@ -353,6 +353,7 @@ pub enum DetectorState {
     Candidate,
     Confirmed,
     Sleeping,
+    Standby,
 }
 
 impl DetectorState {
@@ -365,6 +366,7 @@ impl DetectorState {
             Self::Candidate => "candidate",
             Self::Confirmed => "confirmed",
             Self::Sleeping => "sleeping",
+            Self::Standby => "standby",
         }
     }
 }
@@ -386,6 +388,7 @@ impl FromStr for DetectorState {
             "candidate" => Ok(Self::Candidate),
             "confirmed" => Ok(Self::Confirmed),
             "sleeping" => Ok(Self::Sleeping),
+            "standby" => Ok(Self::Standby),
             other => Err(format!("unknown detector_state `{other}`")),
         }
     }

@@ -211,7 +211,8 @@ impl ReplayAccumulator {
                             }
                             DetectorState::Monitoring
                             | DetectorState::Idle
-                            | DetectorState::Warmup => {
+                            | DetectorState::Warmup
+                            | DetectorState::Standby => {
                                 if from == DetectorState::Confirmed {
                                     self.pending_confirmed_since_ms = None;
                                 }

@@ -1,12 +1,15 @@
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use bpmute::config::{CliOverrides, LoadedConfig};
+use bpmute::config::{CliOverrides, ClockTime, LoadedConfig};
 use bpmute::daemon::{DaemonHandle, DaemonOptions, VirtualClock};
 use bpmute::ipc::IpcClient;
 use bpmute::ipc::protocol::{MAX_FRAME_BYTES, PROTOCOL_VERSION};
 use bpmute::paths::{MapEnv, ResolvedPaths};
+use bpmute::storage::WearableDescriptor;
 use chrono::{Local, TimeZone, Timelike, Utc};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -485,6 +488,219 @@ async fn runtime_dry_run_survives_unrelated_config_updates_and_reloads() {
         .unwrap();
     let st3 = client.request("daemon.status", json!({})).await.unwrap();
     assert_eq!(st3["dry_run"], false);
+
+    daemon.shutdown().await;
+}
+
+#[test]
+fn detector_state_standby_and_monitoring_state_serde_roundtrip() {
+    use bpmute::ipc::protocol::{DaemonStatus, MonitoringState, SnapshotEvent};
+    use bpmute::sleep_engine::DetectorState;
+
+    // DetectorState string representation and serde
+    assert_eq!(DetectorState::Standby.as_str(), "standby");
+    assert_eq!(DetectorState::Standby.to_string(), "standby");
+    assert_eq!(
+        "standby".parse::<DetectorState>().unwrap(),
+        DetectorState::Standby
+    );
+    let serialized_ds = serde_json::to_string(&DetectorState::Standby).unwrap();
+    assert_eq!(serialized_ds, "\"standby\"");
+    let deserialized_ds: DetectorState = serde_json::from_str(&serialized_ds).unwrap();
+    assert_eq!(deserialized_ds, DetectorState::Standby);
+
+    // MonitoringState mapping, display and serde
+    let mon_state = MonitoringState::from(DetectorState::Standby);
+    assert_eq!(mon_state, MonitoringState::Standby);
+    assert_eq!(mon_state.to_string(), "Standby");
+    let serialized_ms = serde_json::to_string(&MonitoringState::Standby).unwrap();
+    assert_eq!(serialized_ms, "\"Standby\"");
+    let deserialized_ms: MonitoringState = serde_json::from_str(&serialized_ms).unwrap();
+    assert_eq!(deserialized_ms, MonitoringState::Standby);
+
+    // DaemonStatus JSON roundtrip with Standby
+    let raw_status_json = json!({
+        "v": 1,
+        "daemon_running": true,
+        "version": "0.1.0",
+        "pid": 1234,
+        "uptime_sec": 42,
+        "monitoring_state": "Standby",
+        "armed": false,
+        "paused": false,
+        "paused_until": null,
+        "pause_mode": null,
+        "dry_run": false,
+        "schedule": {
+            "active_hours_enabled": true,
+            "start": "22:00",
+            "end": "08:00"
+        },
+        "config_path": "/etc/bpmute/config.toml",
+        "config_loaded_from_file": true,
+        "socket_path": "/run/bpmute/daemon.sock",
+        "log_biometrics": false,
+        "alerts": []
+    });
+
+    let status: DaemonStatus = serde_json::from_value(raw_status_json.clone()).unwrap();
+    assert_eq!(status.monitoring_state, MonitoringState::Standby);
+    let status_val = serde_json::to_value(&status).unwrap();
+    assert_eq!(status_val["monitoring_state"], "Standby");
+
+    // SnapshotEvent JSON roundtrip with Standby status
+    let raw_snapshot = json!({
+        "status": raw_status_json,
+        "hr_ring_buffer": [],
+        "alerts": [],
+        "server_now_ms": 1_700_000_000_000_i64
+    });
+
+    let snapshot: SnapshotEvent = serde_json::from_value(raw_snapshot).unwrap();
+    assert_eq!(snapshot.status.monitoring_state, MonitoringState::Standby);
+    let snap_val = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(snap_val["status"]["monitoring_state"], "Standby");
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_wearable_streaming_outside_active_hours_enters_standby_and_suppresses_sessions() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let env = MapEnv::new();
+
+    // 14:00 Local time is outside active hours [22:00, 08:00)
+    let local_14h = Local.with_ymd_and_hms(2026, 11, 19, 14, 0, 0).unwrap();
+    let start_utc = local_14h.with_timezone(&Utc);
+
+    let (source, wearable_tx) = common::daemon::TestWearableSource::new();
+
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = ClockTime::new(8, 0).unwrap();
+
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(start_utc));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, std::sync::Arc::new(env), clock)
+            .with_wearable_source(std::sync::Arc::new(source)),
+    )
+    .await
+    .expect("daemon should start");
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+
+    let snapshot = client.next_event().await.unwrap();
+    assert_eq!(snapshot.event, "Snapshot");
+    assert_eq!(snapshot.data["status"]["monitoring_state"], "Idle");
+    assert_eq!(snapshot.data["status"]["armed"], false);
+
+    // Wearable connects outside active hours
+    let desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:FF".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Test Watch".to_string()),
+        advertised_name: Some("GT5".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: desc.clone(),
+            state: bpmute::sleep_engine::StreamState {
+                ts_ms: start_utc.timestamp_millis(),
+                status: bpmute::sleep_engine::StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    let mut state_ev = None;
+    for _ in 0..5 {
+        if let Ok(ev) = client.next_event().await
+            && ev.event == "StateChanged"
+        {
+            state_ev = Some(ev);
+            break;
+        }
+    }
+    let state_ev = state_ev.expect("StateChanged event must be published");
+    assert_eq!(state_ev.data["monitoring_state"], "Standby");
+
+    let st = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st["monitoring_state"], "Standby");
+    assert_eq!(st["armed"], false);
+
+    // Stream 10 heart rate packets (simulating low resting HR)
+    for i in 1..=10_i64 {
+        let ts_ms = start_utc.timestamp_millis() + i * 1000;
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms,
+                    bpm: 54.0,
+                    rr_ms: vec![1111.0],
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    // Telemetry HrSample events arrive over IPC
+    let mut saw_hr_sample = false;
+    for _ in 0..10 {
+        if let Ok(ev) = client.next_event().await
+            && ev.event == "HrSample"
+        {
+            saw_hr_sample = true;
+            assert_eq!(ev.data["bpm"], 54.0);
+            assert_eq!(ev.data["session_id"], Value::Null);
+            break;
+        }
+    }
+    assert!(
+        saw_hr_sample,
+        "should receive HrSample telemetry event in Standby"
+    );
+
+    // Check sessions via IPC: sessions count must be 0
+    let sess_list = client.request("session.list", json!({})).await.unwrap();
+    assert_eq!(sess_list["sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(sess_list["total_count"], 0);
+
+    // Disconnect wearable outside active hours -> transitions to Idle
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamDisconnected {
+            wearable: desc.clone(),
+            ts_ms: start_utc.timestamp_millis() + 20_000,
+            reason: bpmute::sleep_engine::StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+
+    let mut disc_ev = None;
+    for _ in 0..25 {
+        if let Ok(ev) = client.next_event().await
+            && ev.event == "StateChanged"
+        {
+            disc_ev = Some(ev);
+            break;
+        }
+    }
+    let disc_ev = disc_ev.expect("StateChanged event must be published on disconnect");
+    assert_eq!(disc_ev.data["monitoring_state"], "Idle");
+
+    let st_after = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st_after["monitoring_state"], "Idle");
+
+    // Sessions count must still be 0
+    let sess_after = client.request("session.list", json!({})).await.unwrap();
+    assert_eq!(sess_after["sessions"].as_array().unwrap().len(), 0);
+    assert_eq!(sess_after["total_count"], 0);
 
     daemon.shutdown().await;
 }

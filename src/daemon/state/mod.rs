@@ -813,6 +813,20 @@ impl DaemonCore {
     pub fn publish_hr_sample(&self, sample: Value) {
         self.broker.publish_stream("HrSample", sample);
     }
+
+    /// Returns whether the current local time falls within configured Active Hours
+    /// (or `true` if Active Hours are disabled).
+    pub fn is_within_active_hours(&self) -> bool {
+        let guard = self.inner.lock().expect("daemon state mutex poisoned");
+        if !guard.loaded_config.config.schedule.active_hours_enabled {
+            return true;
+        }
+        guard
+            .loaded_config
+            .config
+            .schedule
+            .is_within_active_hours(self.clock.now_local().time())
+    }
 }
 
 fn is_armed_locked(guard: &InnerState, clock: &dyn DaemonClock) -> bool {

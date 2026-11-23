@@ -41,11 +41,13 @@ impl MonitoringContext {
         raw_retention: RawSamplesRetention,
     ) -> Self {
         let cal = core.calibration_state();
-        let engine = SleepEngine::new(EngineConfig {
+        let within_active = core.is_within_active_hours();
+        let mut engine = SleepEngine::new(EngineConfig {
             detection: detection_cfg.clone(),
             priors: cal.to_priors(),
             wearable_floor: Default::default(),
         });
+        engine.set_active_hours(within_active);
         Self {
             core,
             engine,
@@ -131,6 +133,8 @@ impl MonitoringContext {
     }
 
     async fn handle_wearable_event(&mut self, ev: WearableEvent) {
+        let within_active = self.core.is_within_active_hours();
+        self.engine.set_active_hours(within_active);
         match ev {
             WearableEvent::StreamState { wearable, state } => {
                 self.process_stream_transition(
@@ -282,11 +286,14 @@ impl MonitoringContext {
             .as_deref()
             .map(|id| cal.wearable_floor(id))
             .unwrap_or_default();
-        self.engine = SleepEngine::new(EngineConfig {
+        let within_active = self.core.is_within_active_hours();
+        let mut engine = SleepEngine::new(EngineConfig {
             detection: self.detection_cfg.clone(),
             priors: cal.to_priors(),
             wearable_floor: floor,
         });
+        engine.set_active_hours(within_active);
+        self.engine = engine;
         self.core.sync_detector_and_deadline(
             DetectorState::Idle,
             None,
@@ -531,6 +538,8 @@ pub(crate) async fn run_monitoring_loop(
                 ctx.detection_cfg = det.clone();
                 ctx.raw_samples_enabled = !matches!(ret, RawSamplesRetention::Disabled);
                 ctx.engine.update_detection_config(det);
+                let within_active = ctx.core.is_within_active_hours();
+                ctx.engine.set_active_hours(within_active);
             }
             res = shutdown_rx.changed() => {
                 if res.is_err() || *shutdown_rx.borrow() {
