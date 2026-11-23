@@ -67,6 +67,11 @@ if grep -Eq 'SessionListEntry\s*\{' tests/*.rs; then
   exit 1
 fi
 
+if awk '/SessionSummary\s*\{/ && !/->/ && !/fn / { print FILENAME ":" FNR ":" $0; found=1 } END { exit !found }' tests/*.rs; then
+  echo "error: direct SessionSummary struct literal forbidden in tests; use tests/common/tui.rs::make_session_summary(...) (docs/agents/testing.md)" >&2
+  exit 1
+fi
+
 if grep -En '#!/usr/bin/env[[:space:]]' tests/*.rs; then
   echo "error: #!/usr/bin/env shebang forbidden in fake test scripts (stripped MapEnv PATH omits /usr/bin); use POSIX #!/bin/sh" >&2
   exit 1

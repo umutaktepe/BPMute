@@ -535,7 +535,7 @@ pub(crate) fn load_session_record(
         params![session_id],
         |row| {
             let record = map_session_ledger_row(row)?;
-            let status_str: String = row.get(31)?;
+            let status_str: String = row.get(SESSION_LEDGER_COLUMNS_COUNT)?;
             let status = status_str.parse().unwrap_or(SessionStatus::Closed);
             Ok((record, status))
         },
@@ -679,6 +679,24 @@ pub(crate) fn load_raw_samples(
     }
     Ok(packets)
 }
+
+/// Total column count consumed from `sessions` by [`map_session_ledger_row`] (indices 0..31).
+///
+/// Any query feeding [`map_session_ledger_row`] must project the standard 31-column prefix:
+/// `id (0), wearable_id (1), start_ts_ms (2), end_ts_ms (3), end_reason (4), detection_sensitivity (5),`
+/// `had_rr (6), warmup_mu_hr (7), warmup_sigma_hr (8), warmup_ln_rmssd (9),`
+/// `pre_candidate_mu_hr (10), pre_candidate_sigma_hr (11), pre_candidate_ln_rmssd (12),`
+/// `onset_candidate_ts_ms (13), onset_confirmed_ts_ms (14), sleeping_ts_ms (15),`
+/// `sleep_mu_hr (16), onset_hr_bpm (17), delta_hr_onset (18), sleep_ln_rmssd (19),`
+/// `sleep_hr_var_ratio (20), typical_sqi (21), post_trigger_sleep_sec (22),`
+/// `trigger_power_action (23), rapid_resume_within_5m (24), grace_cancel_count (25),`
+/// `rapid_wake_fp_count (26), snooze_count (27), auto_anomalous (28),`
+/// `epochs_count (29), raw_samples_count (30)`.
+///
+/// Trailing projection offsets (such as `status` or joined `wearables`/`feedback` columns in
+/// [`crate::storage::store::load_closed_sessions_for_recompute`]) must be keyed from
+/// `SESSION_LEDGER_COLUMNS_COUNT`.
+pub(crate) const SESSION_LEDGER_COLUMNS_COUNT: usize = 31;
 
 pub(crate) fn map_session_ledger_row(
     row: &rusqlite::Row<'_>,

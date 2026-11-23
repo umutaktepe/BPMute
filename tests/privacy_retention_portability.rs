@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
@@ -9,7 +11,6 @@ use bpmute::exit_code::ExitCode;
 use bpmute::paths::{MapEnv, ResolvedPaths};
 use bpmute::sleep_engine::{
     CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket,
-    SessionEndReason, SessionSummary,
 };
 use bpmute::storage::{
     CloseSessionRequest, LedgerStore, OpenSessionRequest, PersistenceWorker, WearableDescriptor,
@@ -82,36 +83,7 @@ fn sample_epoch(ts_ms: i64, hr_bpm: f64, p_sleep: f64, state: DetectorState) -> 
     }
 }
 
-fn sample_summary(start_ts_ms: i64, end_ts_ms: i64, sleep_mu_hr: f64) -> SessionSummary {
-    SessionSummary {
-        session_index: 1,
-        start_ts_ms,
-        end_ts_ms,
-        end_reason: SessionEndReason::SustainedWakefulness,
-        candidate_ts_ms: Some(start_ts_ms + 900_000),
-        confirmed_ts_ms: Some(start_ts_ms + 1_080_000),
-        sleeping_ts_ms: Some(start_ts_ms + 1_110_000),
-        anomalous: false,
-        fp_count: 0,
-        warmup_mu_hr: Some(66.0),
-        warmup_sigma_hr: Some(2.3),
-        warmup_ln_rmssd: Some(3.45),
-        pre_candidate_mu_hr: None,
-        pre_candidate_sigma_hr: None,
-        pre_candidate_ln_rmssd: None,
-        onset_hr_bpm: Some(sleep_mu_hr + 0.5),
-        sleep_mu_hr: Some(sleep_mu_hr),
-        sleep_ln_rmssd: Some(3.7),
-        observed_hr_var_ratio: Some(0.26),
-        typical_sqi: Some(0.97),
-        post_trigger_sleep_sec: 1_800,
-        had_rr: true,
-        grace_cancel_count: 0,
-        rapid_wake_fp_count: 0,
-        snooze_count: 0,
-        epochs_count: 2,
-    }
-}
+use common::sample_session_summary as sample_summary;
 
 #[tokio::test]
 async fn test_retention_pruning_rolling_ttl_and_active_session_immunity() {

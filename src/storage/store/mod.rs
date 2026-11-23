@@ -28,7 +28,10 @@ mod session_export;
 mod session_lifecycle;
 pub mod wearable;
 
-use session::{load_session_epochs, map_optional_session_feedback_row, map_session_ledger_row};
+use session::{
+    SESSION_LEDGER_COLUMNS_COUNT, load_session_epochs, map_optional_session_feedback_row,
+    map_session_ledger_row,
+};
 
 /// Synchronous SQLite WAL store backing both the persistence worker and offline CLI commands.
 pub struct LedgerStore {
@@ -750,9 +753,13 @@ pub(crate) fn load_ledger_recompute_input(
     let session_rows = s_stmt
         .query_map([], |row| {
             let record = map_session_ledger_row(row)?;
-            let w_rr = row.get::<_, i64>(31)? != 0;
-            let w_contact = row.get::<_, i64>(32)? != 0;
-            let feedback = map_optional_session_feedback_row(row, 33, record.id.clone())?;
+            let w_rr = row.get::<_, i64>(SESSION_LEDGER_COLUMNS_COUNT)? != 0;
+            let w_contact = row.get::<_, i64>(SESSION_LEDGER_COLUMNS_COUNT + 1)? != 0;
+            let feedback = map_optional_session_feedback_row(
+                row,
+                SESSION_LEDGER_COLUMNS_COUNT + 2,
+                record.id.clone(),
+            )?;
             Ok((record, feedback, w_rr, w_contact))
         })?
         .collect::<Result<Vec<_>, _>>()?;

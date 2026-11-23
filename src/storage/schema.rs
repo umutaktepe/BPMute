@@ -183,6 +183,8 @@ CREATE TABLE IF NOT EXISTS wearables (
     UNIQUE (mac, address_type)
 );
 
+-- Note: Column projection order is synchronized with `SESSION_LEDGER_COLUMNS_COUNT`
+-- and `map_session_ledger_row` in `src/storage/store/session.rs`.
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     wearable_id TEXT NOT NULL REFERENCES wearables(id),

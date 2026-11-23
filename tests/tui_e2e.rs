@@ -31,7 +31,7 @@ use bpmute::ipc::protocol::{
 use bpmute::paths::MapEnv;
 use bpmute::sleep_engine::{
     CalibrationMaturity, ContactStatus, DetectorState, Epoch, EpochFeatures, SessionEndReason,
-    SessionSummary, StreamStatus,
+    StreamStatus,
 };
 use bpmute::storage::SessionStatus;
 use bpmute::tui::{
@@ -993,38 +993,13 @@ custom_command = ["notify-send", "sleepy"]
                 detection_sensitivity: bpmute::config::Sensitivity::Balanced,
             })
             .unwrap();
+        let mut s1_summary = make_session_summary(1, 1_700_000_100_000, 1_700_000_500_000, false);
+        s1_summary.epochs_count = 20;
         store
             .close_session_and_recompute(
                 &bpmute::storage::CloseSessionRequest {
                     session_id: s1_id.clone(),
-                    summary: SessionSummary {
-                        session_index: 1,
-                        start_ts_ms: 1_700_000_100_000,
-                        end_ts_ms: 1_700_000_500_000,
-                        end_reason: SessionEndReason::StreamEnded,
-                        candidate_ts_ms: None,
-                        confirmed_ts_ms: None,
-                        sleeping_ts_ms: None,
-                        anomalous: false,
-                        fp_count: 0,
-                        warmup_mu_hr: Some(64.0),
-                        warmup_sigma_hr: Some(2.5),
-                        warmup_ln_rmssd: None,
-                        pre_candidate_mu_hr: None,
-                        pre_candidate_sigma_hr: None,
-                        pre_candidate_ln_rmssd: None,
-                        onset_hr_bpm: Some(54.0),
-                        sleep_mu_hr: Some(54.0),
-                        sleep_ln_rmssd: None,
-                        observed_hr_var_ratio: None,
-                        typical_sqi: None,
-                        post_trigger_sleep_sec: 0,
-                        had_rr: false,
-                        grace_cancel_count: 0,
-                        rapid_wake_fp_count: 0,
-                        snooze_count: 0,
-                        epochs_count: 20,
-                    },
+                    summary: s1_summary,
                     trigger_power_action: bpmute::config::PowerAction::None,
                     rapid_resume_within_5m: false,
                 },
@@ -1040,38 +1015,16 @@ custom_command = ["notify-send", "sleepy"]
                 detection_sensitivity: bpmute::config::Sensitivity::Balanced,
             })
             .unwrap();
+        let mut s2_summary = make_session_summary(2, 1_700_010_100_000, 1_700_010_600_000, false);
+        s2_summary.warmup_mu_hr = Some(65.0);
+        s2_summary.onset_hr_bpm = Some(55.0);
+        s2_summary.sleep_mu_hr = Some(55.0);
+        s2_summary.epochs_count = 25;
         store
             .close_session_and_recompute(
                 &bpmute::storage::CloseSessionRequest {
                     session_id: s2_id.clone(),
-                    summary: SessionSummary {
-                        session_index: 2,
-                        start_ts_ms: 1_700_010_100_000,
-                        end_ts_ms: 1_700_010_600_000,
-                        end_reason: SessionEndReason::StreamEnded,
-                        candidate_ts_ms: None,
-                        confirmed_ts_ms: None,
-                        sleeping_ts_ms: None,
-                        anomalous: false,
-                        fp_count: 0,
-                        warmup_mu_hr: Some(65.0),
-                        warmup_sigma_hr: Some(2.5),
-                        warmup_ln_rmssd: None,
-                        pre_candidate_mu_hr: None,
-                        pre_candidate_sigma_hr: None,
-                        pre_candidate_ln_rmssd: None,
-                        onset_hr_bpm: Some(55.0),
-                        sleep_mu_hr: Some(55.0),
-                        sleep_ln_rmssd: None,
-                        observed_hr_var_ratio: None,
-                        typical_sqi: None,
-                        post_trigger_sleep_sec: 0,
-                        had_rr: false,
-                        grace_cancel_count: 0,
-                        rapid_wake_fp_count: 0,
-                        snooze_count: 0,
-                        epochs_count: 25,
-                    },
+                    summary: s2_summary,
                     trigger_power_action: bpmute::config::PowerAction::None,
                     rapid_resume_within_5m: false,
                 },

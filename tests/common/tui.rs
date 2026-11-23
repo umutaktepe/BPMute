@@ -328,6 +328,29 @@ pub fn make_session_summary(
     }
 }
 
+pub fn sample_session_summary(
+    start_ts_ms: i64,
+    end_ts_ms: i64,
+    sleep_mu_hr: f64,
+) -> SessionSummary {
+    let mut s = make_session_summary(1, start_ts_ms, end_ts_ms, true);
+    s.end_reason = SessionEndReason::SustainedWakefulness;
+    s.candidate_ts_ms = Some(start_ts_ms + 900_000);
+    s.confirmed_ts_ms = Some(start_ts_ms + 1_080_000);
+    s.sleeping_ts_ms = Some(start_ts_ms + 1_110_000);
+    s.warmup_mu_hr = Some(66.0);
+    s.warmup_sigma_hr = Some(2.3);
+    s.warmup_ln_rmssd = Some(3.45);
+    s.onset_hr_bpm = Some(sleep_mu_hr + 0.5);
+    s.sleep_mu_hr = Some(sleep_mu_hr);
+    s.sleep_ln_rmssd = Some(3.7);
+    s.observed_hr_var_ratio = Some(0.26);
+    s.typical_sqi = Some(0.97);
+    s.post_trigger_sleep_sec = 1_800;
+    s.epochs_count = 2;
+    s
+}
+
 pub fn is_non_blank_braille(ch: char) -> bool {
     ('\u{2801}'..='\u{28FF}').contains(&ch)
 }
