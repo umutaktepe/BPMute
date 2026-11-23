@@ -29,3 +29,9 @@ TuiApp (src/tui/app.rs)
 ## File Size & Submodule Boundaries
 
 All Rust source files in `src/` must remain strictly under 1000 lines (enforced deterministically by `./scripts/check.sh`). When a module approaches 900+ lines, decompose its internal responsibilities into sibling submodules (for example, extracting IPC dispatch from `src/tui/app.rs` into `src/tui/app_ipc.rs`).
+
+## Canonical Schemas & Contracts
+
+- **IPC wire requests, responses, and push events**: See `src/ipc/protocol.rs` for authoritative schemas (`DaemonStatus`, `SessionListPage`, `SnapshotEvent`, `EpochUpdateEvent`, `HrSampleEvent`).
+- **Persisted database models and descriptors**: See `src/storage/mod.rs` for entity structures (`WearableDescriptor`, `SessionSummary`, `SessionFullDetail`, `ImportSummary`).
+- **Shared test fixtures and doubles**: See `tests/common/` (`common::daemon::TestWearableSource`, `common::tui::make_daemon_status`).

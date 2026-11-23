@@ -617,16 +617,11 @@ async fn test_wearable_streaming_outside_active_hours_enters_standby_and_suppres
         .await
         .unwrap();
 
-    let mut state_ev = None;
-    for _ in 0..5 {
-        if let Ok(ev) = client.next_event().await
-            && ev.event == "StateChanged"
-        {
-            state_ev = Some(ev);
-            break;
-        }
-    }
-    let state_ev = state_ev.expect("StateChanged event must be published");
+    let state_ev = client
+        .next_matching_event("StateChanged", 5)
+        .await
+        .unwrap()
+        .expect("StateChanged event must be published");
     assert_eq!(state_ev.data["monitoring_state"], "Standby");
 
     let st = client.request("daemon.status", json!({})).await.unwrap();
@@ -651,21 +646,13 @@ async fn test_wearable_streaming_outside_active_hours_enters_standby_and_suppres
     }
 
     // Telemetry HrSample events arrive over IPC
-    let mut saw_hr_sample = false;
-    for _ in 0..10 {
-        if let Ok(ev) = client.next_event().await
-            && ev.event == "HrSample"
-        {
-            saw_hr_sample = true;
-            assert_eq!(ev.data["bpm"], 54.0);
-            assert_eq!(ev.data["session_id"], Value::Null);
-            break;
-        }
-    }
-    assert!(
-        saw_hr_sample,
-        "should receive HrSample telemetry event in Standby"
-    );
+    let hr_ev = client
+        .next_matching_event("HrSample", 10)
+        .await
+        .unwrap()
+        .expect("should receive HrSample telemetry event in Standby");
+    assert_eq!(hr_ev.data["bpm"], 54.0);
+    assert_eq!(hr_ev.data["session_id"], Value::Null);
 
     // Check sessions via IPC: sessions count must be 0
     let sess_list = client.request("session.list", json!({})).await.unwrap();
@@ -682,16 +669,11 @@ async fn test_wearable_streaming_outside_active_hours_enters_standby_and_suppres
         .await
         .unwrap();
 
-    let mut disc_ev = None;
-    for _ in 0..25 {
-        if let Ok(ev) = client.next_event().await
-            && ev.event == "StateChanged"
-        {
-            disc_ev = Some(ev);
-            break;
-        }
-    }
-    let disc_ev = disc_ev.expect("StateChanged event must be published on disconnect");
+    let disc_ev = client
+        .next_matching_event("StateChanged", 25)
+        .await
+        .unwrap()
+        .expect("StateChanged event must be published on disconnect");
     assert_eq!(disc_ev.data["monitoring_state"], "Idle");
 
     let st_after = client.request("daemon.status", json!({})).await.unwrap();

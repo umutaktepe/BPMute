@@ -142,4 +142,20 @@ impl IpcClient {
             }
         }
     }
+
+    /// Returns the next push event whose name matches `event_name`, skipping up to `max_skip`
+    /// intervening push events (such as high-frequency `HrSample` stream ticks).
+    pub async fn next_matching_event(
+        &mut self,
+        event_name: &str,
+        max_skip: usize,
+    ) -> Result<Option<PushEventEnvelope>, IpcClientError> {
+        for _ in 0..=max_skip {
+            let ev = self.next_event().await?;
+            if ev.event == event_name {
+                return Ok(Some(ev));
+            }
+        }
+        Ok(None)
+    }
 }
