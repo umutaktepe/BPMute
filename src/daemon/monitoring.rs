@@ -132,9 +132,55 @@ impl MonitoringContext {
         self.process_outputs(&wearable_id, outputs).await;
     }
 
-    async fn handle_wearable_event(&mut self, ev: WearableEvent) {
+    async fn transition_active_hours_entered(&mut self, ts_ms: i64) {
+        self.last_event_ts_ms = Some(ts_ms);
+        self.engine.set_active_hours(true);
+        if self.engine.state() == DetectorState::Standby
+            && let Some(wearable_id) = self.active_wearable_id.clone()
+        {
+            let outputs = self
+                .engine
+                .open_session_from_standby(ts_ms, "active hours started");
+            self.process_outputs(&wearable_id, outputs).await;
+        }
+    }
+
+    async fn transition_active_hours_expired(&mut self, ts_ms: i64) {
+        self.last_event_ts_ms = Some(ts_ms);
+        self.engine.set_active_hours(false);
+        if (self.engine.state() == DetectorState::Monitoring
+            || self.engine.state() == DetectorState::Warmup
+            || self.engine.state() == DetectorState::Candidate)
+            && let Some(wearable_id) = self.active_wearable_id.clone()
+        {
+            let outputs = self.engine.close_active_hours_expired(ts_ms);
+            self.process_outputs(&wearable_id, outputs).await;
+        }
+    }
+
+    async fn evaluate_active_hours(&mut self, ts_ms: i64) {
         let within_active = self.core.is_within_active_hours();
-        self.engine.set_active_hours(within_active);
+        let prev_within = self.engine.within_active_hours();
+        if prev_within != within_active {
+            if !prev_within && within_active {
+                self.transition_active_hours_entered(ts_ms).await;
+            } else if prev_within && !within_active {
+                self.transition_active_hours_expired(ts_ms).await;
+            }
+        }
+    }
+
+    async fn handle_wearable_event(&mut self, ev: WearableEvent) {
+        let event_ts = match &ev {
+            WearableEvent::StreamState { state, .. } => Some(state.ts_ms),
+            WearableEvent::StreamDisconnected { ts_ms, .. } => Some(*ts_ms),
+            WearableEvent::HrPacket { packet, .. } => Some(packet.ts_ms),
+            WearableEvent::Metadata { .. } => None,
+        };
+        if let Some(ts_ms) = event_ts {
+            self.evaluate_active_hours(ts_ms).await;
+        }
+
         match ev {
             WearableEvent::StreamState { wearable, state } => {
                 self.process_stream_transition(
@@ -230,6 +276,12 @@ impl MonitoringContext {
             EngineControlEvent::ManualCloseSession { reply } => {
                 let res = self.manual_close_active_session().await;
                 let _ = reply.send(res);
+            }
+            EngineControlEvent::ActiveHoursEntered { ts_ms } => {
+                self.transition_active_hours_entered(ts_ms).await;
+            }
+            EngineControlEvent::ActiveHoursExpired { ts_ms } => {
+                self.transition_active_hours_expired(ts_ms).await;
             }
         }
     }
@@ -508,17 +560,10 @@ pub(crate) async fn run_monitoring_loop(
         }
         let gap_deadline = ctx.gap_deadline_instant();
         tokio::select! {
-            _ = sleep_or_pending(gap_deadline) => {
-                let now_ms = ctx.core.clock.now_utc().timestamp_millis();
-                ctx.check_gap_timeout(now_ms).await;
-            }
-            ev_opt = wearable_rx.recv(), if !wearable_closed => {
-                match ev_opt {
-                    Some(ev) => ctx.handle_wearable_event(ev).await,
-                    None => {
-                        wearable_closed = true;
-                        ctx.flush_close_latest(SessionEndReason::StreamEnded).await;
-                    }
+            biased;
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
+                    break;
                 }
             }
             Some(ctrl) = ctrl_rx.recv() => {
@@ -541,9 +586,17 @@ pub(crate) async fn run_monitoring_loop(
                 let within_active = ctx.core.is_within_active_hours();
                 ctx.engine.set_active_hours(within_active);
             }
-            res = shutdown_rx.changed() => {
-                if res.is_err() || *shutdown_rx.borrow() {
-                    break;
+            _ = sleep_or_pending(gap_deadline) => {
+                let now_ms = ctx.core.clock.now_utc().timestamp_millis();
+                ctx.check_gap_timeout(now_ms).await;
+            }
+            ev_opt = wearable_rx.recv(), if !wearable_closed => {
+                match ev_opt {
+                    Some(ev) => ctx.handle_wearable_event(ev).await,
+                    None => {
+                        wearable_closed = true;
+                        ctx.flush_close_latest(SessionEndReason::StreamEnded).await;
+                    }
                 }
             }
         }

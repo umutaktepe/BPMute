@@ -250,6 +250,36 @@ impl SleepEngine {
         self.within_active_hours = within;
     }
 
+    /// Returns whether the engine is currently inside configured Active Hours.
+    pub fn within_active_hours(&self) -> bool {
+        self.within_active_hours
+    }
+
+    /// Opens a fresh `Monitoring Session` starting from `Standby` when entering Active Hours.
+    pub fn open_session_from_standby(&mut self, ts_ms: i64, reason: &str) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        if self.state == DetectorState::Standby {
+            self.open_session(ts_ms, reason, &mut outputs);
+        }
+        outputs
+    }
+
+    /// Closes an unconfirmed session with [`SessionEndReason::ActiveHoursExpired`] and transitions to `Standby`.
+    pub fn close_active_hours_expired(&mut self, ts_ms: i64) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        if self.state == DetectorState::Monitoring
+            || self.state == DetectorState::Warmup
+            || self.state == DetectorState::Candidate
+        {
+            self.close_session_to_standby(
+                ts_ms,
+                SessionEndReason::ActiveHoursExpired,
+                &mut outputs,
+            );
+        }
+        outputs
+    }
+
     pub(super) fn enter_standby_internal(
         &mut self,
         ts_ms: i64,
@@ -631,8 +661,27 @@ impl SleepEngine {
         }
 
         if let Some(reason) = split_reason {
+            self.split_session_or_transition_to_standby(
+                ts_ms,
+                reason,
+                "post-sleep wakefulness session split",
+                outputs,
+            );
+        }
+    }
+
+    fn split_session_or_transition_to_standby(
+        &mut self,
+        ts_ms: i64,
+        reason: SessionEndReason,
+        split_desc: &str,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        if self.within_active_hours {
             self.close_session(ts_ms, reason, outputs);
-            self.open_session(ts_ms, "post-sleep wakefulness session split", outputs);
+            self.open_session(ts_ms, split_desc, outputs);
+        } else {
+            self.close_session_to_standby(ts_ms, reason, outputs);
         }
     }
 
@@ -743,8 +792,12 @@ impl SleepEngine {
                 if let (Some(hr), Some(z_hr)) = (self.last_hr_bpm_60s, self.last_z_hr)
                     && self.has_wake_rebound(hr, z_hr, self.hmm.probs()[STATE_SLEEP_NREM])
                 {
-                    self.close_session(ts_ms, SessionEndReason::DesktopWakeRebound, outputs);
-                    self.open_session(ts_ms, "desktop wake rebound session split", outputs);
+                    self.split_session_or_transition_to_standby(
+                        ts_ms,
+                        SessionEndReason::DesktopWakeRebound,
+                        "desktop wake rebound session split",
+                        outputs,
+                    );
                 }
             }
         }

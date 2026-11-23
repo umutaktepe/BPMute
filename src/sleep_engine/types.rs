@@ -417,6 +417,7 @@ pub enum SessionEndReason {
     HostSuspend,
     HostPoweroff,
     ManualClose,
+    ActiveHoursExpired,
 }
 
 impl SessionEndReason {
@@ -430,6 +431,7 @@ impl SessionEndReason {
             Self::HostSuspend => "host_suspend",
             Self::HostPoweroff => "host_poweroff",
             Self::ManualClose => "manual_close",
+            Self::ActiveHoursExpired => "active_hours_expired",
         }
     }
 }
@@ -452,6 +454,7 @@ impl std::str::FromStr for SessionEndReason {
             "host_suspend" => Ok(Self::HostSuspend),
             "host_poweroff" => Ok(Self::HostPoweroff),
             "manual_close" => Ok(Self::ManualClose),
+            "active_hours_expired" => Ok(Self::ActiveHoursExpired),
             _ => Err(format!("invalid session end reason '{s}'")),
         }
     }

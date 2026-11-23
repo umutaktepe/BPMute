@@ -2586,3 +2586,183 @@ fn standby_disconnect_transitions_cleanly_to_idle_without_gap() {
         }
     )));
 }
+
+#[test]
+fn session_end_reason_active_hours_expired_serde_and_display() {
+    assert_eq!(
+        SessionEndReason::ActiveHoursExpired.as_str(),
+        "active_hours_expired"
+    );
+    assert_eq!(
+        SessionEndReason::ActiveHoursExpired.to_string(),
+        "active_hours_expired"
+    );
+    assert_eq!(
+        "active_hours_expired".parse::<SessionEndReason>().unwrap(),
+        SessionEndReason::ActiveHoursExpired
+    );
+    assert_eq!(
+        serde_json::to_string(&SessionEndReason::ActiveHoursExpired).unwrap(),
+        "\"active_hours_expired\""
+    );
+    assert_eq!(
+        serde_json::from_str::<SessionEndReason>("\"active_hours_expired\"").unwrap(),
+        SessionEndReason::ActiveHoursExpired
+    );
+}
+
+#[test]
+fn standby_to_warmup_session_opening_on_active_hours_entry() {
+    let mut eng = default_engine();
+    eng.set_active_hours(false);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 1000,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert_eq!(eng.current_session_index(), None);
+
+    // Active hours start at 22:00 (ts_ms = 100_000)
+    eng.set_active_hours(true);
+    let out = eng.open_session_from_standby(100_000, "active hours started");
+    assert_eq!(eng.state(), DetectorState::Warmup);
+    assert_eq!(eng.current_session_index(), Some(1));
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionStarted {
+            session_index: 1,
+            ts_ms: 100_000,
+        }
+    )));
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            session_index: 1,
+            ts_ms: 100_000,
+            from: DetectorState::Standby,
+            to: DetectorState::Warmup,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn monitoring_session_closes_with_active_hours_expired_and_transitions_to_standby() {
+    let mut eng = default_engine();
+    eng.set_active_hours(true);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Warmup);
+
+    // Warmup through to Monitoring with waking HR (75 bpm)
+    let _ = push_sleep(&mut eng, 1, 700, 75.0, 75.0, false);
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+    assert_eq!(eng.current_session_index(), Some(1));
+
+    // Active hours expire at 08:00 (ts_ms = 36_000_000)
+    eng.set_active_hours(false);
+    let out = eng.close_active_hours_expired(36_000_000);
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            session_index: 1,
+            ts_ms: 36_000_000,
+            from: DetectorState::Monitoring,
+            to: DetectorState::Standby,
+            ..
+        }
+    )));
+    let summary = out
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::SessionEnded(s) => Some(s),
+            _ => None,
+        })
+        .expect("SessionEnded must be emitted");
+    assert_eq!(summary.end_reason, SessionEndReason::ActiveHoursExpired);
+    assert_eq!(summary.sleeping_ts_ms, None);
+    assert_eq!(summary.post_trigger_sleep_sec, 0);
+}
+
+#[test]
+fn sleeping_state_preserved_across_active_hours_window_end() {
+    let mut eng = default_engine();
+    eng.set_active_hours(true);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_sleep(&mut eng, 1, 1500, 52.0, 48.0, true);
+    let _ = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: 1_501_000,
+        outcome: GraceResult::Expired,
+    }));
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+
+    // Active hours end (08:00) -> engine marked outside active hours
+    eng.set_active_hours(false);
+
+    // Feed another hour of consolidated sleep packets outside active hours
+    let _ = push_sleep(&mut eng, 101, 120, 48.0, 48.0, true);
+
+    // State MUST remain Sleeping, session remains active and accumulating
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+    assert_eq!(eng.current_session_index(), Some(1));
+}
+
+#[test]
+fn post_sleep_wakefulness_outside_active_hours_transitions_to_standby_without_new_session() {
+    let mut eng = default_engine();
+    eng.set_active_hours(true);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_sleep(&mut eng, 1, 1500, 52.0, 48.0, true);
+    let _ = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: 1_501_000,
+        outcome: GraceResult::Expired,
+    }));
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+
+    // 08:00 Window ends
+    eng.set_active_hours(false);
+
+    // 08:30 Desktop activity + wake rebound
+    let desk_out = eng.handle_event(EngineEvent::DesktopActivity(DesktopActivity {
+        ts_ms: 3_000_000,
+        kind: DesktopActivityKind::UserInput,
+    }));
+    let _ = push_sleep(&mut eng, 201, 210, 85.0, 85.0, false);
+    let rebound_out = eng.handle_event(EngineEvent::DesktopActivity(DesktopActivity {
+        ts_ms: 3_150_000,
+        kind: DesktopActivityKind::UserInput,
+    }));
+
+    // Must transition directly to Standby without opening a new session!
+    assert_eq!(eng.state(), DetectorState::Standby);
+    let combined_out: Vec<_> = desk_out.into_iter().chain(rebound_out).collect();
+    let ended = combined_out.iter().find_map(|o| match o {
+        EngineOutput::SessionEnded(s) => Some(s),
+        _ => None,
+    });
+    assert!(ended.is_some());
+    assert_eq!(
+        ended.unwrap().end_reason,
+        SessionEndReason::DesktopWakeRebound
+    );
+    assert!(combined_out.iter().all(|o| !matches!(
+        o,
+        EngineOutput::SessionStarted {
+            session_index: 2,
+            ..
+        }
+    )));
+}

@@ -57,6 +57,12 @@ pub enum EngineControlEvent {
     ManualCloseSession {
         reply: oneshot::Sender<Result<SessionFullDetail, ErrorPayload>>,
     },
+    ActiveHoursEntered {
+        ts_ms: i64,
+    },
+    ActiveHoursExpired {
+        ts_ms: i64,
+    },
 }
 
 /// Startup parameters for [`DaemonHandle::spawn`].

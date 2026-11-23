@@ -112,6 +112,7 @@ pub(super) struct InnerState {
     pub(super) wearable_body_locations: HashMap<String, String>,
     pub(super) playing_players_count: Option<usize>,
     pub(super) active_auth_reply: Option<tokio::sync::oneshot::Sender<EnrollAuthResponseParams>>,
+    pub(super) last_within_active_hours: Option<bool>,
 }
 
 pub(super) struct EnrollmentLock {
@@ -161,6 +162,13 @@ impl DaemonCore {
         } = init;
         let dry_run = loaded_config.config.actions.dry_run;
         let started_at = clock.now_instant();
+        let last_within_active_hours =
+            loaded_config.config.schedule.active_hours_enabled.then(|| {
+                loaded_config
+                    .config
+                    .schedule
+                    .is_within_active_hours(clock.now_local().time())
+            });
         let (calibration_tx, _) = watch::channel(initial_calibration.clone());
         let (config_tx, _) = watch::channel((
             loaded_config.config.detection.clone(),
@@ -234,6 +242,7 @@ impl DaemonCore {
                 wearable_body_locations: HashMap::new(),
                 playing_players_count: None,
                 active_auth_reply: None,
+                last_within_active_hours,
             }),
         }
     }
@@ -789,6 +798,7 @@ impl DaemonCore {
         if let Ok(val) = serde_json::to_value(&snapshot) {
             self.broker.publish_control("ConfigUpdated", val);
         }
+        self.check_active_hours_transition(self.clock.now_utc().timestamp_millis());
         if let Some(status) = state_changed_status {
             self.publish_state_changed(&status);
         }
@@ -826,6 +836,36 @@ impl DaemonCore {
             .config
             .schedule
             .is_within_active_hours(self.clock.now_local().time())
+    }
+
+    /// Evaluates clock transitions against configured Active Hours, updating `InnerState` and
+    /// signaling `MonitoringContext` if the active-hours boundary was crossed.
+    pub fn check_active_hours_transition(&self, ts_ms: i64) {
+        let action = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            if !guard.loaded_config.config.schedule.active_hours_enabled {
+                guard.last_within_active_hours = None;
+                None
+            } else {
+                let now_within = guard
+                    .loaded_config
+                    .config
+                    .schedule
+                    .is_within_active_hours(self.clock.now_local().time());
+                let prev_within = guard.last_within_active_hours;
+                guard.last_within_active_hours = Some(now_within);
+
+                match (prev_within, now_within) {
+                    (Some(false), true) => Some(EngineControlEvent::ActiveHoursEntered { ts_ms }),
+                    (Some(true), false) => Some(EngineControlEvent::ActiveHoursExpired { ts_ms }),
+                    _ => None,
+                }
+            }
+        };
+
+        if let Some(event) = action {
+            let _ = self.engine_ctrl_tx.try_send(event);
+        }
     }
 }
 

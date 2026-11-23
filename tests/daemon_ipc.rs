@@ -686,3 +686,477 @@ async fn test_wearable_streaming_outside_active_hours_enters_standby_and_suppres
 
     daemon.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_active_hours_window_entry_opens_session_from_streaming_standby() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let env = MapEnv::new();
+
+    // 21:50 Local time is 10 minutes before active hours [22:00, 08:00)
+    let local_2150 = Local.with_ymd_and_hms(2026, 11, 19, 21, 50, 0).unwrap();
+    let start_utc = local_2150.with_timezone(&Utc);
+
+    let (source, wearable_tx) = common::daemon::TestWearableSource::new();
+
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = ClockTime::new(8, 0).unwrap();
+
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(start_utc));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, std::sync::Arc::new(env), clock)
+            .with_wearable_source(std::sync::Arc::new(source)),
+    )
+    .await
+    .expect("daemon should start");
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+
+    let snapshot = client.next_event().await.unwrap();
+    assert_eq!(snapshot.event, "Snapshot");
+
+    // Wearable connects at 21:50 outside active hours -> enters Standby
+    let desc = WearableDescriptor {
+        mac: "11:22:33:44:55:66".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Active Watch".to_string()),
+        advertised_name: Some("Watch".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: desc.clone(),
+            state: bpmute::sleep_engine::StreamState {
+                ts_ms: start_utc.timestamp_millis(),
+                status: bpmute::sleep_engine::StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    let state_ev = client
+        .next_matching_event("StateChanged", 5)
+        .await
+        .unwrap()
+        .expect("StateChanged to Standby");
+    assert_eq!(state_ev.data["monitoring_state"], "Standby");
+
+    // Send sample during Standby
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::HrPacket {
+            wearable: desc.clone(),
+            packet: bpmute::sleep_engine::HrPacket {
+                ts_ms: start_utc.timestamp_millis() + 1000,
+                bpm: 65.0,
+                rr_ms: vec![923.0],
+                contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+
+    let hr_ev = client
+        .next_matching_event("HrSample", 5)
+        .await
+        .unwrap()
+        .expect("HrSample event during Standby");
+    assert_eq!(hr_ev.data["session_id"], Value::Null);
+
+    // Advance virtual time 10 minutes to 22:00:00 (entering Active Hours!)
+    tokio::time::advance(Duration::from_secs(600)).await;
+    let enter_ts_ms = start_utc.timestamp_millis() + 600_000;
+
+    // Send packet at 22:00:00
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::HrPacket {
+            wearable: desc.clone(),
+            packet: bpmute::sleep_engine::HrPacket {
+                ts_ms: enter_ts_ms,
+                bpm: 62.0,
+                rr_ms: vec![967.0],
+                contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+
+    let state_warmup = client.next_event().await.unwrap();
+    assert_eq!(state_warmup.event, "StateChanged");
+    assert_eq!(state_warmup.data["monitoring_state"], "Warmup");
+
+    let session_ev = client.next_event().await.unwrap();
+    assert_eq!(session_ev.event, "SessionStarted");
+    assert_eq!(session_ev.data["start_ts_ms"], enter_ts_ms);
+
+    let st = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st["monitoring_state"], "Warmup");
+    assert_eq!(st["armed"], true);
+
+    let sess_list = client.request("session.list", json!({})).await.unwrap();
+    assert_eq!(sess_list["total_count"], 1);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_all_nighter_monitoring_expires_at_window_end_with_active_hours_expired() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let env = MapEnv::new();
+
+    // 23:00 Local time is inside active hours [22:00, 08:00)
+    let local_23h = Local.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let start_utc = local_23h.with_timezone(&Utc);
+
+    let (source, wearable_tx) = common::daemon::TestWearableSource::new();
+
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = ClockTime::new(8, 0).unwrap();
+
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(start_utc));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, std::sync::Arc::new(env), clock)
+            .with_wearable_source(std::sync::Arc::new(source)),
+    )
+    .await
+    .expect("daemon should start");
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _ = client.next_event().await.unwrap(); // Snapshot
+
+    let desc = WearableDescriptor {
+        mac: "22:33:44:55:66:77".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("All-Nighter Watch".to_string()),
+        advertised_name: Some("Watch".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: desc.clone(),
+            state: bpmute::sleep_engine::StreamState {
+                ts_ms: start_utc.timestamp_millis(),
+                status: bpmute::sleep_engine::StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Session starts in Warmup
+    let sess_started = client
+        .next_matching_event("SessionStarted", 10)
+        .await
+        .unwrap()
+        .expect("SessionStarted");
+    let session_id = sess_started.data["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Stream 500 seconds (~33 clean epochs) of calm wake HR (~75 bpm) to transition Warmup -> Monitoring
+    for sec in 1..=500_i64 {
+        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
+        let wave = 2.6 * (sec as f64 * 0.11).sin() + 1.1 * (sec as f64 * 0.31).cos();
+        let bpm = 75.0 + wave;
+        let rr_ms = vec![60_000.0 / bpm + 14.0 * (sec as f64 * 1.5).sin()];
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms,
+                    bpm,
+                    rr_ms,
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    let state_mon = client
+        .next_matching_event("StateChanged", 600)
+        .await
+        .unwrap()
+        .expect("StateChanged to Monitoring");
+    assert_eq!(state_mon.data["monitoring_state"], "Monitoring");
+
+    // Advance 9 hours from 23:00 to 08:00:01 (exiting Active Hours!)
+    let exit_secs = 9 * 3600 + 1;
+    tokio::time::advance(Duration::from_secs(exit_secs as u64)).await;
+    let exit_ts_ms = start_utc.timestamp_millis() + exit_secs * 1000;
+
+    // Send packet at 08:00:01
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::HrPacket {
+            wearable: desc.clone(),
+            packet: bpmute::sleep_engine::HrPacket {
+                ts_ms: exit_ts_ms,
+                bpm: 74.0,
+                rr_ms: vec![810.0],
+                contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Session closes with active_hours_expired and transitions to Standby!
+    let state_standby = client
+        .next_matching_event("StateChanged", 50)
+        .await
+        .unwrap()
+        .expect("StateChanged to Standby");
+    assert_eq!(state_standby.data["monitoring_state"], "Standby");
+
+    let sess_closed = client
+        .next_matching_event("SessionClosed", 50)
+        .await
+        .unwrap()
+        .expect("SessionClosed on window expiration");
+    assert_eq!(sess_closed.data["session"]["session"]["id"], session_id);
+    assert_eq!(
+        sess_closed.data["session"]["session"]["end_reason"],
+        "active_hours_expired"
+    );
+    assert_eq!(
+        sess_closed.data["session"]["session"]["post_trigger_sleep_sec"],
+        0
+    );
+    assert!(sess_closed.data["session"]["session"]["sleep_mu_hr"].is_null());
+    assert_eq!(
+        sess_closed.data["session"]["session"]["post_trigger_sleep_sec"],
+        0
+    );
+    assert!(sess_closed.data["session"]["session"]["sleep_mu_hr"].is_null());
+
+    let st = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st["monitoring_state"], "Standby");
+    assert_eq!(st["armed"], false);
+
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_overnight_sleep_crosses_window_end_and_preserves_session_until_wakefulness() {
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let env = MapEnv::new();
+
+    // 23:00 Local time is inside active hours [22:00, 08:00)
+    let local_23h = Local.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let start_utc = local_23h.with_timezone(&Utc);
+
+    let (source, wearable_tx) = common::daemon::TestWearableSource::new();
+
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = ClockTime::new(23, 25).unwrap();
+
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(start_utc));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, std::sync::Arc::new(env), clock)
+            .with_wearable_source(std::sync::Arc::new(source)),
+    )
+    .await
+    .expect("daemon should start");
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _ = client.next_event().await.unwrap(); // Snapshot
+
+    let desc = WearableDescriptor {
+        mac: "33:44:55:66:77:88".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Sleep Watch".to_string()),
+        advertised_name: Some("Watch".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: desc.clone(),
+            state: bpmute::sleep_engine::StreamState {
+                ts_ms: start_utc.timestamp_millis(),
+                status: bpmute::sleep_engine::StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    let sess_started = client
+        .next_matching_event("SessionStarted", 10)
+        .await
+        .unwrap()
+        .expect("SessionStarted");
+    let session_id = sess_started.data["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Warmup: 500s of calm wake HR (68 bpm) to transition Warmup -> Monitoring
+    for sec in 1..=500_i64 {
+        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
+        let wave = 2.6 * (sec as f64 * 0.11).sin() + 1.1 * (sec as f64 * 0.31).cos();
+        let bpm = 68.0 + wave;
+        let rr_ms = vec![60_000.0 / bpm + 14.0 * (sec as f64 * 1.5).sin()];
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms,
+                    bpm,
+                    rr_ms,
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(500)).await;
+
+    let state_mon = client
+        .next_matching_event("StateChanged", 600)
+        .await
+        .unwrap()
+        .expect("StateChanged to Monitoring");
+    assert_eq!(state_mon.data["monitoring_state"], "Monitoring");
+
+    // Sleep descent: ramp HR down from 68 bpm to 58 bpm
+    for sec in 501..=1200_i64 {
+        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
+        let mins = (sec - 501) as f64 / 60.0;
+        let target = (68.0 - 0.8 * mins).max(58.0);
+        let bpm = target + 0.35 * (sec as f64 * 0.4).sin();
+        let rr_ms = vec![60_000.0 / bpm + 26.0 * (sec as f64 * 1.5).sin()];
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms,
+                    bpm,
+                    rr_ms,
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(700)).await;
+
+    // Wait for Candidate then Confirmed state
+    let state_cand = client
+        .next_matching_event("StateChanged", 800)
+        .await
+        .unwrap()
+        .expect("StateChanged to Candidate");
+    assert_eq!(state_cand.data["monitoring_state"], "Candidate");
+
+    let state_conf = client
+        .next_matching_event("StateChanged", 800)
+        .await
+        .unwrap()
+        .expect("StateChanged to Confirmed");
+    assert_eq!(state_conf.data["monitoring_state"], "Confirmed");
+
+    let state_sleep = client
+        .next_matching_event("StateChanged", 800)
+        .await
+        .unwrap()
+        .expect("StateChanged to Sleeping");
+    assert_eq!(state_sleep.data["monitoring_state"], "Sleeping");
+
+    // Continuous sleep packets across 23:25:00 (window end) to 23:25:30 (outside active hours!)
+    for sec in 1201..=1530_i64 {
+        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
+        let bpm = 50.0 + 0.35 * (sec as f64 * 0.4).sin();
+        let rr_ms = vec![60_000.0 / bpm + 26.0 * (sec as f64 * 1.5).sin()];
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms,
+                    bpm,
+                    rr_ms,
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(330)).await;
+
+    // Session MUST remain open and in Sleeping across the active-hours boundary!
+    let st_boundary = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st_boundary["monitoring_state"], "Sleeping");
+    assert_eq!(st_boundary["armed"], false);
+
+    // Send 970s of morning wakefulness (74 bpm, P(Sleep) < 0.30)
+    for sec in 1531..=2500_i64 {
+        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
+        let wave = 2.6 * (sec as f64 * 0.11).sin() + 1.1 * (sec as f64 * 0.31).cos();
+        let bpm = 74.0 + wave;
+        let rr_ms = vec![60_000.0 / bpm + 14.0 * (sec as f64 * 1.5).sin()];
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: bpmute::sleep_engine::HrPacket {
+                    ts_ms,
+                    bpm,
+                    rr_ms,
+                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+    tokio::time::advance(Duration::from_secs(970)).await;
+
+    // Wakefulness confirmed outside active hours: session closes and transitions directly to Standby!
+    // Wakefulness confirmed outside active hours: session closes and transitions directly to Standby!
+    let state_final = client
+        .next_matching_event("StateChanged", 2000)
+        .await
+        .unwrap()
+        .expect("StateChanged to Standby");
+    assert_eq!(state_final.data["monitoring_state"], "Standby");
+
+    let sess_closed = client
+        .next_matching_event("SessionClosed", 2000)
+        .await
+        .unwrap()
+        .expect("SessionClosed on morning wakefulness");
+    assert_eq!(sess_closed.data["session"]["session"]["id"], session_id);
+    assert_eq!(
+        sess_closed.data["session"]["session"]["end_reason"],
+        "sustained_wakefulness"
+    );
+    assert!(
+        sess_closed.data["session"]["session"]["post_trigger_sleep_sec"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    let st_final = client.request("daemon.status", json!({})).await.unwrap();
+    assert_eq!(st_final["monitoring_state"], "Standby");
+
+    // Total sessions count is 1 (closed overnight session), no daytime session opened!
+    let sess_list = client.request("session.list", json!({})).await.unwrap();
+    assert_eq!(sess_list["total_count"], 1);
+
+    daemon.shutdown().await;
+}

@@ -473,24 +473,36 @@ impl SleepEngine {
         ))
     }
 
-    pub(super) fn close_session(
+    fn close_session_to_state(
         &mut self,
+        target_state: DetectorState,
         end_ts_ms: i64,
         end_reason: SessionEndReason,
         outputs: &mut Vec<EngineOutput>,
     ) {
+        let reason_str = match (target_state, end_reason) {
+            (DetectorState::Standby, SessionEndReason::ActiveHoursExpired) => {
+                "active hours expired"
+            }
+            (DetectorState::Standby, _) => "monitoring session closed outside active hours",
+            (DetectorState::Idle, _) => "monitoring session closed",
+            _ => "session closed",
+        };
         let Some(session_index) = self.session_index else {
             let prev = self.state;
-            self.state = DetectorState::Idle;
+            self.state = target_state;
             self.active_gap = None;
-            if prev != DetectorState::Idle {
+            if prev != target_state {
                 outputs.push(EngineOutput::StateChanged {
                     session_index: 0,
                     ts_ms: end_ts_ms,
                     from: prev,
-                    to: DetectorState::Idle,
+                    to: target_state,
                     p_sleep: self.hmm.probs()[STATE_SLEEP_NREM],
-                    reason: "standby ended".to_string(),
+                    reason: match target_state {
+                        DetectorState::Standby => "standby".to_string(),
+                        _ => "standby ended".to_string(),
+                    },
                 });
             }
             return;
@@ -498,19 +510,37 @@ impl SleepEngine {
         let medians = self.sleep_samples.finalize_medians();
         let summary = self.build_summary(session_index, end_ts_ms, end_reason, medians);
         let prev = self.state;
-        self.state = DetectorState::Idle;
+        self.state = target_state;
         self.active_gap = None;
-        if prev != DetectorState::Idle {
+        if prev != target_state {
             outputs.push(EngineOutput::StateChanged {
                 session_index,
                 ts_ms: end_ts_ms,
                 from: prev,
-                to: DetectorState::Idle,
+                to: target_state,
                 p_sleep: self.hmm.probs()[STATE_SLEEP_NREM],
-                reason: "monitoring session closed".to_string(),
+                reason: reason_str.to_string(),
             });
         }
         outputs.push(EngineOutput::SessionEnded(summary));
+    }
+
+    pub(super) fn close_session(
+        &mut self,
+        end_ts_ms: i64,
+        end_reason: SessionEndReason,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        self.close_session_to_state(DetectorState::Idle, end_ts_ms, end_reason, outputs);
+    }
+
+    pub(super) fn close_session_to_standby(
+        &mut self,
+        end_ts_ms: i64,
+        end_reason: SessionEndReason,
+        outputs: &mut Vec<EngineOutput>,
+    ) {
+        self.close_session_to_state(DetectorState::Standby, end_ts_ms, end_reason, outputs);
     }
 
     /// Returns the current state-machine phase.
