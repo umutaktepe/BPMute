@@ -866,24 +866,18 @@ async fn test_all_nighter_monitoring_expires_at_window_end_with_active_hours_exp
         .to_string();
 
     // Stream 500 seconds (~33 clean epochs) of calm wake HR (~75 bpm) to transition Warmup -> Monitoring
-    for sec in 1..=500_i64 {
-        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
-        let wave = 2.6 * (sec as f64 * 0.11).sin() + 1.1 * (sec as f64 * 0.31).cos();
-        let bpm = 75.0 + wave;
-        let rr_ms = vec![60_000.0 / bpm + 14.0 * (sec as f64 * 1.5).sin()];
-        wearable_tx
-            .send(bpmute::daemon::WearableEvent::HrPacket {
-                wearable: desc.clone(),
-                packet: bpmute::sleep_engine::HrPacket {
-                    ts_ms,
-                    bpm,
-                    rr_ms,
-                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
-                },
-            })
-            .await
-            .unwrap();
-    }
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &desc,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: start_utc.timestamp_millis() + 1000,
+            count_sec: 500,
+            base_bpm: 75.0,
+            bpm_amplitude: 2.6,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
 
     let state_mon = client
         .next_matching_event("StateChanged", 600)
@@ -1080,23 +1074,18 @@ async fn test_overnight_sleep_crosses_window_end_and_preserves_session_until_wak
     assert_eq!(state_sleep.data["monitoring_state"], "Sleeping");
 
     // Continuous sleep packets across 23:25:00 (window end) to 23:25:30 (outside active hours!)
-    for sec in 1201..=1530_i64 {
-        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
-        let bpm = 50.0 + 0.35 * (sec as f64 * 0.4).sin();
-        let rr_ms = vec![60_000.0 / bpm + 26.0 * (sec as f64 * 1.5).sin()];
-        wearable_tx
-            .send(bpmute::daemon::WearableEvent::HrPacket {
-                wearable: desc.clone(),
-                packet: bpmute::sleep_engine::HrPacket {
-                    ts_ms,
-                    bpm,
-                    rr_ms,
-                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
-                },
-            })
-            .await
-            .unwrap();
-    }
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &desc,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: start_utc.timestamp_millis() + 1201 * 1000,
+            count_sec: 330,
+            base_bpm: 50.0,
+            bpm_amplitude: 0.5,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
     tokio::time::advance(Duration::from_secs(330)).await;
 
     // Session MUST remain open and in Sleeping across the active-hours boundary!
@@ -1105,24 +1094,18 @@ async fn test_overnight_sleep_crosses_window_end_and_preserves_session_until_wak
     assert_eq!(st_boundary["armed"], false);
 
     // Send 970s of morning wakefulness (74 bpm, P(Sleep) < 0.30)
-    for sec in 1531..=2500_i64 {
-        let ts_ms = start_utc.timestamp_millis() + sec * 1000;
-        let wave = 2.6 * (sec as f64 * 0.11).sin() + 1.1 * (sec as f64 * 0.31).cos();
-        let bpm = 74.0 + wave;
-        let rr_ms = vec![60_000.0 / bpm + 14.0 * (sec as f64 * 1.5).sin()];
-        wearable_tx
-            .send(bpmute::daemon::WearableEvent::HrPacket {
-                wearable: desc.clone(),
-                packet: bpmute::sleep_engine::HrPacket {
-                    ts_ms,
-                    bpm,
-                    rr_ms,
-                    contact_status: bpmute::sleep_engine::ContactStatus::Contact,
-                },
-            })
-            .await
-            .unwrap();
-    }
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &desc,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: start_utc.timestamp_millis() + 1531 * 1000,
+            count_sec: 970,
+            base_bpm: 74.0,
+            bpm_amplitude: 2.6,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
     tokio::time::advance(Duration::from_secs(970)).await;
 
     // Wakefulness confirmed outside active hours: session closes and transitions directly to Standby!
