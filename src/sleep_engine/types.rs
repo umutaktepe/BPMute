@@ -529,6 +529,12 @@ pub struct SessionSummary {
     #[serde(default)]
     pub warmup_ln_rmssd: Option<f64>,
     #[serde(default)]
+    pub pre_candidate_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_sigma_hr: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_ln_rmssd: Option<f64>,
+    #[serde(default)]
     pub onset_hr_bpm: Option<f64>,
     #[serde(default)]
     pub sleep_mu_hr: Option<f64>,
@@ -549,6 +555,21 @@ pub struct SessionSummary {
     #[serde(default)]
     pub snooze_count: u8,
     pub epochs_count: usize,
+}
+
+impl SessionSummary {
+    /// Resolves the waking reference heart rate, prioritizing pre-candidate quiet wake over warmup.
+    pub fn wake_ref(&self) -> Option<f64> {
+        self.pre_candidate_mu_hr.or(self.warmup_mu_hr)
+    }
+
+    /// Computes sleep onset deceleration relative to the resolved waking baseline.
+    pub fn compute_delta_hr_onset(&self) -> Option<f64> {
+        self.sleep_mu_hr
+            .or(self.onset_hr_bpm)
+            .zip(self.wake_ref())
+            .map(|(sleep_or_onset, wake)| sleep_or_onset - wake)
+    }
 }
 
 /// Output event emitted synchronously by [`crate::sleep_engine::SleepEngine`].

@@ -56,6 +56,10 @@ _Avoid_: Postpone, mute, cancel (reserve cancellation for waking false positives
 An optional recurring local-clock window during which confirmed sleep onset arms a `Grace Period` and the `Sleep Action Pipeline`; when disabled, actions arm 24/7, while its configured end time still serves as the target for an `until-morning` pause.
 _Avoid_: Schedule, quiet hours
 
+**Pre-Candidate Baseline**:
+The snapshot of the user's calm waking physiological reference (`Quiet-Wake Baseline`) captured immediately upon crossing the sleep-onset threshold into `Candidate` state, serving as the primary waking reference for relative deceleration and calibration recomputation.
+_Avoid_: Onset baseline, pre-sleep average, candidate warmup
+
 **Calibration Boundary**:
 A reversible point-in-time marker in the calibration ledger that resets personal physiological calibration to `Cold Start` (folding only subsequent Monitoring Sessions) while preserving historical sessions and per-Wearable signal floors.
 _Avoid_: Soft reset, reset epoch, baseline wipe, cutoff

@@ -2342,3 +2342,87 @@ fn manual_close_session_during_active_gap_and_precondition_rejections() {
     let subsequent_err = eng.manual_close_session().unwrap_err();
     assert_eq!(subsequent_err, ManualCloseError::NoActiveSession);
 }
+
+#[test]
+fn pre_candidate_baseline_snapshot_propagated_to_summary() {
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 600, 72.0, true);
+    let (_, cand_sec) = push_sleep_until_state(
+        &mut eng,
+        601,
+        1400,
+        72.0,
+        60.0,
+        true,
+        DetectorState::Candidate,
+    );
+    assert_eq!(eng.state(), DetectorState::Candidate);
+
+    let out = eng.force_close_session((cand_sec + 10) * 1000, SessionEndReason::StreamEnded);
+    let summary = extract_session_ended(&out);
+    assert!(summary.pre_candidate_mu_hr.is_some());
+    assert!(summary.pre_candidate_sigma_hr.is_some());
+    assert!(summary.pre_candidate_ln_rmssd.is_some());
+    let pre_mu = summary.pre_candidate_mu_hr.unwrap();
+    assert!((pre_mu - 72.0).abs() < 2.0);
+}
+
+#[test]
+fn pre_candidate_baseline_is_none_when_session_closes_in_monitoring() {
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 400, 70.0, true);
+    let out = eng.force_close_session(401_000, SessionEndReason::StreamEnded);
+    let summary = extract_session_ended(&out);
+    assert_eq!(summary.pre_candidate_mu_hr, None);
+    assert_eq!(summary.pre_candidate_sigma_hr, None);
+    assert_eq!(summary.pre_candidate_ln_rmssd, None);
+}
+
+#[test]
+fn pre_candidate_cleared_when_candidate_reset_to_monitoring() {
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 600, 72.0, true);
+    let (_, cand_sec) = push_sleep_until_state(
+        &mut eng,
+        601,
+        1400,
+        72.0,
+        60.0,
+        true,
+        DetectorState::Candidate,
+    );
+    assert_eq!(eng.state(), DetectorState::Candidate);
+
+    let out = eng.handle_event(EngineEvent::DesktopActivity(DesktopActivity {
+        ts_ms: (cand_sec + 2) * 1000,
+        kind: DesktopActivityKind::UserInput,
+    }));
+    assert!(out.iter().any(|o| matches!(
+        o,
+        EngineOutput::StateChanged {
+            from: DetectorState::Candidate,
+            to: DetectorState::Monitoring,
+            ..
+        }
+    )));
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    let close_out = eng.force_close_session((cand_sec + 10) * 1000, SessionEndReason::StreamEnded);
+    let summary = extract_session_ended(&close_out);
+    assert_eq!(summary.candidate_ts_ms, None);
+    assert_eq!(summary.pre_candidate_mu_hr, None);
+    assert_eq!(summary.pre_candidate_sigma_hr, None);
+    assert_eq!(summary.pre_candidate_ln_rmssd, None);
+}

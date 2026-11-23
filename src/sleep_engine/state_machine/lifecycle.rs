@@ -230,6 +230,9 @@ impl SleepEngine {
             self.candidate_ts_ms = None;
             self.confirmed_ts_ms = None;
             self.onset_hr_bpm = None;
+            self.pre_candidate_mu_hr = None;
+            self.pre_candidate_sigma_hr = None;
+            self.pre_candidate_ln_rmssd = None;
         }
         self.transition_to(ts_ms, DetectorState::Monitoring, p_sleep, reason, outputs);
     }
@@ -332,6 +335,9 @@ impl SleepEngine {
         self.warmup_mu_hr = None;
         self.warmup_sigma_hr = None;
         self.warmup_ln_rmssd = None;
+        self.pre_candidate_mu_hr = None;
+        self.pre_candidate_sigma_hr = None;
+        self.pre_candidate_ln_rmssd = None;
         self.onset_hr_bpm = None;
         self.epochs_count = 0;
         self.warmup_clean_epochs = 0;
@@ -435,6 +441,9 @@ impl SleepEngine {
                 .warmup_sigma_hr
                 .or_else(|| (self.epochs_count > 0).then(|| self.baseline.sigma_hr())),
             warmup_ln_rmssd: self.warmup_ln_rmssd.or_else(|| self.baseline.mu_ln_rmssd()),
+            pre_candidate_mu_hr: self.pre_candidate_mu_hr,
+            pre_candidate_sigma_hr: self.pre_candidate_sigma_hr,
+            pre_candidate_ln_rmssd: self.pre_candidate_ln_rmssd,
             onset_hr_bpm: self.onset_hr_bpm,
             sleep_mu_hr,
             sleep_ln_rmssd,

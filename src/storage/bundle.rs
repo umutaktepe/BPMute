@@ -53,6 +53,12 @@ pub struct SessionBundleRecord {
     pub warmup_mu_hr: Option<f64>,
     pub warmup_sigma_hr: Option<f64>,
     pub warmup_ln_rmssd: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_sigma_hr: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_ln_rmssd: Option<f64>,
     pub onset_candidate_ts_ms: Option<i64>,
     pub onset_confirmed_ts_ms: Option<i64>,
     pub sleeping_ts_ms: Option<i64>,

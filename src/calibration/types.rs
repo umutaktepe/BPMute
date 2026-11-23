@@ -208,6 +208,12 @@ pub struct SessionLedgerRecord {
     pub warmup_mu_hr: Option<f64>,
     pub warmup_sigma_hr: Option<f64>,
     pub warmup_ln_rmssd: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_mu_hr: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_sigma_hr: Option<f64>,
+    #[serde(default)]
+    pub pre_candidate_ln_rmssd: Option<f64>,
     pub onset_candidate_ts_ms: Option<i64>,
     pub onset_confirmed_ts_ms: Option<i64>,
     pub sleeping_ts_ms: Option<i64>,
@@ -226,6 +232,23 @@ pub struct SessionLedgerRecord {
     pub auto_anomalous: bool,
     pub epochs_count: u32,
     pub raw_samples_count: u32,
+}
+
+impl SessionLedgerRecord {
+    /// Resolves the waking reference heart rate, prioritizing pre-candidate quiet wake over warmup.
+    pub fn wake_ref(&self) -> Option<f64> {
+        self.pre_candidate_mu_hr.or(self.warmup_mu_hr)
+    }
+
+    /// Resolves the deceleration of sleep onset relative to the waking baseline.
+    pub fn resolve_delta_hr(&self) -> Option<f64> {
+        self.delta_hr_onset.filter(|v| v.is_finite()).or_else(|| {
+            self.sleep_mu_hr
+                .or(self.onset_hr_bpm)
+                .zip(self.wake_ref())
+                .map(|(sleep_or_onset, wake)| sleep_or_onset - wake)
+        })
+    }
 }
 
 /// Single session bundle passed to pure-sync calibration recomputation.

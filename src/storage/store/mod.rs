@@ -102,7 +102,8 @@ impl LedgerStore {
         let mut s_stmt = self.conn.prepare(
             "SELECT id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason,
                     detection_sensitivity, had_rr, warmup_mu_hr, warmup_sigma_hr,
-                    warmup_ln_rmssd, onset_candidate_ts_ms, onset_confirmed_ts_ms,
+                    warmup_ln_rmssd, pre_candidate_mu_hr, pre_candidate_sigma_hr,
+                    pre_candidate_ln_rmssd, onset_candidate_ts_ms, onset_confirmed_ts_ms,
                     sleeping_ts_ms, sleep_mu_hr, onset_hr_bpm, delta_hr_onset,
                     sleep_ln_rmssd, sleep_hr_var_ratio, typical_sqi, post_trigger_sleep_sec,
                     trigger_power_action, rapid_resume_within_5m, grace_cancel_count,
@@ -123,24 +124,27 @@ impl LedgerStore {
                     warmup_mu_hr: row.get(8)?,
                     warmup_sigma_hr: row.get(9)?,
                     warmup_ln_rmssd: row.get(10)?,
-                    onset_candidate_ts_ms: row.get(11)?,
-                    onset_confirmed_ts_ms: row.get(12)?,
-                    sleeping_ts_ms: row.get(13)?,
-                    sleep_mu_hr: row.get(14)?,
-                    onset_hr_bpm: row.get(15)?,
-                    delta_hr_onset: row.get(16)?,
-                    sleep_ln_rmssd: row.get(17)?,
-                    sleep_hr_var_ratio: row.get(18)?,
-                    typical_sqi: row.get(19)?,
-                    post_trigger_sleep_sec: row.get(20)?,
-                    trigger_power_action: row.get(21)?,
-                    rapid_resume_within_5m: row.get::<_, i64>(22)? != 0,
-                    grace_cancel_count: row.get(23)?,
-                    rapid_wake_fp_count: row.get(24)?,
-                    snooze_count: row.get(25)?,
-                    auto_anomalous: row.get::<_, i64>(26)? != 0,
-                    epochs_count: row.get(27)?,
-                    raw_samples_count: row.get(28)?,
+                    pre_candidate_mu_hr: row.get(11)?,
+                    pre_candidate_sigma_hr: row.get(12)?,
+                    pre_candidate_ln_rmssd: row.get(13)?,
+                    onset_candidate_ts_ms: row.get(14)?,
+                    onset_confirmed_ts_ms: row.get(15)?,
+                    sleeping_ts_ms: row.get(16)?,
+                    sleep_mu_hr: row.get(17)?,
+                    onset_hr_bpm: row.get(18)?,
+                    delta_hr_onset: row.get(19)?,
+                    sleep_ln_rmssd: row.get(20)?,
+                    sleep_hr_var_ratio: row.get(21)?,
+                    typical_sqi: row.get(22)?,
+                    post_trigger_sleep_sec: row.get(23)?,
+                    trigger_power_action: row.get(24)?,
+                    rapid_resume_within_5m: row.get::<_, i64>(25)? != 0,
+                    grace_cancel_count: row.get(26)?,
+                    rapid_wake_fp_count: row.get(27)?,
+                    snooze_count: row.get(28)?,
+                    auto_anomalous: row.get::<_, i64>(29)? != 0,
+                    epochs_count: row.get(30)?,
+                    raw_samples_count: row.get(31)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -387,12 +391,13 @@ impl LedgerStore {
                     "INSERT INTO sessions (
                          id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason,
                          detection_sensitivity, had_rr, warmup_mu_hr, warmup_sigma_hr,
-                         warmup_ln_rmssd, onset_candidate_ts_ms, onset_confirmed_ts_ms,
+                         warmup_ln_rmssd, pre_candidate_mu_hr, pre_candidate_sigma_hr,
+                         pre_candidate_ln_rmssd, onset_candidate_ts_ms, onset_confirmed_ts_ms,
                          sleeping_ts_ms, sleep_mu_hr, onset_hr_bpm, delta_hr_onset,
                          sleep_ln_rmssd, sleep_hr_var_ratio, typical_sqi, post_trigger_sleep_sec,
                          trigger_power_action, rapid_resume_within_5m, grace_cancel_count,
                          rapid_wake_fp_count, snooze_count, auto_anomalous, epochs_count, raw_samples_count
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
                      ON CONFLICT(id) DO NOTHING",
                     params![
                         s.id,
@@ -406,6 +411,9 @@ impl LedgerStore {
                         s.warmup_mu_hr,
                         s.warmup_sigma_hr,
                         s.warmup_ln_rmssd,
+                        s.pre_candidate_mu_hr,
+                        s.pre_candidate_sigma_hr,
+                        s.pre_candidate_ln_rmssd,
                         s.onset_candidate_ts_ms,
                         s.onset_confirmed_ts_ms,
                         s.sleeping_ts_ms,
@@ -723,6 +731,7 @@ pub(crate) fn load_ledger_recompute_input(
     let mut s_stmt = conn.prepare(
         "SELECT s.id, s.wearable_id, s.start_ts_ms, s.end_ts_ms, s.end_reason, s.detection_sensitivity,
                 s.had_rr, s.warmup_mu_hr, s.warmup_sigma_hr, s.warmup_ln_rmssd,
+                s.pre_candidate_mu_hr, s.pre_candidate_sigma_hr, s.pre_candidate_ln_rmssd,
                 s.onset_candidate_ts_ms, s.onset_confirmed_ts_ms, s.sleeping_ts_ms,
                 s.sleep_mu_hr, s.onset_hr_bpm, s.delta_hr_onset, s.sleep_ln_rmssd,
                 s.sleep_hr_var_ratio, s.typical_sqi, s.post_trigger_sleep_sec,
@@ -741,9 +750,9 @@ pub(crate) fn load_ledger_recompute_input(
     let session_rows = s_stmt
         .query_map([], |row| {
             let record = map_session_ledger_row(row)?;
-            let w_rr = row.get::<_, i64>(28)? != 0;
-            let w_contact = row.get::<_, i64>(29)? != 0;
-            let feedback = map_optional_session_feedback_row(row, 30, record.id.clone())?;
+            let w_rr = row.get::<_, i64>(31)? != 0;
+            let w_contact = row.get::<_, i64>(32)? != 0;
+            let feedback = map_optional_session_feedback_row(row, 33, record.id.clone())?;
             Ok((record, feedback, w_rr, w_contact))
         })?
         .collect::<Result<Vec<_>, _>>()?;

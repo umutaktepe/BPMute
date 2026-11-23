@@ -143,6 +143,9 @@ pub struct SleepEngine {
     warmup_mu_hr: Option<f64>,
     warmup_sigma_hr: Option<f64>,
     warmup_ln_rmssd: Option<f64>,
+    pre_candidate_mu_hr: Option<f64>,
+    pre_candidate_sigma_hr: Option<f64>,
+    pre_candidate_ln_rmssd: Option<f64>,
     onset_hr_bpm: Option<f64>,
     epochs_count: usize,
     warmup_clean_epochs: u32,
@@ -200,6 +203,9 @@ impl SleepEngine {
             warmup_mu_hr: None,
             warmup_sigma_hr: None,
             warmup_ln_rmssd: None,
+            pre_candidate_mu_hr: None,
+            pre_candidate_sigma_hr: None,
+            pre_candidate_ln_rmssd: None,
             onset_hr_bpm: None,
             epochs_count: 0,
             warmup_clean_epochs: 0,
@@ -558,6 +564,9 @@ impl SleepEngine {
         self.candidate_dwell_sec = 15;
         self.candidate_hrv_valid_epochs = u32::from(hrv_valid);
         self.candidate_arousal_streak = 0;
+        self.pre_candidate_mu_hr = self.baseline.mu_hr();
+        self.pre_candidate_sigma_hr = Some(self.baseline.sigma_hr());
+        self.pre_candidate_ln_rmssd = self.baseline.mu_ln_rmssd();
         self.baseline.set_frozen(true);
         self.transition_to(
             ts_ms,

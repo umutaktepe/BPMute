@@ -210,11 +210,7 @@ impl LedgerStore {
             }
 
             let s = &req.summary;
-            let delta_hr_onset = s
-                .sleep_mu_hr
-                .or(s.onset_hr_bpm)
-                .zip(s.warmup_mu_hr)
-                .map(|(sleep_or_onset, wake)| sleep_or_onset - wake);
+            let delta_hr_onset = s.compute_delta_hr_onset();
 
             tx.execute(
                 "UPDATE sessions
@@ -226,22 +222,25 @@ impl LedgerStore {
                      warmup_mu_hr = ?6,
                      warmup_sigma_hr = ?7,
                      warmup_ln_rmssd = ?8,
-                     onset_candidate_ts_ms = ?9,
-                     onset_confirmed_ts_ms = ?10,
-                     sleeping_ts_ms = ?11,
-                     sleep_mu_hr = ?12,
-                     onset_hr_bpm = ?13,
-                     delta_hr_onset = ?14,
-                     sleep_ln_rmssd = ?15,
-                     sleep_hr_var_ratio = ?16,
-                     typical_sqi = ?17,
-                     post_trigger_sleep_sec = ?18,
-                     trigger_power_action = ?19,
-                     rapid_resume_within_5m = ?20,
-                     grace_cancel_count = ?21,
-                     rapid_wake_fp_count = ?22,
-                     snooze_count = ?23,
-                     auto_anomalous = ?24
+                     pre_candidate_mu_hr = ?9,
+                     pre_candidate_sigma_hr = ?10,
+                     pre_candidate_ln_rmssd = ?11,
+                     onset_candidate_ts_ms = ?12,
+                     onset_confirmed_ts_ms = ?13,
+                     sleeping_ts_ms = ?14,
+                     sleep_mu_hr = ?15,
+                     onset_hr_bpm = ?16,
+                     delta_hr_onset = ?17,
+                     sleep_ln_rmssd = ?18,
+                     sleep_hr_var_ratio = ?19,
+                     typical_sqi = ?20,
+                     post_trigger_sleep_sec = ?21,
+                     trigger_power_action = ?22,
+                     rapid_resume_within_5m = ?23,
+                     grace_cancel_count = ?24,
+                     rapid_wake_fp_count = ?25,
+                     snooze_count = ?26,
+                     auto_anomalous = ?27
                  WHERE id = ?1",
                 params![
                     req.session_id,
@@ -252,6 +251,9 @@ impl LedgerStore {
                     s.warmup_mu_hr,
                     s.warmup_sigma_hr,
                     s.warmup_ln_rmssd,
+                    s.pre_candidate_mu_hr,
+                    s.pre_candidate_sigma_hr,
+                    s.pre_candidate_ln_rmssd,
                     s.candidate_ts_ms,
                     s.confirmed_ts_ms,
                     s.sleeping_ts_ms,
@@ -522,6 +524,7 @@ pub(crate) fn load_session_record(
     conn.query_row(
         "SELECT id, wearable_id, start_ts_ms, end_ts_ms, end_reason, detection_sensitivity,
                 had_rr, warmup_mu_hr, warmup_sigma_hr, warmup_ln_rmssd,
+                pre_candidate_mu_hr, pre_candidate_sigma_hr, pre_candidate_ln_rmssd,
                 onset_candidate_ts_ms, onset_confirmed_ts_ms, sleeping_ts_ms,
                 sleep_mu_hr, onset_hr_bpm, delta_hr_onset, sleep_ln_rmssd,
                 sleep_hr_var_ratio, typical_sqi, post_trigger_sleep_sec,
@@ -532,7 +535,7 @@ pub(crate) fn load_session_record(
         params![session_id],
         |row| {
             let record = map_session_ledger_row(row)?;
-            let status_str: String = row.get(28)?;
+            let status_str: String = row.get(31)?;
             let status = status_str.parse().unwrap_or(SessionStatus::Closed);
             Ok((record, status))
         },
@@ -682,7 +685,7 @@ pub(crate) fn map_session_ledger_row(
 ) -> rusqlite::Result<SessionLedgerRecord> {
     let end_reason_str: Option<String> = row.get(4)?;
     let sens_str: String = row.get(5)?;
-    let power_str: String = row.get(20)?;
+    let power_str: String = row.get(23)?;
     Ok(SessionLedgerRecord {
         id: row.get(0)?,
         wearable_id: row.get(1)?,
@@ -696,24 +699,27 @@ pub(crate) fn map_session_ledger_row(
         warmup_mu_hr: row.get(7)?,
         warmup_sigma_hr: row.get(8)?,
         warmup_ln_rmssd: row.get(9)?,
-        onset_candidate_ts_ms: row.get(10)?,
-        onset_confirmed_ts_ms: row.get(11)?,
-        sleeping_ts_ms: row.get(12)?,
-        sleep_mu_hr: row.get(13)?,
-        onset_hr_bpm: row.get(14)?,
-        delta_hr_onset: row.get(15)?,
-        sleep_ln_rmssd: row.get(16)?,
-        sleep_hr_var_ratio: row.get(17)?,
-        typical_sqi: row.get(18)?,
-        post_trigger_sleep_sec: row.get(19)?,
+        pre_candidate_mu_hr: row.get(10)?,
+        pre_candidate_sigma_hr: row.get(11)?,
+        pre_candidate_ln_rmssd: row.get(12)?,
+        onset_candidate_ts_ms: row.get(13)?,
+        onset_confirmed_ts_ms: row.get(14)?,
+        sleeping_ts_ms: row.get(15)?,
+        sleep_mu_hr: row.get(16)?,
+        onset_hr_bpm: row.get(17)?,
+        delta_hr_onset: row.get(18)?,
+        sleep_ln_rmssd: row.get(19)?,
+        sleep_hr_var_ratio: row.get(20)?,
+        typical_sqi: row.get(21)?,
+        post_trigger_sleep_sec: row.get(22)?,
         trigger_power_action: power_str.parse().unwrap_or(PowerAction::None),
-        rapid_resume_within_5m: row.get::<_, i64>(21)? != 0,
-        grace_cancel_count: row.get::<_, u8>(22)?,
-        rapid_wake_fp_count: row.get::<_, u8>(23)?,
-        snooze_count: row.get::<_, u8>(24)?,
-        auto_anomalous: row.get::<_, i64>(25)? != 0,
-        epochs_count: row.get(26)?,
-        raw_samples_count: row.get(27)?,
+        rapid_resume_within_5m: row.get::<_, i64>(24)? != 0,
+        grace_cancel_count: row.get::<_, u8>(25)?,
+        rapid_wake_fp_count: row.get::<_, u8>(26)?,
+        snooze_count: row.get::<_, u8>(27)?,
+        auto_anomalous: row.get::<_, i64>(28)? != 0,
+        epochs_count: row.get(29)?,
+        raw_samples_count: row.get(30)?,
     })
 }
 

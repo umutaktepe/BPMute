@@ -35,6 +35,9 @@ fn make_clean_session(
             warmup_mu_hr: Some(warmup_mu_hr),
             warmup_sigma_hr: Some(2.4),
             warmup_ln_rmssd: Some(3.45),
+            pre_candidate_mu_hr: None,
+            pre_candidate_sigma_hr: None,
+            pre_candidate_ln_rmssd: None,
             onset_candidate_ts_ms: Some(start_ts_ms + 900_000),
             onset_confirmed_ts_ms: Some(start_ts_ms + 1_080_000),
             sleeping_ts_ms: Some(start_ts_ms + 1_110_000),
@@ -683,6 +686,9 @@ fn worked_example_eb_ewma_huber_and_low_sqi_onset_evidence() {
                 warmup_mu_hr: Some(70.0),
                 warmup_sigma_hr: Some(2.4),
                 warmup_ln_rmssd: Some(3.45),
+                pre_candidate_mu_hr: None,
+                pre_candidate_sigma_hr: None,
+                pre_candidate_ln_rmssd: None,
                 onset_candidate_ts_ms: Some(start_ts_ms + 900_000),
                 onset_confirmed_ts_ms: Some(start_ts_ms + 1_080_000),
                 sleeping_ts_ms: Some(start_ts_ms + 1_110_000),
@@ -875,4 +881,139 @@ fn worked_example_eb_ewma_huber_and_low_sqi_onset_evidence() {
     });
     assert!((missed_onset_cal.tau_p_sleep_offset - (-0.015)).abs() < 1e-12);
     assert_eq!(missed_onset_cal.dwell_adjust_sec, -15);
+}
+
+#[test]
+fn pre_candidate_baseline_prioritized_over_warmup_in_recomputation() {
+    let wearables = vec![WearableSeedMeta {
+        wearable_id: "w-1".to_string(),
+        supports_rr: true,
+        supports_contact: true,
+    }];
+    let mut sess = make_clean_session(0, "w-1", 80.0, 58.0, 0.28);
+    // warmup_mu_hr is 80.0, but pre_candidate_mu_hr is 65.0
+    sess.session.warmup_mu_hr = Some(80.0);
+    sess.session.warmup_sigma_hr = Some(3.5);
+    sess.session.pre_candidate_mu_hr = Some(65.0);
+    sess.session.pre_candidate_sigma_hr = Some(2.2);
+    sess.session.delta_hr_onset = None;
+
+    let cal = recompute_calibration(&LedgerRecomputeInput {
+        wearables: wearables.clone(),
+        sessions: vec![sess],
+        ..Default::default()
+    });
+
+    assert_eq!(cal.valid_sessions, 1);
+    let mu_wake = cal.mu_wake.expect("mu_wake must be populated");
+    assert!(
+        (mu_wake - 65.0).abs() < (mu_wake - 80.0).abs(),
+        "mu_wake ({mu_wake}) must anchor to pre_candidate_mu_hr (65.0) rather than warmup_mu_hr (80.0)"
+    );
+
+    let delta = cal
+        .delta_hr_onset
+        .expect("delta_hr_onset must be populated");
+    assert!(
+        (delta - (-7.0)).abs() < (delta - (-22.0)).abs(),
+        "delta_hr_onset ({delta}) must anchor to 58.0 - 65.0 (-7.0) rather than 58.0 - 80.0 (-22.0)"
+    );
+}
+
+#[test]
+fn legacy_session_without_pre_candidate_falls_back_to_warmup_mu_hr() {
+    let wearables = vec![WearableSeedMeta {
+        wearable_id: "w-1".to_string(),
+        supports_rr: true,
+        supports_contact: true,
+    }];
+    let mut sess = make_clean_session(0, "w-1", 70.0, 58.0, 0.28);
+    sess.session.warmup_mu_hr = Some(70.0);
+    sess.session.pre_candidate_mu_hr = None;
+    sess.session.delta_hr_onset = None;
+
+    let cal_legacy = recompute_calibration(&LedgerRecomputeInput {
+        wearables: wearables.clone(),
+        sessions: vec![sess.clone()],
+        ..Default::default()
+    });
+
+    assert_eq!(cal_legacy.valid_sessions, 1);
+    let mu_wake = cal_legacy.mu_wake.expect("mu_wake must be populated");
+    assert!((mu_wake - 70.0).abs() < 1e-12);
+
+    // Identical session where pre_candidate_mu_hr explicitly equals 70.0
+    let mut sess_with_pre = sess;
+    sess_with_pre.session.pre_candidate_mu_hr = Some(70.0);
+    let cal_with_pre = recompute_calibration(&LedgerRecomputeInput {
+        wearables,
+        sessions: vec![sess_with_pre],
+        ..Default::default()
+    });
+
+    // Exact backward compatibility: fallback to warmup_mu_hr produces identical results
+    assert_eq!(cal_legacy.mu_wake, cal_with_pre.mu_wake);
+    assert_eq!(cal_legacy.delta_hr_onset, cal_with_pre.delta_hr_onset);
+}
+
+#[test]
+fn manual_onset_evidence_prioritizes_pre_candidate_mu_hr_in_recomputation() {
+    let wearables = vec![WearableSeedMeta {
+        wearable_id: "w-1".to_string(),
+        supports_rr: true,
+        supports_contact: true,
+    }];
+    let mut sess = make_clean_session(0, "w-1", 80.0, 58.0, 0.28);
+    sess.session.warmup_mu_hr = Some(80.0);
+    sess.session.pre_candidate_mu_hr = Some(65.0);
+    let onset_ts = sess.session.start_ts_ms + 600_000;
+    sess.feedback = Some(SessionFeedbackRecord {
+        id: "fb-manual-onset".to_string(),
+        session_id: sess.session.id.clone(),
+        verdict: None,
+        manual_onset_ts_ms: Some(onset_ts),
+        manual_avg_sleep_hr: None,
+        notes: None,
+        updated_at_ms: 1_000,
+    });
+    sess.epochs = vec![Epoch {
+        session_index: 1,
+        ts_ms: onset_ts + 60_000,
+        features: bpmute::sleep_engine::EpochFeatures {
+            hr_bpm_60s: 56.0,
+            z_hr: -1.5,
+            hr_slope_4m: -0.2,
+            r_var_120s: 0.4,
+            ln_rmssd_60s: Some(3.9),
+            delta_ln_rmssd_60s: Some(0.2),
+            rmssd_sdnn_120s: Some(1.0),
+        },
+        baseline_mu_hr: 70.0,
+        baseline_sigma_hr: 2.2,
+        baseline_frozen: true,
+        coverage: 1.0,
+        hrv_valid: true,
+        rr_artifact_frac: 0.01,
+        flatline_stale: false,
+        accumulators_frozen: false,
+        p_active_wake: 0.05,
+        p_quiet_wake: 0.25,
+        p_sleep: 0.70,
+        state: bpmute::sleep_engine::DetectorState::Monitoring,
+    }];
+
+    let cal = recompute_calibration(&LedgerRecomputeInput {
+        wearables,
+        sessions: vec![sess],
+        ..Default::default()
+    });
+
+    assert_eq!(cal.valid_sessions, 1);
+    let delta = cal
+        .delta_hr_onset
+        .expect("delta_hr_onset must be populated");
+    assert!(
+        (delta - (-9.0)).abs() < (delta - (-20.0)).abs(),
+        "delta_hr_onset ({delta}) must anchor to 56.0 - 65.0 (-9.0) rather than 56.0 - 80.0 (-24.0)"
+    );
 }

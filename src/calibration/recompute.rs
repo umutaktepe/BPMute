@@ -200,10 +200,11 @@ impl WearableAccumulator {
     }
 }
 
-struct ExtractedOnsetEvidence {
-    sleep_hr: f64,
-    delta_hr: Option<f64>,
-    ln_rmssd: Option<f64>,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ExtractedOnsetEvidence {
+    pub(crate) sleep_hr: f64,
+    pub(crate) delta_hr: Option<f64>,
+    pub(crate) ln_rmssd: Option<f64>,
 }
 
 /// Incremental deterministic folder that matches scratch [`recompute_calibration`] bit-for-bit.
@@ -344,11 +345,12 @@ impl CalibrationFolder {
         }
 
         // 4. Automatic MAD anomaly quarantine activates at 5 clean sessions.
+        let wake_ref = session.wake_ref();
         if let Some((median, mad_s)) = self.current_wake_mad()
-            && let Some(warmup_mu) = session.warmup_mu_hr
-            && warmup_mu.is_finite()
+            && let Some(wake_mu) = wake_ref
+            && wake_mu.is_finite()
         {
-            let diff = warmup_mu - median;
+            let diff = wake_mu - median;
             if diff.abs() > ANOMALY_SIGMA_THRESHOLD * mad_s {
                 self.quarantined_sessions += 1;
                 let dir = if diff > 0.0 {
@@ -356,7 +358,7 @@ impl CalibrationFolder {
                 } else {
                     ShiftDirection::Lower
                 };
-                self.record_shift_streak(session, dir, warmup_mu);
+                self.record_shift_streak(session, dir, wake_mu);
                 return;
             }
         }
@@ -387,8 +389,14 @@ impl CalibrationFolder {
             .and_then(|fb| fb.manual_avg_sleep_hr)
             .filter(|v| v.is_finite());
         let manual_onset_ts_ms = feedback.and_then(|fb| fb.manual_onset_ts_ms);
-        let onset_evidence = manual_onset_ts_ms
-            .and_then(|ts| extract_onset_evidence(ts, session.warmup_mu_hr, &input.epochs));
+        let onset_evidence = manual_onset_ts_ms.and_then(|ts| {
+            extract_onset_evidence(
+                ts,
+                session.pre_candidate_mu_hr,
+                session.warmup_mu_hr,
+                &input.epochs,
+            )
+        });
 
         if let Some(onset_ts) = manual_onset_ts_ms {
             apply_manual_onset_threshold_nudge(
@@ -433,7 +441,7 @@ impl CalibrationFolder {
 
         let delta_hr_obs = if let Some(ref ev) = onset_evidence {
             ev.delta_hr.map(|d| (d, WEIGHT_MANUAL_ONSET))
-        } else if let (Some(avg_hr), Some(wake_hr)) = (manual_avg_sleep_hr, session.warmup_mu_hr) {
+        } else if let (Some(avg_hr), Some(wake_hr)) = (manual_avg_sleep_hr, wake_ref) {
             Some((
                 (avg_hr + NADIR_OFFSET_BPM) - wake_hr,
                 WEIGHT_MANUAL_AVG_SLEEP_HR,
@@ -467,12 +475,13 @@ impl CalibrationFolder {
             .map(|(_, s)| s)
             .unwrap_or(SIGMA_MIN_BPM);
         let huber_hr_delta = HUBER_DELTA_MULT * scale_s;
+        let wake_sigma_ref = session.pre_candidate_sigma_hr.or(session.warmup_sigma_hr);
 
         if use_ewma {
-            if let Some(w_hr) = session.warmup_mu_hr.filter(|v| v.is_finite()) {
+            if let Some(w_hr) = wake_ref.filter(|v| v.is_finite()) {
                 self.mu_wake.update_ewma(w_hr, wake_weight, huber_hr_delta);
             }
-            if let Some(s_hr) = session.warmup_sigma_hr.filter(|v| v.is_finite()) {
+            if let Some(s_hr) = wake_sigma_ref.filter(|v| v.is_finite()) {
                 self.sigma_wake.update_ewma(s_hr, wake_weight, 3.0);
             }
             if let Some((s_mu, w)) = sleep_mu_obs {
@@ -485,10 +494,10 @@ impl CalibrationFolder {
                 self.mu_ln_rmssd_sleep.update_ewma(r_val, w, 0.70);
             }
         } else {
-            if let Some(w_hr) = session.warmup_mu_hr.filter(|v| v.is_finite()) {
+            if let Some(w_hr) = wake_ref.filter(|v| v.is_finite()) {
                 self.mu_wake.update_eb(w_hr, wake_weight, w_hr);
             }
-            if let Some(s_hr) = session.warmup_sigma_hr.filter(|v| v.is_finite()) {
+            if let Some(s_hr) = wake_sigma_ref.filter(|v| v.is_finite()) {
                 self.sigma_wake.update_eb(s_hr, wake_weight, s_hr);
             }
             if let Some((s_mu, w)) = sleep_mu_obs {
@@ -507,7 +516,7 @@ impl CalibrationFolder {
             }
         }
 
-        if let Some(w_hr) = session.warmup_mu_hr.filter(|v| v.is_finite()) {
+        if let Some(w_hr) = wake_ref.filter(|v| v.is_finite()) {
             if self.clean_wake_hrs.len() == MAD_ROLLING_WINDOW {
                 self.clean_wake_hrs.pop_front();
             }
@@ -684,20 +693,12 @@ fn select_latest_active_boundary(
 }
 
 fn resolve_implicit_delta_hr(session: &SessionLedgerRecord) -> Option<f64> {
-    session
-        .delta_hr_onset
-        .filter(|v| v.is_finite())
-        .or_else(|| {
-            session
-                .sleep_mu_hr
-                .or(session.onset_hr_bpm)
-                .zip(session.warmup_mu_hr)
-                .map(|(sleep_or_onset, wake)| sleep_or_onset - wake)
-        })
+    session.resolve_delta_hr()
 }
 
-fn extract_onset_evidence(
+pub(crate) fn extract_onset_evidence(
     onset_ts_ms: i64,
+    pre_candidate_mu_hr: Option<f64>,
     warmup_mu_hr: Option<f64>,
     epochs: &[Epoch],
 ) -> Option<ExtractedOnsetEvidence> {
@@ -732,7 +733,7 @@ fn extract_onset_evidence(
         .collect();
     let sleep_hr = quantile(&hrs, 0.5)?;
 
-    let wake_ref = warmup_mu_hr.or_else(|| {
+    let wake_ref = pre_candidate_mu_hr.or(warmup_mu_hr).or_else(|| {
         let pre_baselines: Vec<f64> = epochs
             .iter()
             .filter(|ep| ep.ts_ms <= onset_ts_ms)
@@ -785,5 +786,43 @@ mod tests {
         ] {
             assert_eq!(r.as_str().parse::<BoundaryReason>().unwrap(), r);
         }
+    }
+
+    #[test]
+    fn extract_onset_evidence_prioritizes_pre_candidate_mu_hr() {
+        use crate::sleep_engine::{DetectorState, Epoch, EpochFeatures};
+
+        let onset_ts = 1_000_000;
+        let ep = Epoch {
+            session_index: 1,
+            ts_ms: onset_ts + 60_000,
+            features: EpochFeatures {
+                hr_bpm_60s: 56.0,
+                z_hr: -1.5,
+                hr_slope_4m: -0.2,
+                r_var_120s: 0.4,
+                ln_rmssd_60s: Some(3.9),
+                delta_ln_rmssd_60s: Some(0.2),
+                rmssd_sdnn_120s: Some(1.0),
+            },
+            baseline_mu_hr: 70.0,
+            baseline_sigma_hr: 2.2,
+            baseline_frozen: true,
+            coverage: 1.0,
+            hrv_valid: true,
+            rr_artifact_frac: 0.01,
+            flatline_stale: false,
+            accumulators_frozen: false,
+            p_active_wake: 0.05,
+            p_quiet_wake: 0.25,
+            p_sleep: 0.70,
+            state: DetectorState::Monitoring,
+        };
+
+        let evidence = super::extract_onset_evidence(onset_ts, Some(64.0), Some(80.0), &[ep])
+            .expect("evidence must be extracted");
+
+        assert_eq!(evidence.sleep_hr, 56.0);
+        assert_eq!(evidence.delta_hr, Some(-8.0));
     }
 }

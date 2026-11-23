@@ -131,6 +131,18 @@ pub fn initialize_rw_connection(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wearables_mac_type ON wearables(mac, address_type);",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN pre_candidate_mu_hr REAL;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN pre_candidate_sigma_hr REAL;",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE sessions ADD COLUMN pre_candidate_ln_rmssd REAL;",
+            [],
+        );
     } else {
         return Err(StorageError::Validation(format!(
             "unsupported SQLite ledger schema version {user_version}; expected {CURRENT_DB_SCHEMA_VERSION}"
@@ -183,6 +195,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     warmup_mu_hr REAL,
     warmup_sigma_hr REAL,
     warmup_ln_rmssd REAL,
+    pre_candidate_mu_hr REAL,
+    pre_candidate_sigma_hr REAL,
+    pre_candidate_ln_rmssd REAL,
     onset_candidate_ts_ms INTEGER,
     onset_confirmed_ts_ms INTEGER,
     sleeping_ts_ms INTEGER,

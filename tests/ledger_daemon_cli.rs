@@ -72,6 +72,9 @@ fn sample_summary(start_ts_ms: i64, end_ts_ms: i64, sleep_mu_hr: f64) -> Session
         warmup_mu_hr: Some(66.0),
         warmup_sigma_hr: Some(2.3),
         warmup_ln_rmssd: Some(3.45),
+        pre_candidate_mu_hr: None,
+        pre_candidate_sigma_hr: None,
+        pre_candidate_ln_rmssd: None,
         onset_hr_bpm: Some(sleep_mu_hr + 0.5),
         sleep_mu_hr: Some(sleep_mu_hr),
         sleep_ln_rmssd: Some(3.7),
@@ -1517,4 +1520,237 @@ async fn live_daemon_hard_wipe_aborts_active_session_and_resets_engine() {
 
     drop(wearable_tx);
     daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn pre_candidate_persistence_and_schema_hydration() {
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("data/bpmute");
+    let db_path = db_path_in_data_dir(&data_dir);
+    let lock_path = lock_path_in_data_dir(&data_dir);
+
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let wid = store
+        .upsert_wearable(
+            &WearableDescriptor {
+                mac: "AA:BB:CC:DD:EE:FF".to_string(),
+                alias: Some("TestRing".to_string()),
+                advertised_name: Some("Ring".to_string()),
+                supports_rr: true,
+                supports_contact: true,
+                address_type: "public".to_string(),
+            },
+            1_000_000,
+        )
+        .unwrap();
+
+    let sid = store
+        .open_session(&OpenSessionRequest {
+            wearable_id: wid.clone(),
+            start_ts_ms: 2_000_000,
+            detection_sensitivity: Sensitivity::Balanced,
+        })
+        .unwrap();
+
+    let mut summary = sample_summary(2_000_000, 3_000_000, 56.0);
+    summary.pre_candidate_mu_hr = Some(67.5);
+    summary.pre_candidate_sigma_hr = Some(2.1);
+    summary.pre_candidate_ln_rmssd = Some(3.8);
+
+    store
+        .close_session_and_recompute(
+            &CloseSessionRequest {
+                session_id: sid.clone(),
+                summary,
+                trigger_power_action: PowerAction::None,
+                rapid_resume_within_5m: false,
+            },
+            3_000_000,
+        )
+        .unwrap();
+
+    let detail = store.get_session(&sid).unwrap();
+    assert_eq!(detail.session.pre_candidate_mu_hr, Some(67.5));
+    assert_eq!(detail.session.pre_candidate_sigma_hr, Some(2.1));
+    assert_eq!(detail.session.pre_candidate_ln_rmssd, Some(3.8));
+
+    // Export bundle and verify JSON
+    let export_path = temp.path().join("export.json");
+    store
+        .export_bundle(
+            &export_path,
+            bpmute::storage::ExportBundleOptions {
+                include_raw: false,
+                include_epochs: false,
+                include_wearables: true,
+            },
+            3_000_000,
+        )
+        .unwrap();
+
+    let exported_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&export_path).unwrap()).unwrap();
+    let s_obj = &exported_json["sessions"][0];
+    assert_eq!(s_obj["pre_candidate_mu_hr"], 67.5);
+    assert_eq!(s_obj["pre_candidate_sigma_hr"], 2.1);
+    assert_eq!(s_obj["pre_candidate_ln_rmssd"], 3.8);
+
+    // Import into fresh store
+    let temp2 = TempDir::new().unwrap();
+    let db2 = db_path_in_data_dir(temp2.path());
+    let lock2 = lock_path_in_data_dir(temp2.path());
+    let mut store2 = LedgerStore::open_read_write(&db2, &lock2).unwrap();
+    store2
+        .import_bundle(
+            &export_path,
+            bpmute::storage::ImportMode::Replace,
+            false,
+            3_500_000,
+        )
+        .unwrap();
+
+    let detail2 = store2.get_session(&sid).unwrap();
+    assert_eq!(detail2.session.pre_candidate_mu_hr, Some(67.5));
+    assert_eq!(detail2.session.pre_candidate_sigma_hr, Some(2.1));
+    assert_eq!(detail2.session.pre_candidate_ln_rmssd, Some(3.8));
+}
+
+#[tokio::test]
+async fn legacy_db_without_pre_candidate_columns_migrates_cleanly() {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("legacy.db");
+    let lock_path = temp.path().join("legacy.lock");
+
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 1;
+             CREATE TABLE wearables (
+                 id TEXT PRIMARY KEY,
+                 mac TEXT NOT NULL,
+                 address_type TEXT NOT NULL DEFAULT 'public',
+                 alias TEXT,
+                 advertised_name TEXT,
+                 supports_rr INTEGER NOT NULL DEFAULT 0,
+                 supports_contact INTEGER NOT NULL DEFAULT 0,
+                 hr_var_floor REAL NOT NULL DEFAULT 0.25,
+                 typical_sqi REAL,
+                 enrolled_at_ms INTEGER NOT NULL,
+                 last_seen_at_ms INTEGER NOT NULL,
+                 active INTEGER NOT NULL DEFAULT 1,
+                 UNIQUE (mac, address_type)
+             );
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY,
+                 wearable_id TEXT NOT NULL REFERENCES wearables(id),
+                 status TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+                 start_ts_ms INTEGER NOT NULL,
+                 end_ts_ms INTEGER NOT NULL,
+                 end_reason TEXT,
+                 detection_sensitivity TEXT NOT NULL,
+                 had_rr INTEGER NOT NULL DEFAULT 0,
+                 warmup_mu_hr REAL,
+                 warmup_sigma_hr REAL,
+                 warmup_ln_rmssd REAL,
+                 onset_candidate_ts_ms INTEGER,
+                 onset_confirmed_ts_ms INTEGER,
+                 sleeping_ts_ms INTEGER,
+                 sleep_mu_hr REAL,
+                 onset_hr_bpm REAL,
+                 delta_hr_onset REAL,
+                 sleep_ln_rmssd REAL,
+                 sleep_hr_var_ratio REAL,
+                 typical_sqi REAL,
+                 post_trigger_sleep_sec INTEGER NOT NULL DEFAULT 0,
+                 trigger_power_action TEXT NOT NULL DEFAULT 'none',
+                 rapid_resume_within_5m INTEGER NOT NULL DEFAULT 0,
+                 grace_cancel_count INTEGER NOT NULL DEFAULT 0,
+                 rapid_wake_fp_count INTEGER NOT NULL DEFAULT 0,
+                 snooze_count INTEGER NOT NULL DEFAULT 0,
+                 auto_anomalous INTEGER NOT NULL DEFAULT 0,
+                 epochs_count INTEGER NOT NULL DEFAULT 0,
+                 raw_samples_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE session_feedback (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+                 verdict TEXT,
+                 manual_onset_ts_ms INTEGER,
+                 manual_avg_sleep_hr REAL,
+                 notes TEXT,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE session_epochs (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 hr_bpm_60s REAL NOT NULL,
+                 z_hr REAL NOT NULL,
+                 hr_slope_4m REAL NOT NULL,
+                 r_var_120s REAL NOT NULL,
+                 ln_rmssd_60s REAL,
+                 delta_ln_rmssd_60s REAL,
+                 rmssd_sdnn_120s REAL,
+                 hrv_valid INTEGER NOT NULL,
+                 rr_artifact_frac REAL NOT NULL,
+                 coverage REAL NOT NULL,
+                 flatline_stale INTEGER NOT NULL,
+                 accumulators_frozen INTEGER NOT NULL,
+                 baseline_mu_hr REAL NOT NULL,
+                 baseline_sigma_hr REAL NOT NULL,
+                 baseline_frozen INTEGER NOT NULL,
+                 p_active_wake REAL NOT NULL,
+                 p_quiet_wake REAL NOT NULL,
+                 p_sleep REAL NOT NULL,
+                 state TEXT NOT NULL,
+                 UNIQUE(session_id, seq)
+             );
+             CREATE TABLE raw_samples (
+                 id TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 seq INTEGER NOT NULL,
+                 ts_ms INTEGER NOT NULL,
+                 bpm REAL NOT NULL,
+                 rr_ms_json TEXT NOT NULL,
+                 contact_status TEXT NOT NULL,
+                 UNIQUE(session_id, seq)
+             );
+             CREATE TABLE calibration_boundaries (
+                 id TEXT PRIMARY KEY,
+                 effective_ts_ms INTEGER NOT NULL,
+                 reason TEXT NOT NULL,
+                 seed_sleep_hr REAL,
+                 reset_floors INTEGER NOT NULL DEFAULT 0,
+                 created_at_ms INTEGER NOT NULL,
+                 reverted_at_ms INTEGER
+             );
+             CREATE TABLE calibration_meta (
+                 singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                 day1_seed_sleep_hr REAL,
+                 day1_seed_updated_at_ms INTEGER,
+                 dismissed_shift_anchor_ts_ms INTEGER,
+                 dismissed_shift_direction TEXT
+             );
+             CREATE TABLE calibration_state (
+                 singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                 algorithm_version INTEGER NOT NULL,
+                 computed_at_ms INTEGER NOT NULL,
+                 state_json TEXT NOT NULL
+             );
+             INSERT INTO wearables (id, mac, address_type, enrolled_at_ms, last_seen_at_ms)
+             VALUES ('w1', '11:22:33:44:55:66', 'public', 1000, 1000);
+             INSERT INTO sessions (id, wearable_id, status, start_ts_ms, end_ts_ms, detection_sensitivity, warmup_mu_hr)
+             VALUES ('s1', 'w1', 'closed', 1000, 2000, 'balanced', 65.0);
+            ",
+        )
+        .unwrap();
+    }
+
+    let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let detail = store.get_session("s1").unwrap();
+    assert_eq!(detail.session.warmup_mu_hr, Some(65.0));
+    assert_eq!(detail.session.pre_candidate_mu_hr, None);
+    assert_eq!(detail.session.pre_candidate_sigma_hr, None);
+    assert_eq!(detail.session.pre_candidate_ln_rmssd, None);
 }
