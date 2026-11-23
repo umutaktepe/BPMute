@@ -7,7 +7,7 @@ use super::super::app::{Tab, TuiApp};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::super::sparkline::HrSparklineWidget;
 use super::{build_clickable_row_line, centered_rect, format_wearable_battery};
-use crate::ipc::protocol::alert_ids;
+use crate::ipc::protocol::{MonitoringState, alert_ids};
 
 pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
     if area.height < 5 || area.width < 10 {
@@ -53,9 +53,9 @@ pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_m
         let card_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(23),
-                Constraint::Length(23),
-                Constraint::Min(34),
+                Constraint::Length(22),
+                Constraint::Length(28),
+                Constraint::Min(30),
             ])
             .split(top_cards_area);
 
@@ -65,7 +65,7 @@ pub(crate) fn render_dashboard(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_m
     } else if top_cards_area.width >= 50 {
         let card_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .constraints([Constraint::Length(22), Constraint::Min(28)])
             .split(top_cards_area);
 
         render_live_bpm_card(app, card_chunks[0], buf);
@@ -191,7 +191,18 @@ fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let p_sleep = app.latest_p_sleep.unwrap_or(0.0).clamp(0.0, 1.0);
     let p_pct = (p_sleep * 100.0).round() as u16;
 
-    let line1 = if let Some(rem_sec) = app.session_close_remaining_sec() {
+    let line1 = if app.monitoring_state == MonitoringState::Standby {
+        let arm_time = active_hours_config(app)
+            .map(|ah| ah.start.to_string())
+            .unwrap_or_else(|| crate::config::ScheduleConfig::default().start.to_string());
+        let badge = format!("[STANDBY - Arms at {arm_time}]");
+        let display_badge = if inner.width > badge.len() as u16 {
+            format!(" {badge}")
+        } else {
+            badge
+        };
+        Line::from(vec![Span::styled(display_badge, app.theme.accent())])
+    } else if let Some(rem_sec) = app.session_close_remaining_sec() {
         let formatted = crate::tui::format_close_countdown(rem_sec);
         Line::from(vec![Span::styled(
             format!(" Closing in {formatted}"),

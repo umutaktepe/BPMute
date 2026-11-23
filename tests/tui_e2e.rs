@@ -4298,3 +4298,229 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     let _ = ticker_task.await;
     daemon.shutdown().await;
 }
+
+#[test]
+fn test_dashboard_standby_badge_live_telemetry_rendering() {
+    use bpmute::config::{ClockTime, ScheduleConfig};
+    use bpmute::ipc::protocol::HrSampleEvent;
+    use bpmute::sleep_engine::ContactStatus;
+
+    let schedule = ScheduleConfig {
+        active_hours_enabled: true,
+        start: ClockTime::new(23, 0).unwrap(),
+        end: ClockTime::new(8, 0).unwrap(),
+    };
+
+    let build_test_app = |no_color: bool, ascii: bool| {
+        let mut app = TuiApp::new(false, no_color, ascii);
+        app.daemon_connected = true;
+        app.daemon_status = Some(make_daemon_status(schedule.clone()));
+        app.monitoring_state = MonitoringState::Standby;
+        app.latest_bpm = Some(68.0);
+        app.contact_ok = true;
+        app.sparkline_data.quiet_wake_baseline = Some(72.0);
+        app.sparkline_data.sleeping_hr = Some(58.0);
+        app.enrolled_wearables = vec![make_wearable(
+            "w-1",
+            "AA:BB:CC:11:22:33",
+            Some("Polar H10"),
+            StreamStatus::Streaming,
+            Some(85),
+            Some("Chest"),
+        )];
+        app.sparkline_data.push_sample(HrSampleEvent {
+            bpm: 68.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+            wearable_id: "w-1".into(),
+            session_id: None,
+            ts_ms: 1_700_000_000_000,
+        });
+        app
+    };
+
+    // 1. Standard mode (80x24 baseline and 60x18 compact)
+    let mut app = build_test_app(false, false);
+    for (w, h) in [(80, 24), (60, 18)] {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let out = buffer_to_string(&buf);
+
+        assert!(
+            find_text_coords(&buf, "State: Standby").is_some(),
+            "expected State: Standby at {w}x{h} in:\n{out}"
+        );
+        assert!(
+            find_text_coords(&buf, "[STANDBY - Arms at 23:00]").is_some(),
+            "expected Standby badge at {w}x{h} in:\n{out}"
+        );
+        assert!(
+            find_text_coords(&buf, "68 BPM").is_some(),
+            "expected live BPM at {w}x{h} in:\n{out}"
+        );
+        if w >= 80 {
+            assert!(
+                find_text_coords(&buf, "(85%)").is_some(),
+                "expected battery at {w}x{h} in:\n{out}"
+            );
+        }
+    }
+
+    // 2. ASCII and NO_COLOR mode across both 80x24 and 60x18
+    let mut app_ascii = build_test_app(true, true);
+    for (w, h) in [(80, 24), (60, 18)] {
+        let mut terminal_ascii = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal_ascii
+            .draw(|f| app_ascii.render(f.area(), f.buffer_mut()))
+            .unwrap();
+        let buf_ascii = terminal_ascii.backend().buffer().clone();
+        let out_ascii = buffer_to_string(&buf_ascii);
+
+        assert!(
+            out_ascii.is_ascii(),
+            "must be strictly ASCII at {w}x{h} in:\n{out_ascii}"
+        );
+        assert!(
+            find_text_coords(&buf_ascii, "State: Standby").is_some(),
+            "expected State: Standby at {w}x{h} in:\n{out_ascii}"
+        );
+        assert!(
+            find_text_coords(&buf_ascii, "[STANDBY - Arms at 23:00]").is_some(),
+            "expected Standby badge at {w}x{h} in:\n{out_ascii}"
+        );
+        assert!(
+            find_text_coords(&buf_ascii, "68 BPM").is_some(),
+            "expected live BPM at {w}x{h} in:\n{out_ascii}"
+        );
+        if w >= 80 {
+            assert!(
+                find_text_coords(&buf_ascii, "(85%)").is_some(),
+                "expected battery at {w}x{h} in:\n{out_ascii}"
+            );
+        }
+
+        // NO_COLOR check: every cell Color::Reset
+        for y in 0..buf_ascii.area.height {
+            for x in 0..buf_ascii.area.width {
+                let cell = &buf_ascii[(x, y)];
+                assert_eq!(cell.fg, Color::Reset);
+                assert_eq!(cell.bg, Color::Reset);
+            }
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_tui_bridge_standby_and_live_telemetry_e2e() {
+    use bpmute::daemon::WearableEvent;
+    use bpmute::sleep_engine::{ContactStatus, HrPacket, StreamState};
+    use bpmute::storage::WearableDescriptor;
+    use chrono::{Local, TimeZone};
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+
+    // 14:00 Local time is outside active hours [23:00, 08:00)
+    let local_14h = Local.with_ymd_and_hms(2026, 11, 19, 14, 0, 0).unwrap();
+    let start_utc = local_14h.with_timezone(&Utc);
+    let t0 = start_utc.timestamp_millis();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = bpmute::config::ClockTime::new(23, 0).unwrap();
+    loaded.config.schedule.end = bpmute::config::ClockTime::new(8, 0).unwrap();
+
+    let (source, w_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:77".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Standby Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), t0)
+        .await
+        .unwrap();
+
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+
+    // Connect wearable outside active hours -> transitions to Standby
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0,
+        },
+    })
+    .await
+    .unwrap();
+
+    // Stream telemetry HrPacket (65 BPM)
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t0 + 1_000,
+            bpm: 65.0,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.monitoring_state == MonitoringState::Standby
+            && a.latest_bpm == Some(65.0)
+            && !a.sparkline_data.samples.is_empty()
+    })
+    .await;
+
+    // Verify rendering in 80x24 baseline
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let out = buffer_to_string(&buf);
+
+    assert!(
+        find_text_coords(&buf, "State: Standby").is_some(),
+        "expected State: Standby in:\n{out}"
+    );
+    assert!(
+        find_text_coords(&buf, "[STANDBY - Arms at 23:00]").is_some(),
+        "expected Standby badge in:\n{out}"
+    );
+    assert!(
+        find_text_coords(&buf, "65 BPM").is_some(),
+        "expected 65 BPM in:\n{out}"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
+}

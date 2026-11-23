@@ -768,3 +768,110 @@ async fn test_sessions_end_cli_gap_gated_and_preconditions() {
 
     daemon.shutdown().await;
 }
+
+fn make_cli_test_env(temp: &TempDir) -> (ResolvedPaths, MapEnv) {
+    let env = MapEnv::new()
+        .with(
+            "XDG_CONFIG_HOME",
+            temp.path().join("cfg").display().to_string(),
+        )
+        .with(
+            "XDG_DATA_HOME",
+            temp.path().join("data").display().to_string(),
+        )
+        .with(
+            "XDG_RUNTIME_DIR",
+            temp.path().join("run").display().to_string(),
+        );
+    let paths = ResolvedPaths::resolve(None, None, None, &env).unwrap();
+    (paths, env)
+}
+
+#[tokio::test(start_paused = true)]
+async fn status_cli_displays_standby_state_arming_time_and_json_state() {
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_cli_test_env(&temp);
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = bpmute::config::ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = bpmute::config::ClockTime::new(8, 0).unwrap();
+
+    // 14:00 Local time is outside active hours [22:00, 08:00)
+    let local_14h = Local.with_ymd_and_hms(2026, 11, 19, 14, 0, 0).unwrap();
+    let start_utc = local_14h.with_timezone(&Utc);
+    let t0 = start_utc.timestamp_millis();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (source, wearable_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env.clone()), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let wearable = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:99".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Standby Watch".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", serde_json::json!({}))
+        .await
+        .unwrap();
+    let _snap = sub.next_event().await.unwrap();
+
+    // Connect wearable outside active hours -> enters Standby
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: t0,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    let state_ev = sub
+        .next_matching_event("StateChanged", 5)
+        .await
+        .unwrap()
+        .expect("StateChanged event must be published");
+    assert_eq!(state_ev.data["monitoring_state"], "Standby");
+
+    // Human-readable status displays Standby and Active Hours arming time
+    let (code, text_standby, err) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(
+        text_standby.contains("state: Standby"),
+        "got: {text_standby}"
+    );
+    assert!(
+        text_standby.contains("active_hours_arms_at: 22:00"),
+        "expected active hours arming time in status output:\n{text_standby}"
+    );
+
+    // Human-readable status under NO_COLOR
+    let env_nc = env.clone().with("NO_COLOR", "1");
+    let (code_nc, text_nc, err_nc) = run_inproc_cli(&["bpmute", "status"], &env_nc).await;
+    assert_eq!(code_nc, ExitCode::Success, "stderr: {err_nc}");
+    assert!(text_nc.contains("state: Standby"));
+    assert!(text_nc.contains("active_hours_arms_at: 22:00"));
+
+    // JSON status outputs both "state": "Standby" and "monitoring_state": "Standby"
+    let (code, json_standby, err) = run_inproc_cli(&["bpmute", "status", "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let parsed: Value = serde_json::from_str(json_standby.trim()).unwrap();
+    assert_eq!(parsed["state"], "Standby");
+    assert_eq!(parsed["monitoring_state"], "Standby");
+
+    daemon.shutdown().await;
+}

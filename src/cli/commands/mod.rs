@@ -11,7 +11,7 @@ use crate::bluetooth::BluezWearableSource;
 use crate::config::{CliOverrides, LoadedConfig, Sensitivity, init_config_file};
 use crate::daemon::{DaemonError, DaemonHandle, DaemonOptions, SystemClock};
 use crate::exit_code::ExitCode;
-use crate::ipc::protocol::{ConfigSnapshotPayload, PauseMode, PauseParams};
+use crate::ipc::protocol::{ConfigSnapshotPayload, MonitoringState, PauseMode, PauseParams};
 use crate::ipc::{DaemonStatus, IpcClient, IpcClientError, OfflineStatus, SnapshotEvent};
 use crate::logging::init_logging;
 use crate::paths::{EnvSource, ResolvedPaths, resolve_config_file, split_shell_words};
@@ -239,8 +239,13 @@ async fn run_status<WOut: Write, WErr: Write>(
     };
 
     match client.request("daemon.status", json!({})).await {
-        Ok(data) => {
+        Ok(mut data) => {
             if as_json {
+                if let Some(map) = data.as_object_mut()
+                    && let Some(ms) = map.get("monitoring_state").cloned()
+                {
+                    map.insert("state".to_string(), ms);
+                }
                 let _ = serde_json::to_writer(&mut *stdout, &data);
                 let _ = writeln!(stdout);
             } else if let Ok(status) = serde_json::from_value::<DaemonStatus>(data.clone()) {
@@ -253,6 +258,9 @@ async fn run_status<WOut: Write, WErr: Write>(
                     status.paused,
                     status.dry_run
                 );
+                if status.monitoring_state == MonitoringState::Standby {
+                    let _ = writeln!(stdout, "active_hours_arms_at: {}", status.schedule.start);
+                }
                 if let Some(until) = status.paused_until {
                     let _ = writeln!(stdout, "paused_until: {until}");
                 }
