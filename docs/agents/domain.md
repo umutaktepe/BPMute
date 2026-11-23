@@ -19,6 +19,7 @@ How the engineering skills should consume this repo's domain documentation when 
   - `0011-grace-period-activity-hold-window.md`
   - `0012-disconnect-session-closure-and-manual-end.md`
   - `0013-state-gated-active-hours-passive-standby-and-pre-candidate-baseline.md`
+  To locate an ADR by numeric reference (e.g., `ADR-0013`), match against the index list above or use wildcard pattern `docs/adr/0013-*.md` rather than guessing the descriptive slug.
 - **`docs/research/`**: read only when exact numeric constants, protocol details, or empirical justification are needed:
   - `ble-hrs-bluez-dbus.md`
   - `linux-daemon-actions-stack.md`

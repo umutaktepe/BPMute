@@ -665,3 +665,22 @@ pub fn render_dashboard_braille_cols(
         .collect();
     (cols, start_col, chart_right, buffer_to_string(buf))
 }
+
+/// Canonical TUI test viewport dimensions: standard 80x24 baseline and compact 60x18 boundary.
+pub const CANONICAL_VIEWPORTS: [(u16, u16); 2] = [(80, 24), (60, 18)];
+
+/// Renders `app` sequentially across both canonical viewports (`80x24` baseline and `60x18` compact),
+/// executing `check` with the resulting buffer and viewport dimensions.
+pub fn render_canonical_viewports<F>(app: &mut TuiApp, mut check: F)
+where
+    F: FnMut(&Buffer, u16, u16),
+{
+    for (w, h) in CANONICAL_VIEWPORTS {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("test backend");
+        terminal
+            .draw(|f| app.render(f.area(), f.buffer_mut()))
+            .expect("render");
+        let buf = terminal.backend().buffer().clone();
+        check(&buf, w, h);
+    }
+}

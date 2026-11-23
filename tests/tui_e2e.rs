@@ -4341,63 +4341,51 @@ fn test_dashboard_standby_badge_live_telemetry_rendering() {
 
     // 1. Standard mode (80x24 baseline and 60x18 compact)
     let mut app = build_test_app(false, false);
-    for (w, h) in [(80, 24), (60, 18)] {
-        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal
-            .draw(|f| app.render(f.area(), f.buffer_mut()))
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let out = buffer_to_string(&buf);
-
+    render_canonical_viewports(&mut app, |buf, w, h| {
+        let out = buffer_to_string(buf);
         assert!(
-            find_text_coords(&buf, "State: Standby").is_some(),
+            find_text_coords(buf, "State: Standby").is_some(),
             "expected State: Standby at {w}x{h} in:\n{out}"
         );
         assert!(
-            find_text_coords(&buf, "[STANDBY - Arms at 23:00]").is_some(),
+            find_text_coords(buf, "[STANDBY - Arms at 23:00]").is_some(),
             "expected Standby badge at {w}x{h} in:\n{out}"
         );
         assert!(
-            find_text_coords(&buf, "68 BPM").is_some(),
+            find_text_coords(buf, "68 BPM").is_some(),
             "expected live BPM at {w}x{h} in:\n{out}"
         );
         if w >= 80 {
             assert!(
-                find_text_coords(&buf, "(85%)").is_some(),
+                find_text_coords(buf, "(85%)").is_some(),
                 "expected battery at {w}x{h} in:\n{out}"
             );
         }
-    }
+    });
 
     // 2. ASCII and NO_COLOR mode across both 80x24 and 60x18
     let mut app_ascii = build_test_app(true, true);
-    for (w, h) in [(80, 24), (60, 18)] {
-        let mut terminal_ascii = Terminal::new(TestBackend::new(w, h)).unwrap();
-        terminal_ascii
-            .draw(|f| app_ascii.render(f.area(), f.buffer_mut()))
-            .unwrap();
-        let buf_ascii = terminal_ascii.backend().buffer().clone();
-        let out_ascii = buffer_to_string(&buf_ascii);
-
+    render_canonical_viewports(&mut app_ascii, |buf_ascii, w, h| {
+        let out_ascii = buffer_to_string(buf_ascii);
         assert!(
             out_ascii.is_ascii(),
             "must be strictly ASCII at {w}x{h} in:\n{out_ascii}"
         );
         assert!(
-            find_text_coords(&buf_ascii, "State: Standby").is_some(),
+            find_text_coords(buf_ascii, "State: Standby").is_some(),
             "expected State: Standby at {w}x{h} in:\n{out_ascii}"
         );
         assert!(
-            find_text_coords(&buf_ascii, "[STANDBY - Arms at 23:00]").is_some(),
+            find_text_coords(buf_ascii, "[STANDBY - Arms at 23:00]").is_some(),
             "expected Standby badge at {w}x{h} in:\n{out_ascii}"
         );
         assert!(
-            find_text_coords(&buf_ascii, "68 BPM").is_some(),
+            find_text_coords(buf_ascii, "68 BPM").is_some(),
             "expected live BPM at {w}x{h} in:\n{out_ascii}"
         );
         if w >= 80 {
             assert!(
-                find_text_coords(&buf_ascii, "(85%)").is_some(),
+                find_text_coords(buf_ascii, "(85%)").is_some(),
                 "expected battery at {w}x{h} in:\n{out_ascii}"
             );
         }
@@ -4410,7 +4398,7 @@ fn test_dashboard_standby_badge_live_telemetry_rendering() {
                 assert_eq!(cell.bg, Color::Reset);
             }
         }
-    }
+    });
 }
 
 #[tokio::test(start_paused = true)]
