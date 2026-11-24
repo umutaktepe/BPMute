@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -402,8 +404,6 @@ async fn test_grace_period_early_exit_emits_zero_tick_and_respects_user_dismiss(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_desktop_notifier_keeps_persistent_dbus_connection_and_resident_hints() {
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
     use std::sync::Mutex;
 
     use bpmute::actions::DesktopNotifier;
@@ -412,14 +412,6 @@ async fn test_desktop_notifier_keeps_persistent_dbus_connection_and_resident_hin
     use zbus::interface;
     use zbus::object_server::SignalContext;
     use zbus::zvariant::OwnedValue;
-
-    struct ChildGuard(Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
 
     #[derive(Clone, Default)]
     struct RecordedNotify {
@@ -492,27 +484,7 @@ async fn test_desktop_notifier_keeps_persistent_dbus_connection_and_resident_hin
     }
 
     let temp = TempDir::new().unwrap();
-    let bus_sock = temp.path().join("session-bus.sock");
-    let listen_addr = format!("unix:path={}", bus_sock.display());
-    let mut child = Command::new("dbus-daemon")
-        .args([
-            "--session",
-            "--nopidfile",
-            "--nosyslog",
-            "--nofork",
-            "--print-address=1",
-            "--address",
-            &listen_addr,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("dbus-daemon must spawn");
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let mut bus_addr = String::new();
-    reader.read_line(&mut bus_addr).unwrap();
-    let bus_addr = bus_addr.trim().to_string();
-    let _dbus_guard = ChildGuard(child);
+    let (_dbus_guard, bus_addr) = common::dbus::spawn_private_session_dbus(&temp);
 
     let state = Arc::new(Mutex::new(MockNotificationsState::default()));
     let server_conn = zbus::connection::Builder::address(bus_addr.as_str())

@@ -1,4 +1,5 @@
 pub mod daemon;
+pub mod dbus;
 pub mod synthetic;
 pub mod tui;
 

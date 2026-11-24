@@ -130,8 +130,8 @@ pub trait ActionExecutor: Send + Sync {
     ) -> BoxFuture<'a, Result<PowerActionResult, ActionError>>;
 
     /// Monitors paused players for up to 5 minutes (300s).
-    /// Returns `true` if any player resumed playback (`PlaybackStatus == "Playing"`),
-    /// or `false` on clean completion / timeout.
+    /// Returns `true` if any player transitions from `"Paused"` or `"Stopped"` back to
+    /// `PlaybackStatus == "Playing"`, or `false` on clean completion / timeout.
     fn watch_mpris_resume<'a>(&'a self, paused_players: &'a [String]) -> BoxFuture<'a, bool>;
 }
 

@@ -94,9 +94,60 @@ trait LogindSession {
     fn lock(&self) -> zbus::Result<()>;
 }
 
+const DEFAULT_MPRIS_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
+const MPRIS_OBJECT_PATH: &str = "/org/mpris/MediaPlayer2";
+const MPRIS_PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
+const MPRIS_STATUS_PLAYING: &str = "Playing";
+const MPRIS_STATUS_PAUSED: &str = "Paused";
+const MPRIS_STATUS_STOPPED: &str = "Stopped";
+
 /// Production system action executor communicating over session and system D-Bus.
-#[derive(Debug, Default, Clone)]
-pub struct SystemActionExecutor;
+#[derive(Debug, Clone)]
+pub struct SystemActionExecutor {
+    session_bus_address: Option<String>,
+    mpris_watch_timeout: Duration,
+}
+
+impl Default for SystemActionExecutor {
+    fn default() -> Self {
+        Self {
+            session_bus_address: None,
+            mpris_watch_timeout: DEFAULT_MPRIS_WATCH_TIMEOUT,
+        }
+    }
+}
+
+impl SystemActionExecutor {
+    /// Creates an executor backed by the ambient session and system D-Bus.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an executor targeting a specific session D-Bus address (used in hermetic tests).
+    pub fn with_session_bus_address(address: impl Into<String>) -> Self {
+        Self {
+            session_bus_address: Some(address.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Overrides the MPRIS post-trigger watch timeout (defaults to 300 s).
+    pub fn with_mpris_watch_timeout(mut self, timeout: Duration) -> Self {
+        self.mpris_watch_timeout = timeout;
+        self
+    }
+
+    async fn session_conn(&self) -> Result<zbus::Connection, zbus::Error> {
+        match &self.session_bus_address {
+            Some(addr) => {
+                zbus::connection::Builder::address(addr.as_str())?
+                    .build()
+                    .await
+            }
+            None => zbus::Connection::session().await,
+        }
+    }
+}
 
 impl ActionExecutor for SystemActionExecutor {
     fn pause_mpris_players<'a>(
@@ -104,7 +155,7 @@ impl ActionExecutor for SystemActionExecutor {
         ignore_players: &'a [String],
     ) -> BoxFuture<'a, Result<Vec<String>, ActionError>> {
         Box::pin(async move {
-            let conn = match zbus::Connection::session().await {
+            let conn = match self.session_conn().await {
                 Ok(c) => c,
                 Err(err) => return Err(ActionError::Mpris(format!("session bus error: {err}"))),
             };
@@ -150,7 +201,7 @@ impl ActionExecutor for SystemActionExecutor {
                         .ok()?
                         .ok()?;
 
-                        if status != "Playing" {
+                        if status != MPRIS_STATUS_PLAYING {
                             return None;
                         }
 
@@ -200,7 +251,7 @@ impl ActionExecutor for SystemActionExecutor {
         ignore_players: &'a [String],
     ) -> BoxFuture<'a, Result<usize, ActionError>> {
         Box::pin(async move {
-            let conn = match zbus::Connection::session().await {
+            let conn = match self.session_conn().await {
                 Ok(c) => c,
                 Err(err) => return Err(ActionError::Mpris(format!("session bus error: {err}"))),
             };
@@ -246,7 +297,7 @@ impl ActionExecutor for SystemActionExecutor {
                         .ok()?
                         .ok()?;
 
-                        Some(status == "Playing")
+                        Some(status == MPRIS_STATUS_PLAYING)
                     }
                     .await;
                     opt
@@ -399,9 +450,15 @@ impl ActionExecutor for SystemActionExecutor {
 
     fn watch_mpris_resume<'a>(&'a self, paused_players: &'a [String]) -> BoxFuture<'a, bool> {
         Box::pin(async move {
-            let conn = match zbus::Connection::session().await {
+            let conn = match self.session_conn().await {
                 Ok(c) => c,
-                Err(_) => return false,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "watch_mpris_resume failed to connect to session D-Bus"
+                    );
+                    return false;
+                }
             };
 
             let (resumed_tx, mut resumed_rx) = mpsc::channel::<()>(1);
@@ -412,24 +469,142 @@ impl ActionExecutor for SystemActionExecutor {
                 let tx = resumed_tx.clone();
                 let target_name = target.clone();
                 join_handles.push(tokio::spawn(async move {
-                    let builder = match MediaPlayer2PlayerProxy::builder(&c)
+                    let props_builder = match zbus::fdo::PropertiesProxy::builder(&c)
                         .destination(target_name.as_str())
+                        .and_then(|b| b.path(MPRIS_OBJECT_PATH))
                     {
                         Ok(b) => b,
-                        Err(_) => return,
-                    };
-                    let proxy = match builder.build().await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
-                    let mut stream = proxy.receive_playback_status_changed().await;
-                    use zbus::export::futures_util::StreamExt;
-                    while let Some(change) = stream.next().await {
-                        if let Ok(val) = change.get().await
-                            && val == "Playing"
-                        {
-                            let _ = tx.send(()).await;
+                        Err(err) => {
+                            tracing::warn!(
+                                player = %target_name,
+                                error = %err,
+                                "failed to configure MPRIS PropertiesProxy"
+                            );
                             return;
+                        }
+                    };
+                    let props_proxy = match props_builder.build().await {
+                        Ok(p) => p,
+                        Err(err) => {
+                            tracing::warn!(
+                                player = %target_name,
+                                error = %err,
+                                "failed to build MPRIS PropertiesProxy"
+                            );
+                            return;
+                        }
+                    };
+                    // Subscribe to PropertiesChanged before reading initial PlaybackStatus so no
+                    // async browser transition (e.g. Playing -> Paused -> Playing) is lost or
+                    // replayed out of order from zbus's coalescing property cache.
+                    let mut stream = match props_proxy.receive_properties_changed().await {
+                        Ok(s) => s,
+                        Err(err) => {
+                            tracing::warn!(
+                                player = %target_name,
+                                error = %err,
+                                "failed to subscribe to MPRIS PropertiesChanged"
+                            );
+                            return;
+                        }
+                    };
+
+                    let player_builder = match MediaPlayer2PlayerProxy::builder(&c)
+                        .destination(target_name.as_str())
+                    {
+                        Ok(b) => b.cache_properties(zbus::proxy::CacheProperties::No),
+                        Err(err) => {
+                            tracing::warn!(
+                                player = %target_name,
+                                error = %err,
+                                "failed to configure MPRIS PlayerProxy"
+                            );
+                            return;
+                        }
+                    };
+                    let player_proxy = match player_builder.build().await {
+                        Ok(p) => p,
+                        Err(err) => {
+                            tracing::warn!(
+                                player = %target_name,
+                                error = %err,
+                                "failed to build MPRIS PlayerProxy"
+                            );
+                            return;
+                        }
+                    };
+
+                    let mut seen_paused_or_stopped = match player_proxy.playback_status().await {
+                        Ok(status) => {
+                            matches!(status.as_str(), MPRIS_STATUS_PAUSED | MPRIS_STATUS_STOPPED)
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                player = %target_name,
+                                error = %err,
+                                "failed to read initial MPRIS PlaybackStatus; waiting for signal"
+                            );
+                            false
+                        }
+                    };
+
+                    use zbus::export::ordered_stream::OrderedStreamExt;
+                    while let Some(signal) = stream.next().await {
+                        let args = match signal.args() {
+                            Ok(args) => args,
+                            Err(err) => {
+                                tracing::debug!(
+                                    player = %target_name,
+                                    error = %err,
+                                    "failed to decode MPRIS PropertiesChanged signal"
+                                );
+                                continue;
+                            }
+                        };
+                        if args.interface_name.as_str() != MPRIS_PLAYER_INTERFACE {
+                            continue;
+                        }
+
+                        let status_opt =
+                            if let Some(val) = args.changed_properties.get("PlaybackStatus") {
+                                match val {
+                                    Value::Str(s) => Some(s.as_str().to_string()),
+                                    other => {
+                                        tracing::debug!(
+                                            player = %target_name,
+                                            value = ?other,
+                                            "unexpected MPRIS PlaybackStatus property type"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else if args.invalidated_properties.contains(&"PlaybackStatus") {
+                                match player_proxy.playback_status().await {
+                                    Ok(status) => Some(status),
+                                    Err(err) => {
+                                        tracing::debug!(
+                                            player = %target_name,
+                                            error = %err,
+                                            "failed to re-read invalidated MPRIS PlaybackStatus"
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                        if let Some(status) = status_opt {
+                            match status.as_str() {
+                                MPRIS_STATUS_PAUSED | MPRIS_STATUS_STOPPED => {
+                                    seen_paused_or_stopped = true;
+                                }
+                                MPRIS_STATUS_PLAYING if seen_paused_or_stopped => {
+                                    let _ = tx.send(()).await;
+                                    return;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }));
@@ -437,7 +612,7 @@ impl ActionExecutor for SystemActionExecutor {
             drop(resumed_tx);
 
             let resumed = tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(300)) => false,
+                _ = tokio::time::sleep(self.mpris_watch_timeout) => false,
                 res = resumed_rx.recv() => res.is_some(),
             };
 

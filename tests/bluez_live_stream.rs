@@ -1,6 +1,7 @@
+mod common;
+
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU8, Ordering},
@@ -37,46 +38,10 @@ enum MockBluezError {
     Failed(String),
 }
 
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use common::dbus::{PrivateDbusGuard as ChildGuard, spawn_private_dbus_named};
 
 fn owned<'a>(v: impl Into<Value<'a>>) -> OwnedValue {
     OwnedValue::try_from(v.into()).expect("convert Value into OwnedValue")
-}
-
-fn spawn_private_dbus_named(temp: &TempDir, sock_name: &str) -> (ChildGuard, String) {
-    let bus_sock = temp.path().join(sock_name);
-    let listen_addr = format!("unix:path={}", bus_sock.display());
-    let mut child = Command::new("dbus-daemon")
-        .args([
-            "--session",
-            "--nopidfile",
-            "--nosyslog",
-            "--nofork",
-            "--print-address=1",
-            "--address",
-            &listen_addr,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("dbus-daemon must spawn");
-
-    let stdout = child.stdout.take().expect("dbus-daemon stdout");
-    let mut reader = BufReader::new(stdout);
-    let mut addr = String::new();
-    reader
-        .read_line(&mut addr)
-        .expect("read dbus-daemon address");
-    let addr = addr.trim().to_string();
-    assert!(!addr.is_empty(), "dbus-daemon did not print a bus address");
-    (ChildGuard(child), addr)
 }
 
 fn spawn_private_dbus(temp: &TempDir) -> (ChildGuard, String) {
