@@ -33,6 +33,6 @@ All Rust source files in `src/` must remain strictly under 1000 lines (enforced 
 
 ## Canonical Schemas & Contracts
 
-- **IPC wire requests, responses, and push events**: See `src/ipc/protocol.rs` for authoritative schemas (`DaemonStatus`, `SessionListPage`, `SnapshotEvent`, `EpochUpdateEvent`, `HrSampleEvent`).
-- **Persisted database models and descriptors**: See `src/storage/mod.rs` for entity structures (`WearableDescriptor`, `SessionSummary`, `SessionFullDetail`, `ImportSummary`).
+- **IPC wire requests, responses, and push events**: See `src/ipc/protocol.rs` for authoritative schemas (`DaemonStatus`, `SessionListPage`, `SessionEpochsParams`, `MAX_IPC_EPOCHS_PER_FRAME`, `SnapshotEvent`, `EpochUpdateEvent`, `HrSampleEvent`) and `src/ipc/client.rs` (`EpochPaginator`) for transparent multi-page epoch assembly.
+- **Persisted database models and descriptors**: See `src/storage/mod.rs` for entity structures (`WearableDescriptor`, `SessionSummary`, `SessionFullDetail`, `SessionEpochsPage`, `ImportSummary`).
 - **Shared test fixtures and doubles**: See `tests/common/` (`common::daemon::TestWearableSource`, `common::tui::make_daemon_status`).

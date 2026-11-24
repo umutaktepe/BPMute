@@ -53,7 +53,7 @@ while IFS= read -r -d '' file; do
 done < <(find ./src -name '*.rs' -print0)
 
 if grep -Eq 'DaemonOptions\s*\{' tests/*.rs; then
-  echo "error: direct DaemonOptions struct literal forbidden in tests; use DaemonOptions::for_testing(...) (docs/agents/testing.md:27)" >&2
+  echo "error: direct DaemonOptions struct literal forbidden in tests; use DaemonOptions::for_testing(...) (docs/agents/testing.md)" >&2
   exit 1
 fi
 
@@ -165,6 +165,26 @@ for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
             sys.exit(
                 f"error: {path} ({fn_sig}) mutates/recomputes ledger without wal_checkpoint(TRUNCATE) / flush_wal() / write_tx_and_flush()"
             )
+
+ipc_server = "\n".join(
+    l.split("//", 1)[0] for l in open("src/ipc/server.rs", encoding="utf-8").read().splitlines()
+)
+if re.search(r'\bwrite_ndjson_line\(', ipc_server):
+    sys.exit(
+        "error: unbounded write_ndjson_line(...) forbidden in src/ipc/server.rs; use write_bounded_ndjson_line(..., MAX_FRAME_BYTES)"
+    )
+
+for path in sorted(glob.glob("src/daemon/**/*.rs", recursive=True)):
+    stripped = "\n".join(
+        l.split("//", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()
+    )
+    if re.search(
+        r'\bpersistence\.(?:get_session|close_session_and_recompute|set_feedback_and_recompute)\(',
+        stripped,
+    ):
+        sys.exit(
+            f"error: unbounded persistence session detail call forbidden in {path}; use get_session_with_epoch_limit / get_session_epochs / *_slim_and_recompute (ADR-0002)"
+        )
 PY
 
 # shellcheck disable=SC2016

@@ -76,7 +76,8 @@ impl TuiIpcBridge {
             // Dedicated writer task
             let mut writer_task = tokio::spawn(async move {
                 while let Some(envelope) = req_rx.recv().await {
-                    if write_ndjson_line(&mut write_half, &envelope).await.is_err() {
+                    if let Err(err) = write_ndjson_line(&mut write_half, &envelope).await {
+                        tracing::warn!(error = %err, "TUI IPC writer disconnected");
                         break;
                     }
                 }
@@ -108,7 +109,11 @@ impl TuiIpcBridge {
                                         }
                                     }
                                 }
-                                _ => break,
+                                Ok(None) => break,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "TUI IPC reader disconnected");
+                                    break;
+                                }
                             }
                         }
                         _ = reader_shutdown.changed() => break,
