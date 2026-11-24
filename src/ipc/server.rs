@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::daemon::state::DaemonCore;
 
-use super::framing::{FrameError, read_bounded_line, write_ndjson_line};
+use super::framing::{FrameError, read_bounded_line, write_bounded_ndjson_line};
 use super::protocol::{
     MAX_FRAME_BYTES, PROTOCOL_VERSION, PushEventEnvelope, RequestEnvelope, ResponseEnvelope,
     error_codes,
@@ -38,7 +38,7 @@ pub async fn handle_connection(
                 maybe_resp = resp_rx.recv() => {
                     match maybe_resp {
                         Some(resp) => {
-                            if write_ndjson_line(&mut write_half, &resp).await.is_err() {
+                            if !write_server_response(&mut write_half, &resp, client_id).await {
                                 break;
                             }
                         }
@@ -56,7 +56,7 @@ pub async fn handle_connection(
                         None => std::future::pending::<PushEventEnvelope>().await,
                     }
                 } => {
-                    if write_ndjson_line(&mut write_half, &event).await.is_err() {
+                    if !write_server_push(&mut write_half, &event, client_id).await {
                         break;
                     }
                 }
@@ -225,5 +225,118 @@ async fn process_line(
                 let _ = resp_tx_cloned.send(resp).await;
             });
         }
+    }
+}
+
+async fn write_server_response<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    resp: &ResponseEnvelope,
+    client_id: u64,
+) -> bool {
+    match write_bounded_ndjson_line(writer, resp, MAX_FRAME_BYTES).await {
+        Ok(()) => true,
+        Err(FrameError::TooLarge { max_bytes }) => {
+            tracing::error!(
+                client_id,
+                req_id = resp.id,
+                max_bytes,
+                "IPC response exceeded MAX_FRAME_BYTES; sending FRAME_TOO_LARGE error"
+            );
+            let fallback = ResponseEnvelope::err(
+                resp.id,
+                error_codes::FRAME_TOO_LARGE,
+                format!("IPC response exceeds maximum frame size of {max_bytes} bytes"),
+            );
+            write_bounded_ndjson_line(writer, &fallback, MAX_FRAME_BYTES)
+                .await
+                .is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+async fn write_server_push<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    event: &PushEventEnvelope,
+    client_id: u64,
+) -> bool {
+    match write_bounded_ndjson_line(writer, event, MAX_FRAME_BYTES).await {
+        Ok(()) => true,
+        Err(FrameError::TooLarge { max_bytes }) => {
+            tracing::error!(
+                client_id,
+                event = %event.event,
+                seq = event.seq,
+                max_bytes,
+                "IPC push event exceeded MAX_FRAME_BYTES; dropping oversized push event"
+            );
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn write_server_response_emits_frame_too_large_and_keeps_connection_alive() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut buf_reader = BufReader::new(reader);
+
+        let huge = ResponseEnvelope::ok(7, json!({ "pad": "x".repeat(MAX_FRAME_BYTES + 128) }));
+        assert!(write_server_response(&mut writer, &huge, 1).await);
+
+        let next = ResponseEnvelope::ok(8, json!({ "pong": true }));
+        assert!(write_server_response(&mut writer, &next, 1).await);
+        drop(writer);
+
+        let mut line1 = String::new();
+        buf_reader.read_line(&mut line1).await.unwrap();
+        let r1: ResponseEnvelope = serde_json::from_str(&line1).unwrap();
+        assert_eq!(r1.id, 7);
+        assert!(!r1.ok);
+        assert_eq!(r1.error.unwrap().code, error_codes::FRAME_TOO_LARGE);
+
+        let mut line2 = String::new();
+        buf_reader.read_line(&mut line2).await.unwrap();
+        let r2: ResponseEnvelope = serde_json::from_str(&line2).unwrap();
+        assert_eq!(r2.id, 8);
+        assert!(r2.ok);
+        assert_eq!(r2.data.unwrap()["pong"], true);
+    }
+
+    #[tokio::test]
+    async fn write_server_push_drops_oversized_event_without_poisoning_subscriber_stream() {
+        let (mut writer, reader) = UnixStream::pair().unwrap();
+        let mut buf_reader = BufReader::new(reader);
+
+        let huge_push = PushEventEnvelope {
+            v: PROTOCOL_VERSION,
+            event: "OversizedTest".to_string(),
+            seq: 1,
+            data: json!({ "pad": "x".repeat(MAX_FRAME_BYTES + 128) }),
+        };
+        assert!(write_server_push(&mut writer, &huge_push, 1).await);
+
+        let normal_push = PushEventEnvelope {
+            v: PROTOCOL_VERSION,
+            event: "StateChanged".to_string(),
+            seq: 2,
+            data: json!({ "ok": true }),
+        };
+        assert!(write_server_push(&mut writer, &normal_push, 1).await);
+        drop(writer);
+
+        let mut line = String::new();
+        buf_reader.read_line(&mut line).await.unwrap();
+        let received: PushEventEnvelope = serde_json::from_str(&line).unwrap();
+        assert_eq!(received.event, "StateChanged");
+        assert_eq!(received.seq, 2);
+
+        line.clear();
+        assert_eq!(buf_reader.read_line(&mut line).await.unwrap(), 0);
     }
 }

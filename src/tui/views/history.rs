@@ -284,12 +284,15 @@ fn render_detail_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
         return;
     }
 
-    let detail_opt = app.selected_session_detail.as_ref();
     let selected_entry = app.history_sessions.get(app.selected_session_idx);
 
     let Some(entry) = selected_entry else {
         return;
     };
+    let detail_opt = app
+        .selected_session_detail
+        .as_ref()
+        .filter(|d| d.session.id == entry.id);
 
     let header_lines = build_detail_header(entry, detail_opt, app);
     let header_height = (header_lines.len() as u16).min(inner.height);

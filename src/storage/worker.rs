@@ -11,8 +11,9 @@ use crate::replay::TraceFormat;
 use crate::sleep_engine::{Epoch, HrPacket};
 use crate::storage::{
     AcceptShiftResult, CloseSessionRequest, EnrolledWearable, ExportBundleOptions, ImportMode,
-    ImportSummary, LedgerStore, OpenSessionRequest, PruneSummary, SessionFullDetail,
-    SessionListPage, SetFeedbackRequest, StorageError, StorageStats, WearableDescriptor,
+    ImportSummary, LedgerStore, OpenSessionRequest, PruneSummary, SessionEpochsPage,
+    SessionFullDetail, SessionListPage, SetFeedbackRequest, StorageError, StorageStats,
+    WearableDescriptor,
 };
 
 enum DbCommand {
@@ -49,6 +50,7 @@ enum DbCommand {
     CloseSessionAndRecompute {
         req: CloseSessionRequest,
         now_ms: i64,
+        include_epochs: bool,
         reply: oneshot::Sender<Result<(SessionFullDetail, CalibrationState), StorageError>>,
     },
     ListSessions {
@@ -59,6 +61,17 @@ enum DbCommand {
     GetSession {
         id_or_prefix: String,
         reply: oneshot::Sender<Result<SessionFullDetail, StorageError>>,
+    },
+    GetSessionWithEpochLimit {
+        id_or_prefix: String,
+        max_epochs: u32,
+        reply: oneshot::Sender<Result<SessionFullDetail, StorageError>>,
+    },
+    GetSessionEpochs {
+        id_or_prefix: String,
+        limit: u32,
+        offset: u32,
+        reply: oneshot::Sender<Result<SessionEpochsPage, StorageError>>,
     },
     DeleteSessionAndRecompute {
         id_or_prefix: String,
@@ -75,6 +88,7 @@ enum DbCommand {
     SetFeedbackAndRecompute {
         req: SetFeedbackRequest,
         now_ms: i64,
+        include_epochs: bool,
         reply: oneshot::Sender<Result<(SessionFullDetail, CalibrationState), StorageError>>,
     },
     SetDay1SeedAndRecompute {
@@ -305,8 +319,18 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
                 raw_samples.iter().map(|(seq, pkt)| (*seq, pkt)).collect();
             let _ = reply.send(store.append_epoch_and_raw(&session_id, ep_ref, &raw_refs));
         }
-        DbCommand::CloseSessionAndRecompute { req, now_ms, reply } => {
-            let _ = reply.send(store.close_session_and_recompute(&req, now_ms));
+        DbCommand::CloseSessionAndRecompute {
+            req,
+            now_ms,
+            include_epochs,
+            reply,
+        } => {
+            let res = if include_epochs {
+                store.close_session_and_recompute(&req, now_ms)
+            } else {
+                store.close_session_slim_and_recompute(&req, now_ms)
+            };
+            let _ = reply.send(res);
         }
         DbCommand::ListSessions {
             limit,
@@ -321,8 +345,33 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
         } => {
             let _ = reply.send(store.get_session(&id_or_prefix));
         }
-        DbCommand::SetFeedbackAndRecompute { req, now_ms, reply } => {
-            let _ = reply.send(store.set_feedback_and_recompute(&req, now_ms));
+        DbCommand::GetSessionWithEpochLimit {
+            id_or_prefix,
+            max_epochs,
+            reply,
+        } => {
+            let _ = reply.send(store.get_session_with_epoch_limit(&id_or_prefix, max_epochs));
+        }
+        DbCommand::GetSessionEpochs {
+            id_or_prefix,
+            limit,
+            offset,
+            reply,
+        } => {
+            let _ = reply.send(store.get_session_epochs(&id_or_prefix, limit, offset));
+        }
+        DbCommand::SetFeedbackAndRecompute {
+            req,
+            now_ms,
+            include_epochs,
+            reply,
+        } => {
+            let res = if include_epochs {
+                store.set_feedback_and_recompute(&req, now_ms)
+            } else {
+                store.set_feedback_slim_and_recompute(&req, now_ms)
+            };
+            let _ = reply.send(res);
         }
         DbCommand::SetDay1SeedAndRecompute {
             sleep_hr,
@@ -531,8 +580,27 @@ impl PersistenceHandle {
         req: CloseSessionRequest,
         now_ms: i64,
     ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
-        self.call(|reply| DbCommand::CloseSessionAndRecompute { req, now_ms, reply })
-            .await
+        self.call(|reply| DbCommand::CloseSessionAndRecompute {
+            req,
+            now_ms,
+            include_epochs: true,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn close_session_slim_and_recompute(
+        &self,
+        req: CloseSessionRequest,
+        now_ms: i64,
+    ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
+        self.call(|reply| DbCommand::CloseSessionAndRecompute {
+            req,
+            now_ms,
+            include_epochs: false,
+            reply,
+        })
+        .await
     }
 
     pub async fn list_sessions(
@@ -559,13 +627,60 @@ impl PersistenceHandle {
         .await
     }
 
+    pub async fn get_session_with_epoch_limit(
+        &self,
+        id_or_prefix: String,
+        max_epochs: u32,
+    ) -> Result<SessionFullDetail, StorageError> {
+        self.call(|reply| DbCommand::GetSessionWithEpochLimit {
+            id_or_prefix,
+            max_epochs,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn get_session_epochs(
+        &self,
+        id_or_prefix: String,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SessionEpochsPage, StorageError> {
+        self.call(|reply| DbCommand::GetSessionEpochs {
+            id_or_prefix,
+            limit,
+            offset,
+            reply,
+        })
+        .await
+    }
+
     pub async fn set_feedback_and_recompute(
         &self,
         req: SetFeedbackRequest,
         now_ms: i64,
     ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
-        self.call(|reply| DbCommand::SetFeedbackAndRecompute { req, now_ms, reply })
-            .await
+        self.call(|reply| DbCommand::SetFeedbackAndRecompute {
+            req,
+            now_ms,
+            include_epochs: true,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn set_feedback_slim_and_recompute(
+        &self,
+        req: SetFeedbackRequest,
+        now_ms: i64,
+    ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
+        self.call(|reply| DbCommand::SetFeedbackAndRecompute {
+            req,
+            now_ms,
+            include_epochs: false,
+            reply,
+        })
+        .await
     }
 
     pub async fn set_day1_seed_and_recompute(

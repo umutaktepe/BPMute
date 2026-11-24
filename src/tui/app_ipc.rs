@@ -205,7 +205,7 @@ impl TuiApp {
                     return Some(TuiCommand::RefreshSessions);
                 }
             }
-            IpcEvent::SessionClosed(closed_detail) => {
+            IpcEvent::SessionClosed(mut closed_detail) => {
                 if let Some(entry) = self
                     .history_sessions
                     .iter_mut()
@@ -233,7 +233,18 @@ impl TuiApp {
                     .as_ref()
                     .is_some_and(|d| d.session.id == closed_detail.session.id)
                 {
-                    self.selected_session_detail = Some(*closed_detail);
+                    if closed_detail.epochs.is_empty()
+                        && let Some(existing) = self.selected_session_detail.take()
+                        && !existing.epochs.is_empty()
+                    {
+                        closed_detail.epochs = existing.epochs;
+                    }
+                    if closed_detail.epochs.len() < closed_detail.session.epochs_count as usize {
+                        // Force RefreshSessions -> SessionsUpdated to load complete epochs.
+                        self.selected_session_detail = None;
+                    } else {
+                        self.selected_session_detail = Some(*closed_detail);
+                    }
                 }
                 self.session_close_deadline_ms = None;
                 if self.daemon_connected {
@@ -370,6 +381,24 @@ impl TuiApp {
                 }
             }
             IpcEvent::SessionDetailLoaded(mut detail) => {
+                if let Some(entry) = self
+                    .history_sessions
+                    .iter_mut()
+                    .find(|s| s.id == detail.session.id)
+                {
+                    entry.epochs_count = entry.epochs_count.max(detail.session.epochs_count);
+                    entry.end_ts_ms = entry.end_ts_ms.max(detail.session.end_ts_ms);
+                    if entry.warmup_mu_hr.is_none() {
+                        entry.warmup_mu_hr = detail.session.warmup_mu_hr;
+                    }
+                }
+                let matches_selected = self
+                    .history_sessions
+                    .get(self.selected_session_idx)
+                    .is_some_and(|s| s.id == detail.session.id);
+                if !matches_selected {
+                    return None;
+                }
                 if let Some(existing) = self.selected_session_detail.take()
                     && existing.session.id == detail.session.id
                 {
@@ -388,17 +417,6 @@ impl TuiApp {
                         && detail.session.warmup_mu_hr.is_none()
                     {
                         detail.session.warmup_mu_hr = Some(warmup_mu_hr);
-                    }
-                }
-                if let Some(entry) = self
-                    .history_sessions
-                    .iter_mut()
-                    .find(|s| s.id == detail.session.id)
-                {
-                    entry.epochs_count = entry.epochs_count.max(detail.session.epochs_count);
-                    entry.end_ts_ms = entry.end_ts_ms.max(detail.session.end_ts_ms);
-                    if entry.warmup_mu_hr.is_none() {
-                        entry.warmup_mu_hr = detail.session.warmup_mu_hr;
                     }
                 }
                 self.selected_session_detail = Some(*detail);

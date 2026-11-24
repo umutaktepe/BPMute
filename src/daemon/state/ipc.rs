@@ -8,8 +8,9 @@ use crate::ipc::protocol::{
     AlertDismissParams, CalibrationSetBoundaryParams, DataBackupSqliteParams,
     DataExportBundleParams, DataExportBundleResponse, DataHardWipeParams, DataImportBundleParams,
     DataImportBundleResponse, DataPurgeRawResponse, EnrollAuthResponseParams, EnrollSelectParams,
-    EnrollSelectResponse, EnrollStartParams, EnrollStartResponse, ErrorPayload, PROTOCOL_VERSION,
-    PauseParams, SessionDeleteParams, SessionDeleteResponse, SessionExportTraceParams,
+    EnrollSelectResponse, EnrollStartParams, EnrollStartResponse, ErrorPayload,
+    MAX_IPC_EPOCHS_PER_FRAME, PROTOCOL_VERSION, PauseParams, SessionDeleteParams,
+    SessionDeleteResponse, SessionEpochsParams, SessionExportTraceParams,
     SessionExportTraceResponse, SessionGetParams, SessionListParams, SetDryRunParams,
     SetFeedbackParams, SetSeedParams, SnoozeGraceParams, SnoozeGraceResponse, TestTriggerParams,
     TestTriggerResponse, WearableConnectParams, WearableConnectResponse, WearableListResponse,
@@ -126,10 +127,29 @@ impl DaemonCore {
                 })?;
                 let detail = self
                     .persistence
-                    .get_session(parsed.id)
+                    .get_session_with_epoch_limit(parsed.id, MAX_IPC_EPOCHS_PER_FRAME)
                     .await
                     .map_err(storage_to_ipc_err)?;
                 serialize_json(detail)
+            }
+            "session.epochs" => {
+                let parsed: SessionEpochsParams = serde_json::from_value(params).map_err(|e| {
+                    ipc_err(
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session.epochs params: {e}"),
+                    )
+                })?;
+                let limit = parsed
+                    .limit
+                    .unwrap_or(MAX_IPC_EPOCHS_PER_FRAME)
+                    .min(MAX_IPC_EPOCHS_PER_FRAME);
+                let offset = parsed.offset.unwrap_or(0);
+                let page = self
+                    .persistence
+                    .get_session_epochs(parsed.id, limit, offset)
+                    .await
+                    .map_err(storage_to_ipc_err)?;
+                serialize_json(page)
             }
             "session.end" => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -222,7 +242,7 @@ impl DaemonCore {
                 };
                 let (detail, cal_state) = self
                     .persistence
-                    .set_feedback_and_recompute(req, now_ms)
+                    .set_feedback_slim_and_recompute(req, now_ms)
                     .await
                     .map_err(storage_to_ipc_err)?;
                 self.apply_calibration_update(cal_state);

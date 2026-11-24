@@ -11,8 +11,8 @@ use crate::config::{LoadedConfig, PatchField};
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::{
     CalibrationSetBoundaryParams, SessionDeleteParams, SessionDeleteResponse,
-    SessionExportTraceParams, SessionExportTraceResponse, SessionGetParams, SessionListParams,
-    SetFeedbackParams, SetSeedParams,
+    SessionExportTraceParams, SessionExportTraceResponse, SessionListParams, SetFeedbackParams,
+    SetSeedParams,
 };
 use crate::logging::format_wearable_label;
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -239,10 +239,9 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             }
             let detail: SessionFullDetail = match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    let params = SessionGetParams { id: id.clone() };
-                    match ipc_request_params(&mut client, "session.get", &params, stderr).await {
+                    match client.get_session_full(&id).await {
                         Ok(detail) => detail,
-                        Err(code) => return code,
+                        Err(err) => return report_ipc_error(err, stderr),
                     }
                 }
                 Ok(OnlineOrOffline::Offline) => match LedgerStore::open_read_only(&db_path) {

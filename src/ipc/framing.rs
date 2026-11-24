@@ -64,14 +64,58 @@ pub async fn read_bounded_line<R: AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
+async fn write_ndjson_line_inner<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    max_bytes: Option<usize>,
+) -> Result<(), FrameError> {
+    let mut bytes = serde_json::to_vec(value)?;
+    if let Some(max) = max_bytes
+        && bytes.len() > max
+    {
+        return Err(FrameError::TooLarge { max_bytes: max });
+    }
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
 /// Serializes `value` as a single-line JSON payload followed by `\n` and flushes.
 pub async fn write_ndjson_line<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<(), FrameError> {
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    writer.write_all(&bytes).await?;
-    writer.flush().await?;
-    Ok(())
+    write_ndjson_line_inner(writer, value, None).await
+}
+
+/// Serializes `value` as a single-line JSON payload capped at `max_bytes` (excluding `\n`) and flushes.
+///
+/// Leaves `writer` untouched and returns `Err(FrameError::TooLarge { max_bytes })` if the
+/// serialized payload exceeds `max_bytes`.
+pub async fn write_bounded_ndjson_line<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    max_bytes: usize,
+) -> Result<(), FrameError> {
+    write_ndjson_line_inner(writer, value, Some(max_bytes)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn write_bounded_ndjson_line_rejects_oversized_payload_without_writing() {
+        let mut sink = Vec::new();
+        let payload = serde_json::json!({ "pad": "x".repeat(128) });
+        let err = write_bounded_ndjson_line(&mut sink, &payload, 64)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FrameError::TooLarge { max_bytes: 64 }));
+        assert!(
+            sink.is_empty(),
+            "oversized payload must not partially write"
+        );
+    }
 }

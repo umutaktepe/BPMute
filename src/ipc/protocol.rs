@@ -17,6 +17,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum NDJSON line length in bytes (`1 MiB`).
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 
+/// Maximum 15-second `Epoch` records returned per NDJSON IPC frame (`500` epochs ≈ `350 KiB`).
+pub const MAX_IPC_EPOCHS_PER_FRAME: u32 = 500;
+
 /// Canonical daemon alert identifiers shared across daemon, IPC, and TUI.
 pub mod alert_ids {
     pub const CONFIG_RELOAD_FAILED: &str = "config_reload_failed";
@@ -378,6 +381,17 @@ pub struct SessionListParams {
 #[serde(deny_unknown_fields)]
 pub struct SessionGetParams {
     pub id: String,
+}
+
+/// Parameters accepted by `session.epochs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEpochsParams {
+    pub id: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 /// Parameters accepted by `session.set_feedback`.

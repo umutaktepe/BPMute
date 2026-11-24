@@ -478,7 +478,7 @@ impl MonitoringContext {
                         match self
                             .core
                             .persistence
-                            .close_session_and_recompute(
+                            .close_session_slim_and_recompute(
                                 CloseSessionRequest {
                                     session_id: sid,
                                     summary,

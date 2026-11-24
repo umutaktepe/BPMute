@@ -251,6 +251,16 @@ pub struct SessionFullDetail {
     pub has_raw_samples: bool,
 }
 
+/// Paginated 15-second `Epoch` slice returned by `session.epochs`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionEpochsPage {
+    pub session_id: String,
+    pub epochs: Vec<Epoch>,
+    pub total_count: u64,
+    pub limit: u32,
+    pub offset: u32,
+}
+
 /// Read-only stored session payload loaded for `bpmute replay --session <id>`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionReplayBundle {

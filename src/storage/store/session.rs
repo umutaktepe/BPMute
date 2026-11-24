@@ -13,8 +13,9 @@ use crate::sleep_engine::{
 };
 use crate::storage::schema::generate_uuid_v7_with;
 use crate::storage::{
-    CloseSessionRequest, OpenSessionRequest, SessionFullDetail, SessionListEntry, SessionListPage,
-    SessionReplayBundle, SessionStatus, SetFeedbackRequest, StorageError, WearableInfo,
+    CloseSessionRequest, OpenSessionRequest, SessionEpochsPage, SessionFullDetail,
+    SessionListEntry, SessionListPage, SessionReplayBundle, SessionStatus, SetFeedbackRequest,
+    StorageError, WearableInfo,
 };
 
 use super::recompute_and_persist_in_tx;
@@ -193,6 +194,23 @@ impl LedgerStore {
         req: &CloseSessionRequest,
         now_ms: i64,
     ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
+        self.close_session_with_epoch_limit(req, now_ms, None)
+    }
+
+    pub(crate) fn close_session_slim_and_recompute(
+        &mut self,
+        req: &CloseSessionRequest,
+        now_ms: i64,
+    ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
+        self.close_session_with_epoch_limit(req, now_ms, Some(0))
+    }
+
+    fn close_session_with_epoch_limit(
+        &mut self,
+        req: &CloseSessionRequest,
+        now_ms: i64,
+        max_epochs: Option<u32>,
+    ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
         let retention = self.retention_config.clone();
         self.write_tx_and_flush(move |tx| {
             let exists: Option<String> = tx
@@ -275,7 +293,7 @@ impl LedgerStore {
 
             let state = recompute_and_persist_in_tx(tx, now_ms)?;
             let _pruned = super::maintenance::prune_retention_in_tx(tx, &retention, now_ms)?;
-            let detail = load_session_detail_in_conn(tx, &req.session_id)?;
+            let detail = load_session_detail_with_epoch_limit(tx, &req.session_id, max_epochs)?;
             Ok((detail, state))
         })
     }
@@ -357,6 +375,44 @@ impl LedgerStore {
         load_session_detail_in_conn(&self.conn, &session_id)
     }
 
+    /// Loads detailed session inspection data with at most `max_epochs` leading `Epochs`.
+    pub fn get_session_with_epoch_limit(
+        &self,
+        id_or_prefix: &str,
+        max_epochs: u32,
+    ) -> Result<SessionFullDetail, StorageError> {
+        let session_id = resolve_session_id(&self.conn, id_or_prefix)?;
+        load_session_detail_with_epoch_limit(&self.conn, &session_id, Some(max_epochs))
+    }
+
+    /// Loads a paginated slice of `15 s` `Epochs` for a session in chronological (`seq`) order.
+    pub fn get_session_epochs(
+        &self,
+        id_or_prefix: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<SessionEpochsPage, StorageError> {
+        if limit == 0 {
+            return Err(StorageError::Validation(
+                "session epochs limit must be >= 1".to_string(),
+            ));
+        }
+        let session_id = resolve_session_id(&self.conn, id_or_prefix)?;
+        let total_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM session_epochs WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let epochs = load_session_epochs_page(&self.conn, &session_id, limit, offset)?;
+        Ok(SessionEpochsPage {
+            session_id,
+            epochs,
+            total_count: total_count.max(0) as u64,
+            limit,
+            offset,
+        })
+    }
+
     /// Loads stored raw samples and/or 15-second `Epochs` read-only for `bpmute replay --session`.
     pub fn load_session_for_replay(
         &self,
@@ -384,6 +440,23 @@ impl LedgerStore {
         &mut self,
         req: &SetFeedbackRequest,
         now_ms: i64,
+    ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
+        self.set_feedback_with_epoch_limit(req, now_ms, None)
+    }
+
+    pub(crate) fn set_feedback_slim_and_recompute(
+        &mut self,
+        req: &SetFeedbackRequest,
+        now_ms: i64,
+    ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
+        self.set_feedback_with_epoch_limit(req, now_ms, Some(0))
+    }
+
+    fn set_feedback_with_epoch_limit(
+        &mut self,
+        req: &SetFeedbackRequest,
+        now_ms: i64,
+        max_epochs: Option<u32>,
     ) -> Result<(SessionFullDetail, CalibrationState), StorageError> {
         if let PatchField::Set(hr) = req.avg_sleep_hr {
             validate_sleep_hr_bpm("avg_sleep_hr", hr).map_err(StorageError::Validation)?;
@@ -474,7 +547,7 @@ impl LedgerStore {
             }
 
             let state = recompute_and_persist_in_tx(tx, now_ms)?;
-            let detail = load_session_detail_in_conn(tx, &session_id)?;
+            let detail = load_session_detail_with_epoch_limit(tx, &session_id, max_epochs)?;
             Ok((detail, state))
         })
     }
@@ -548,6 +621,14 @@ pub(crate) fn load_session_detail_in_conn(
     conn: &Connection,
     session_id: &str,
 ) -> Result<SessionFullDetail, StorageError> {
+    load_session_detail_with_epoch_limit(conn, session_id, None)
+}
+
+pub(crate) fn load_session_detail_with_epoch_limit(
+    conn: &Connection,
+    session_id: &str,
+    max_epochs: Option<u32>,
+) -> Result<SessionFullDetail, StorageError> {
     let (session, status) = load_session_record(conn, session_id)?;
     let wearable = conn.query_row(
         "SELECT id, mac, alias, advertised_name, supports_rr, supports_contact, hr_var_floor, typical_sqi
@@ -568,7 +649,11 @@ pub(crate) fn load_session_detail_in_conn(
         },
     )?;
     let feedback = load_session_feedback(conn, session_id)?;
-    let epochs = load_session_epochs(conn, session_id)?;
+    let epochs = match max_epochs {
+        None => load_session_epochs(conn, session_id)?,
+        Some(0) => Vec::new(),
+        Some(limit) => load_session_epochs_page(conn, session_id, limit, 0)?,
+    };
     let raw_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM raw_samples WHERE session_id = ?1",
         params![session_id],
@@ -600,49 +685,74 @@ pub(crate) fn load_session_feedback(
         .flatten())
 }
 
+const EPOCH_SELECT_COLUMNS: &str = "ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
+    ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
+    rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
+    baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
+    p_active_wake, p_quiet_wake, p_sleep, state";
+
+fn map_epoch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Epoch> {
+    let state_str: String = row.get(19)?;
+    Ok(Epoch {
+        session_index: 1,
+        ts_ms: row.get(0)?,
+        features: EpochFeatures {
+            hr_bpm_60s: row.get(1)?,
+            z_hr: row.get(2)?,
+            hr_slope_4m: row.get(3)?,
+            r_var_120s: row.get(4)?,
+            ln_rmssd_60s: row.get(5)?,
+            delta_ln_rmssd_60s: row.get(6)?,
+            rmssd_sdnn_120s: row.get(7)?,
+        },
+        hrv_valid: row.get::<_, i64>(8)? != 0,
+        rr_artifact_frac: row.get(9)?,
+        coverage: row.get(10)?,
+        flatline_stale: row.get::<_, i64>(11)? != 0,
+        accumulators_frozen: row.get::<_, i64>(12)? != 0,
+        baseline_mu_hr: row.get(13)?,
+        baseline_sigma_hr: row.get(14)?,
+        baseline_frozen: row.get::<_, i64>(15)? != 0,
+        p_active_wake: row.get(16)?,
+        p_quiet_wake: row.get(17)?,
+        p_sleep: row.get(18)?,
+        state: state_str.parse().unwrap_or(DetectorState::Idle),
+    })
+}
+
 pub(crate) fn load_session_epochs(
     conn: &Connection,
     session_id: &str,
 ) -> Result<Vec<Epoch>, StorageError> {
-    let mut stmt = conn.prepare(
-        "SELECT ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
-                ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
-                rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
-                baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
-                p_active_wake, p_quiet_wake, p_sleep, state
+    let sql = format!(
+        "SELECT {EPOCH_SELECT_COLUMNS}
          FROM session_epochs
          WHERE session_id = ?1
-         ORDER BY seq ASC",
-    )?;
+         ORDER BY seq ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let epochs = stmt
-        .query_map(params![session_id], |row| {
-            let state_str: String = row.get(19)?;
-            Ok(Epoch {
-                session_index: 1,
-                ts_ms: row.get(0)?,
-                features: EpochFeatures {
-                    hr_bpm_60s: row.get(1)?,
-                    z_hr: row.get(2)?,
-                    hr_slope_4m: row.get(3)?,
-                    r_var_120s: row.get(4)?,
-                    ln_rmssd_60s: row.get(5)?,
-                    delta_ln_rmssd_60s: row.get(6)?,
-                    rmssd_sdnn_120s: row.get(7)?,
-                },
-                hrv_valid: row.get::<_, i64>(8)? != 0,
-                rr_artifact_frac: row.get(9)?,
-                coverage: row.get(10)?,
-                flatline_stale: row.get::<_, i64>(11)? != 0,
-                accumulators_frozen: row.get::<_, i64>(12)? != 0,
-                baseline_mu_hr: row.get(13)?,
-                baseline_sigma_hr: row.get(14)?,
-                baseline_frozen: row.get::<_, i64>(15)? != 0,
-                p_active_wake: row.get(16)?,
-                p_quiet_wake: row.get(17)?,
-                p_sleep: row.get(18)?,
-                state: state_str.parse().unwrap_or(DetectorState::Idle),
-            })
-        })?
+        .query_map(params![session_id], map_epoch_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(epochs)
+}
+
+pub(crate) fn load_session_epochs_page(
+    conn: &Connection,
+    session_id: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Epoch>, StorageError> {
+    let sql = format!(
+        "SELECT {EPOCH_SELECT_COLUMNS}
+         FROM session_epochs
+         WHERE session_id = ?1
+         ORDER BY seq ASC
+         LIMIT ?2 OFFSET ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let epochs = stmt
+        .query_map(params![session_id, limit, offset], map_epoch_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(epochs)
 }

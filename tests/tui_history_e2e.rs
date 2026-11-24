@@ -2766,3 +2766,331 @@ fn test_feedback_modal_canonicalizes_short_hour_rejects_short_minute_and_accepts
         })
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_long_session_over_1mib_loads_without_disconnect_loop() {
+    use bpmute::storage::{
+        CloseSessionRequest, LedgerStore, OpenSessionRequest, db_path_in_data_dir,
+        lock_path_in_data_dir,
+    };
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let base_utc = Utc.with_ymd_and_hms(2026, 11, 24, 0, 50, 0).unwrap();
+    let long_start = base_utc.timestamp_millis();
+    let long_epochs = 2500u32;
+    let long_end = long_start + i64::from(long_epochs) * 15_000;
+    let short_start = long_end + 1_000;
+    let short_epochs = 26u32;
+    let short_end = short_start + i64::from(short_epochs) * 15_000;
+
+    let (long_id, short_id) = {
+        let db_file = db_path_in_data_dir(&paths.data_dir);
+        let db_lock = lock_path_in_data_dir(&paths.data_dir);
+        let mut store = LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &WearableDescriptor {
+                    mac: "AA:BB:CC:DD:EE:05".into(),
+                    address_type: "public".into(),
+                    alias: Some("Watch GT5".into()),
+                    advertised_name: None,
+                    supports_rr: false,
+                    supports_contact: true,
+                },
+                long_start - 10_000,
+            )
+            .unwrap();
+
+        let long_sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid.clone(),
+                start_ts_ms: long_start,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        for seq in 0..long_epochs {
+            let ts_ms = long_start + i64::from(seq + 1) * 15_000;
+            let ep = make_test_epoch(
+                1,
+                ts_ms,
+                64.0 + 3.0 * (f64::from(seq) * 0.05).sin(),
+                0.6,
+                66.8,
+            );
+            store
+                .append_epoch_and_raw(&long_sid, Some((seq, &ep)), &[])
+                .unwrap();
+        }
+        let mut long_summary = make_session_summary(1, long_start, long_end, false);
+        long_summary.end_reason = SessionEndReason::SustainedWakefulness;
+        long_summary.epochs_count = long_epochs as usize;
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: long_sid.clone(),
+                    summary: long_summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                long_end,
+            )
+            .unwrap();
+
+        let short_sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: short_start,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        for seq in 0..short_epochs {
+            let ts_ms = short_start + i64::from(seq + 1) * 15_000;
+            let ep = make_test_epoch(
+                2,
+                ts_ms,
+                84.0 + 2.0 * (f64::from(seq) * 0.2).sin(),
+                0.01,
+                84.5,
+            );
+            store
+                .append_epoch_and_raw(&short_sid, Some((seq, &ep)), &[])
+                .unwrap();
+        }
+        let mut short_summary = make_session_summary(2, short_start, short_end, false);
+        short_summary.end_reason = SessionEndReason::GapExceeded;
+        short_summary.epochs_count = short_epochs as usize;
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: short_sid.clone(),
+                    summary: short_summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                short_end,
+            )
+            .unwrap();
+
+        (long_sid, short_sid)
+    };
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(
+        base_utc + chrono::Duration::hours(10),
+    ));
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env),
+        clock,
+    ))
+    .await
+    .unwrap();
+
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.daemon_connected
+            && a.history_sessions.len() == 2
+            && a.selected_session_detail
+                .as_ref()
+                .is_some_and(|d| d.session.id == short_id)
+    })
+    .await;
+
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::SessionGet {
+            id: long_id.clone(),
+        })
+    );
+    cmd_tx.send(cmd.unwrap()).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        assert!(
+            a.daemon_connected,
+            "selecting 2500-epoch session must not disconnect TUI bridge"
+        );
+        a.selected_session_detail
+            .as_ref()
+            .is_some_and(|d| d.session.id == long_id && d.epochs.len() == long_epochs as usize)
+    })
+    .await;
+
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let buf = term.backend().buffer();
+    let out = buffer_to_string(buf);
+    assert!(
+        !out.contains("Daemon offline"),
+        "long session view must not show Daemon offline banner"
+    );
+    assert!(
+        out.chars().any(is_non_blank_braille),
+        "long session chart must render HR/P(Sleep) Braille points:\n{out}"
+    );
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
+}
+
+#[test]
+fn test_history_selection_clears_stale_detail_and_ignores_out_of_order_detail() {
+    let base_ts = 1_700_000_000_000i64;
+    let s0 = make_history_session(
+        "s-short",
+        "Watch GT5",
+        base_ts + 30_000_000,
+        base_ts + 30_390_000,
+        SessionStatus::Closed,
+        2,
+    );
+    let s1 = make_history_session(
+        "s-long",
+        "Watch GT5",
+        base_ts,
+        base_ts + 29_900_000,
+        SessionStatus::Closed,
+        2,
+    );
+    let s0_detail = make_session_detail(
+        &s0,
+        vec![make_test_epoch(2, base_ts + 30_015_000, 84.0, 0.05, 84.5)],
+    );
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+    app.handle_ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![s0, s1],
+        boundaries: Vec::new(),
+    });
+    app.handle_ipc(IpcEvent::SessionDetailLoaded(Box::new(s0_detail.clone())));
+    assert_eq!(
+        app.selected_session_detail.as_ref().map(|d| &d.session.id),
+        Some(&"s-short".to_string())
+    );
+
+    // Switching to s-long must immediately clear stale s-short detail
+    let cmd = app.handle_event(TuiEvent::Key(key(KeyCode::Char('j'))));
+    assert_eq!(
+        cmd,
+        Some(TuiCommand::SessionGet {
+            id: "s-long".to_string(),
+        })
+    );
+    assert!(
+        app.selected_session_detail.is_none(),
+        "switching sessions must clear stale selected_session_detail"
+    );
+
+    // Out-of-order SessionDetailLoaded for s-short while s-long is selected must be ignored
+    app.handle_ipc(IpcEvent::SessionDetailLoaded(Box::new(s0_detail.clone())));
+    assert!(
+        app.selected_session_detail.is_none(),
+        "stale SessionDetailLoaded for non-selected session must not populate detail"
+    );
+
+    // Render guard: even if selected_session_detail somehow holds a mismatched ID, History must not plot it
+    app.selected_session_detail = Some(s0_detail.clone());
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
+    let out = buffer_to_string(term.backend().buffer());
+    assert!(
+        out.contains("Loading session epoch detail..."),
+        "mismatched detail.session.id must fall back to loading message instead of plotting wrong epochs:\n{out}"
+    );
+    assert!(
+        !out.chars().any(is_non_blank_braille),
+        "mismatched detail must not plot Braille points from another session"
+    );
+
+    // Late SessionDetailLoaded when history_sessions is empty (last session deleted/wiped) must be ignored
+    app.handle_ipc(IpcEvent::SessionsUpdated {
+        sessions: Vec::new(),
+        boundaries: Vec::new(),
+    });
+    app.handle_ipc(IpcEvent::SessionDetailLoaded(Box::new(s0_detail)));
+    assert!(
+        app.selected_session_detail.is_none(),
+        "late SessionDetailLoaded must not resurrect detail when history_sessions is empty"
+    );
+}
+
+#[test]
+fn test_session_closed_with_empty_epochs_preserves_loaded_epochs_for_selected_session() {
+    let base_ts = 1_700_000_000_000i64;
+    let s_active = make_history_session(
+        "s-active",
+        "Watch GT5",
+        base_ts,
+        base_ts + 60_000,
+        SessionStatus::Active,
+        2,
+    );
+    let ep1 = make_test_epoch(1, base_ts + 15_000, 65.0, 0.2, 66.0);
+    let ep2 = make_test_epoch(1, base_ts + 30_000, 62.0, 0.4, 66.0);
+
+    let mut s_closed_summary = make_history_session(
+        "s-active",
+        "Watch GT5",
+        base_ts,
+        base_ts + 60_000,
+        SessionStatus::Closed,
+        2,
+    );
+    s_closed_summary.end_reason = Some(SessionEndReason::SustainedWakefulness);
+    let mut slim_closed_detail = make_session_detail(&s_closed_summary, Vec::new());
+    slim_closed_detail.session.epochs_count = 2;
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+    app.handle_ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![s_active.clone()],
+        boundaries: Vec::new(),
+    });
+    app.handle_ipc(IpcEvent::SessionDetailLoaded(Box::new(
+        make_session_detail(&app.history_sessions[0], vec![ep1.clone(), ep2]),
+    )));
+
+    app.handle_ipc(IpcEvent::SessionClosed(Box::new(
+        slim_closed_detail.clone(),
+    )));
+    let detail = app.selected_session_detail.as_ref().unwrap();
+    assert_eq!(detail.status, SessionStatus::Closed);
+    assert_eq!(
+        detail.epochs.len(),
+        2,
+        "slim SessionClosed must preserve already-loaded epochs on selected session"
+    );
+
+    // Partial or empty epochs on slim SessionClosed (existing < epochs_count) must trigger reload via RefreshSessions -> SessionsUpdated
+    app.selected_session_detail = Some(make_session_detail(&s_active, vec![ep1]));
+    let mut s_closed_3 = slim_closed_detail;
+    s_closed_3.session.epochs_count = 3;
+    let cmd_refresh = app.handle_ipc(IpcEvent::SessionClosed(Box::new(s_closed_3.clone())));
+    assert_eq!(cmd_refresh, Some(TuiCommand::RefreshSessions));
+    assert!(
+        app.selected_session_detail.is_none(),
+        "partial epochs on slim SessionClosed must clear detail so SessionsUpdated reloads all epochs"
+    );
+
+    let mut updated_entry = s_closed_summary;
+    updated_entry.epochs_count = 3;
+    let cmd_get = app.handle_ipc(IpcEvent::SessionsUpdated {
+        sessions: vec![updated_entry],
+        boundaries: Vec::new(),
+    });
+    assert_eq!(
+        cmd_get,
+        Some(TuiCommand::SessionGet {
+            id: "s-active".to_string(),
+        })
+    );
+}

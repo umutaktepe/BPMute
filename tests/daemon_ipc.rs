@@ -1143,3 +1143,287 @@ async fn test_overnight_sleep_crosses_window_end_and_preserves_session_until_wak
 
     daemon.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn large_session_over_1mib_ipc_get_feedback_and_close_never_overflow_frame() {
+    use bpmute::cli::{Cli, execute_cli};
+    use bpmute::config::PowerAction;
+    use bpmute::exit_code::ExitCode;
+    use bpmute::ipc::protocol::MAX_IPC_EPOCHS_PER_FRAME;
+    use bpmute::sleep_engine::{ContactStatus, SessionEndReason, StreamState, StreamStatus};
+    use bpmute::storage::{
+        CloseSessionRequest, LedgerStore, OpenSessionRequest, SessionEpochsPage, SessionFullDetail,
+        db_path_in_data_dir, lock_path_in_data_dir,
+    };
+    use clap::Parser;
+
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let env = MapEnv::new()
+        .with(
+            "XDG_CONFIG_HOME",
+            temp.path().join("cfg").display().to_string(),
+        )
+        .with(
+            "XDG_DATA_HOME",
+            temp.path().join("data").display().to_string(),
+        )
+        .with(
+            "XDG_RUNTIME_DIR",
+            temp.path().join("run").display().to_string(),
+        );
+    let start_utc = Utc.with_ymd_and_hms(2026, 11, 24, 0, 50, 0).unwrap();
+    let base_ts = start_utc.timestamp_millis();
+
+    let epoch_count = 2500u32;
+    let session_id = {
+        let db_path = db_path_in_data_dir(&paths.data_dir);
+        let lock_path = lock_path_in_data_dir(&paths.data_dir);
+        let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &WearableDescriptor {
+                    mac: "AA:BB:CC:DD:EE:99".to_string(),
+                    address_type: "public".to_string(),
+                    alias: Some("Watch GT5".to_string()),
+                    advertised_name: Some("Watch GT5".to_string()),
+                    supports_rr: false,
+                    supports_contact: true,
+                },
+                base_ts,
+            )
+            .unwrap();
+        let sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: base_ts,
+                detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+            })
+            .unwrap();
+
+        for seq in 0..epoch_count {
+            let ts_ms = base_ts + i64::from(seq + 1) * 15_000;
+            let ep = common::tui::make_test_epoch(
+                1,
+                ts_ms,
+                64.0 + (f64::from(seq) * 0.05).sin(),
+                0.5,
+                66.8,
+            );
+            store
+                .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
+                .unwrap();
+        }
+        let end_ts = base_ts + i64::from(epoch_count) * 15_000;
+        let mut summary = common::make_session_summary(1, base_ts, end_ts, false);
+        summary.end_reason = SessionEndReason::SustainedWakefulness;
+        summary.epochs_count = epoch_count as usize;
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                end_ts,
+            )
+            .unwrap();
+        sid
+    };
+
+    let (source, wearable_tx) = common::daemon::TestWearableSource::new();
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.retention.raw_samples_days = bpmute::config::RawSamplesRetention::Disabled;
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(
+        start_utc + chrono::Duration::hours(12),
+    ));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(
+            paths.clone(),
+            loaded,
+            std::sync::Arc::new(env.clone()),
+            clock,
+        )
+        .with_wearable_source(std::sync::Arc::new(source)),
+    )
+    .await
+    .expect("daemon should start");
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+
+    // 1. Direct `session.get` returns bounded leading slice (MAX_IPC_EPOCHS_PER_FRAME)
+    let get_resp = client
+        .request("session.get", json!({ "id": session_id }))
+        .await
+        .expect("session.get on 2500-epoch session must not overflow 1 MiB frame");
+    assert_eq!(get_resp["session"]["id"], session_id);
+    assert_eq!(
+        get_resp["epochs"].as_array().unwrap().len(),
+        MAX_IPC_EPOCHS_PER_FRAME as usize
+    );
+
+    // 2. Direct `session.epochs` pagination, clamping, and limit == 0 validation
+    let page_err = client
+        .request(
+            "session.epochs",
+            json!({ "id": session_id, "limit": 0, "offset": 0 }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(page_err.code(), Some("VALIDATION_ERROR"));
+
+    let clamped_val = client
+        .request(
+            "session.epochs",
+            json!({ "id": session_id, "limit": 99_999, "offset": 500 }),
+        )
+        .await
+        .unwrap();
+    let clamped: SessionEpochsPage = serde_json::from_value(clamped_val).unwrap();
+    assert_eq!(clamped.total_count, u64::from(epoch_count));
+    assert_eq!(clamped.limit, MAX_IPC_EPOCHS_PER_FRAME);
+    assert_eq!(clamped.offset, 500);
+    assert_eq!(clamped.epochs.len(), MAX_IPC_EPOCHS_PER_FRAME as usize);
+
+    // 3. `IpcClient::get_session_full` assembles all 2500 epochs in monotonic order
+    let full = client.get_session_full(&session_id).await.unwrap();
+    assert_eq!(full.epochs.len(), epoch_count as usize);
+    assert!(
+        full.epochs.windows(2).all(|w| w[0].ts_ms < w[1].ts_ms),
+        "paginated epochs must remain strictly ordered by ts_ms"
+    );
+
+    // 4. `bpmute sessions show <id> --json` against live daemon returns all 2500 epochs
+    let cli = Cli::try_parse_from(["bpmute", "sessions", "show", &session_id, "--json"]).unwrap();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = execute_cli(cli, &env, &mut stdout, &mut stderr).await;
+    assert_eq!(
+        exit,
+        ExitCode::Success,
+        "sessions show stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    let cli_detail: SessionFullDetail = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(cli_detail.session.id, session_id);
+    assert_eq!(cli_detail.epochs.len(), epoch_count as usize);
+
+    // 5. `session.set_feedback` on 2500-epoch session returns slim detail without frame overflow
+    let fb_resp = client
+        .request(
+            "session.set_feedback",
+            json!({
+                "session_id": session_id,
+                "verdict": "missed_sleep"
+            }),
+        )
+        .await
+        .expect("session.set_feedback on 2500-epoch session must not overflow 1 MiB frame");
+    assert_eq!(fb_resp["session"]["id"], session_id);
+    assert!(fb_resp["epochs"].as_array().unwrap().is_empty());
+
+    // 6. Subscribed client receives slim `SessionClosed` and `session.end` on a >1900-epoch live session
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", json!({})).await.unwrap();
+    let _ = sub.next_event().await.unwrap(); // Snapshot
+
+    let live_desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:88".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Live Watch".to_string()),
+        advertised_name: Some("Live Watch".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+    let live_start_ms = (start_utc + chrono::Duration::hours(12)).timestamp_millis();
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: live_desc.clone(),
+            state: StreamState {
+                ts_ms: live_start_ms,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+    let started_ev = sub
+        .next_matching_event("SessionStarted", 10)
+        .await
+        .unwrap()
+        .expect("SessionStarted");
+    let live_sid = started_ev.data["session_id"].as_str().unwrap().to_string();
+
+    // Stream 2,000 epochs (30,000 s) in batches while keeping sleep suppressed
+    let feeder_tx = wearable_tx.clone();
+    let feeder_desc = live_desc.clone();
+    let feeder = tokio::spawn(async move {
+        common::daemon::send_synthetic_wave_stream(
+            &feeder_tx,
+            &feeder_desc,
+            common::daemon::SyntheticStreamParams {
+                start_ts_ms: live_start_ms,
+                count_sec: 30_000,
+                base_bpm: 78.0,
+                bpm_amplitude: 2.5,
+                contact: ContactStatus::Contact,
+            },
+        )
+        .await;
+    });
+    feeder.await.unwrap();
+
+    // Transition to SignalLost so `session.end` is allowed
+    let dc_ts = live_start_ms + 30_000 * 1_000;
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: live_desc,
+            state: StreamState {
+                ts_ms: dc_ts,
+                status: StreamStatus::SignalLost,
+            },
+        })
+        .await
+        .unwrap();
+    // Wait until MonitoringContext processes the SignalLost transition before calling `session.end`
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "WearablesUpdated"
+            && ev.data["wearables"]
+                .as_array()
+                .is_some_and(|arr| arr.iter().any(|w| w["status"] == "signal_lost"))
+        {
+            break;
+        }
+    }
+
+    let end_resp = client
+        .request("session.end", json!({}))
+        .await
+        .expect("session.end on 2000-epoch live session must stay under 1 MiB");
+    assert_eq!(end_resp["session"]["id"], live_sid);
+    assert!(end_resp["epochs"].as_array().unwrap().is_empty());
+
+    let closed_ev = sub
+        .next_matching_event("SessionClosed", 5000)
+        .await
+        .unwrap()
+        .expect("subscribed client must receive slim SessionClosed without FrameTooLarge");
+    assert_eq!(closed_ev.data["session"]["session"]["id"], live_sid);
+    assert!(
+        closed_ev.data["session"]["epochs"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let live_full = client.get_session_full(&live_sid).await.unwrap();
+    assert!(
+        live_full.epochs.len() >= 1950,
+        "expected >= 1950 persisted epochs, got {}",
+        live_full.epochs.len()
+    );
+
+    daemon.shutdown().await;
+}

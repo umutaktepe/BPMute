@@ -16,7 +16,7 @@ use crate::ipc::protocol::{
     SessionGetParams, SessionListParams, SetFeedbackParams, SetSeedParams, SnoozeGraceParams,
     WearableConnectParams, WearableListResponse, WearableRenameParams, WearableUnenrollParams,
 };
-use crate::storage::{SessionFullDetail, SessionListPage, StorageStats};
+use crate::storage::{SessionEpochsPage, SessionFullDetail, SessionListPage, StorageStats};
 
 pub(super) async fn execute_command(
     req_tx: &mpsc::Sender<RequestEnvelope>,
@@ -515,15 +515,60 @@ pub(super) async fn refresh_session_detail(
     let params = SessionGetParams { id: id.to_string() };
     let resp = send_typed_request(req_tx, pending, next_id, "session.get", &params).await?;
 
-    if let Some(data) = resp.data
-        && let Ok(detail) = serde_json::from_value::<SessionFullDetail>(data)
-    {
-        let _ = event_tx
-            .send(TuiEvent::ipc(IpcEvent::SessionDetailLoaded(Box::new(
-                detail,
-            ))))
-            .await;
+    let Some(data) = resp.data else {
+        if let Some(err) = resp.error {
+            let _ = event_tx
+                .send(TuiEvent::ipc(IpcEvent::OpCompleted {
+                    op: "session.get".to_string(),
+                    success: false,
+                    message: Some(err.message),
+                }))
+                .await;
+        }
+        return Ok(());
+    };
+    let Ok(mut detail) = serde_json::from_value::<SessionFullDetail>(data) else {
+        return Ok(());
+    };
+
+    let mut paginator = crate::ipc::client::EpochPaginator::new(&detail);
+    while let Some(page_params) = paginator.next_params() {
+        let page_resp =
+            send_typed_request(req_tx, pending, next_id, "session.epochs", &page_params).await?;
+        let page_res: Result<SessionEpochsPage, String> = if !page_resp.ok {
+            Err(page_resp
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "session.epochs failed".to_string()))
+        } else if let Some(page_data) = page_resp.data {
+            serde_json::from_value::<SessionEpochsPage>(page_data)
+                .map_err(|e| format!("invalid session.epochs payload: {e}"))
+        } else {
+            Err("session.epochs returned empty payload".to_string())
+        };
+        let page = match page_res {
+            Ok(page) => page,
+            Err(msg) => {
+                let _ = event_tx
+                    .send(TuiEvent::ipc(IpcEvent::OpCompleted {
+                        op: "session.epochs".to_string(),
+                        success: false,
+                        message: Some(msg),
+                    }))
+                    .await;
+                return Ok(());
+            }
+        };
+        if !paginator.push_page(&mut detail, page) {
+            break;
+        }
     }
+
+    let _ = event_tx
+        .send(TuiEvent::ipc(IpcEvent::SessionDetailLoaded(Box::new(
+            detail,
+        ))))
+        .await;
     Ok(())
 }
 

@@ -182,6 +182,13 @@ impl TuiApp {
     pub(super) fn select_history_session(&mut self, idx: usize) -> Option<TuiCommand> {
         let sid = self.history_sessions.get(idx)?.id.clone();
         self.selected_session_idx = idx;
+        if self
+            .selected_session_detail
+            .as_ref()
+            .is_some_and(|d| d.session.id != sid)
+        {
+            self.selected_session_detail = None;
+        }
         if !self.daemon_connected {
             self.load_session_detail_offline(&sid);
             None

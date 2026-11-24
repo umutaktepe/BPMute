@@ -11,8 +11,10 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use super::framing::{FrameError, read_bounded_line, write_ndjson_line};
 use super::protocol::{
-    MAX_FRAME_BYTES, PROTOCOL_VERSION, PushEventEnvelope, RequestEnvelope, ResponseEnvelope,
+    MAX_FRAME_BYTES, MAX_IPC_EPOCHS_PER_FRAME, PROTOCOL_VERSION, PushEventEnvelope,
+    RequestEnvelope, ResponseEnvelope, SessionEpochsParams, SessionGetParams,
 };
+use crate::storage::{SessionEpochsPage, SessionFullDetail};
 
 /// Errors produced by [`IpcClient`].
 #[derive(Debug, Error)]
@@ -157,5 +159,71 @@ impl IpcClient {
             }
         }
         Ok(None)
+    }
+
+    /// Fetches full [`SessionFullDetail`] including all `Epochs`, transparently paginating
+    /// via `session.epochs` when the session exceeds `MAX_IPC_EPOCHS_PER_FRAME`.
+    pub async fn get_session_full(
+        &mut self,
+        id: &str,
+    ) -> Result<SessionFullDetail, IpcClientError> {
+        let params = serde_json::to_value(SessionGetParams { id: id.to_string() })?;
+        let val = self.request("session.get", params).await?;
+        let mut detail: SessionFullDetail = serde_json::from_value(val)?;
+
+        let mut paginator = EpochPaginator::new(&detail);
+        while let Some(page_params) = paginator.next_params() {
+            let val = serde_json::to_value(page_params)?;
+            let page_val = self.request("session.epochs", val).await?;
+            let page: SessionEpochsPage = serde_json::from_value(page_val)?;
+            if !paginator.push_page(&mut detail, page) {
+                break;
+            }
+        }
+
+        Ok(detail)
+    }
+}
+
+/// Coordinates paginated `session.epochs` fetches after an initial `session.get` response.
+pub(crate) struct EpochPaginator {
+    session_id: String,
+    next_offset: Option<u32>,
+}
+
+impl EpochPaginator {
+    pub(crate) fn new(detail: &SessionFullDetail) -> Self {
+        let next_offset = (detail.epochs.len() >= MAX_IPC_EPOCHS_PER_FRAME as usize)
+            .then_some(detail.epochs.len() as u32);
+        Self {
+            session_id: detail.session.id.clone(),
+            next_offset,
+        }
+    }
+
+    pub(crate) fn next_params(&self) -> Option<SessionEpochsParams> {
+        self.next_offset.map(|offset| SessionEpochsParams {
+            id: self.session_id.clone(),
+            limit: Some(MAX_IPC_EPOCHS_PER_FRAME),
+            offset: Some(offset),
+        })
+    }
+
+    pub(crate) fn push_page(
+        &mut self,
+        detail: &mut SessionFullDetail,
+        page: SessionEpochsPage,
+    ) -> bool {
+        if page.epochs.is_empty() {
+            self.next_offset = None;
+            return false;
+        }
+        detail.epochs.extend(page.epochs);
+        if (detail.epochs.len() as u64) >= page.total_count {
+            self.next_offset = None;
+            return false;
+        }
+        self.next_offset = Some(detail.epochs.len() as u32);
+        true
     }
 }
