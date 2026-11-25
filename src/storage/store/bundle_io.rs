@@ -1,6 +1,6 @@
 //! Portable `Ledger Bundle` export and import (`Merge` / `Replace`) against SQLite `v2`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -17,7 +17,7 @@ use crate::storage::bundle::*;
 use crate::storage::raw_codec::{
     RAW_CHUNK_MAX_SAMPLES, decode_raw_chunk, encode_raw_chunk_with_bounds,
 };
-use crate::storage::schema::{backups_dir_in_data_dir, generate_uuid_v7_with};
+use crate::storage::schema::backups_dir_in_data_dir;
 
 use super::{LedgerStore, recompute_and_persist_in_tx};
 
@@ -100,7 +100,7 @@ impl LedgerStore {
                 .query_map([], |row| {
                     let ts_ms: i64 = row.get(2)?;
                     Ok(SessionEpochBundleRecord {
-                        id: generate_uuid_v7_with(&self.uuid_ctx, ts_ms),
+                        id: None,
                         session_id: row.get(0)?,
                         seq: row.get(1)?,
                         ts_ms,
@@ -159,7 +159,7 @@ impl LedgerStore {
                 let packets = decode_raw_chunk(&blob)?;
                 for pkt in packets {
                     records.push(RawSampleBundleRecord {
-                        id: generate_uuid_v7_with(&self.uuid_ctx, pkt.ts_ms),
+                        id: None,
                         session_id: sid.clone(),
                         seq: next_seq,
                         ts_ms: pkt.ts_ms,
@@ -310,7 +310,8 @@ impl LedgerStore {
                 }
             }
 
-            // Import Wearables
+            // Import Wearables (track MAC+address_type remapping so sessions merge cleanly across machines)
+            let mut wearable_id_remap: HashMap<String, String> = HashMap::new();
             for w in &bundle.wearables {
                 let inserted = tx.execute(
                     "INSERT INTO wearables (
@@ -343,10 +344,22 @@ impl LedgerStore {
                 if inserted > 0 {
                     summary.wearables_imported += 1;
                 }
+                let resolved_id: String = tx.query_row(
+                    "SELECT id FROM wearables WHERE mac = ?1 AND address_type = ?2",
+                    params![w.mac, w.address_type],
+                    |r| r.get(0),
+                )?;
+                if resolved_id != w.id {
+                    wearable_id_remap.insert(w.id.clone(), resolved_id);
+                }
             }
 
             // Import Sessions
             for s in &bundle.sessions {
+                let effective_wearable_id = wearable_id_remap
+                    .get(&s.wearable_id)
+                    .map(String::as_str)
+                    .unwrap_or(s.wearable_id.as_str());
                 let inserted = tx.execute(
                     "INSERT INTO sessions (
                          id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason,
@@ -361,7 +374,7 @@ impl LedgerStore {
                      ON CONFLICT(id) DO NOTHING",
                     params![
                         s.id,
-                        s.wearable_id,
+                        effective_wearable_id,
                         s.status,
                         s.start_ts_ms,
                         s.end_ts_ms,
@@ -451,6 +464,13 @@ impl LedgerStore {
                 }
             }
 
+            let mut touched_session_pks: BTreeSet<i64> = BTreeSet::new();
+            for s in &bundle.sessions {
+                if let Some(&pk) = session_pk_map.get(&s.id) {
+                    touched_session_pks.insert(pk);
+                }
+            }
+
             // Import Epochs
             for ep in &bundle.session_epochs {
                 let session_pk = session_pk_map.get(&ep.session_id).copied().ok_or_else(|| {
@@ -459,6 +479,7 @@ impl LedgerStore {
                         ep.session_id
                     ))
                 })?;
+                touched_session_pks.insert(session_pk);
                 let inserted = tx.execute(
                     "INSERT INTO session_epochs (
                          session_pk, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m,
@@ -498,7 +519,7 @@ impl LedgerStore {
                 }
             }
 
-            // Import Raw Samples (grouped per session and packed into <=15-sample chunks)
+            // Import Raw Samples (grouped per session, deduplicated by seq, and packed into <=15-sample chunks)
             let mut raw_by_session: BTreeMap<&str, Vec<(u32, HrPacket)>> = BTreeMap::new();
             for raw in &bundle.raw_samples {
                 let rr_ms: Vec<f64> = serde_json::from_str(&raw.rr_ms_json)?;
@@ -525,11 +546,28 @@ impl LedgerStore {
                         "bundle raw_samples references unknown session '{session_id}'"
                     ))
                 })?;
+                touched_session_pks.insert(session_pk);
                 samples.sort_by_key(|(seq, _)| *seq);
-                for chunk in samples.chunks(RAW_CHUNK_MAX_SAMPLES) {
-                    let chunk_seq = chunk[0].0;
-                    let pkts: Vec<&HrPacket> = chunk.iter().map(|(_, p)| p).collect();
-                    let encoded = encode_raw_chunk_with_bounds(&pkts)?;
+                samples.dedup_by_key(|(seq, _)| *seq);
+
+                let existing_chunks: Vec<RawChunkSpan> = if mode == ImportMode::Merge {
+                    let mut stmt = tx.prepare_cached(
+                        "SELECT seq, sample_count FROM raw_sample_chunks WHERE session_pk = ?1 ORDER BY seq ASC",
+                    )?;
+                    stmt.query_map(params![session_pk], |r| {
+                        Ok(RawChunkSpan {
+                            seq: r.get(0)?,
+                            sample_count: r.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+                } else {
+                    Vec::new()
+                };
+
+                for (chunk_seq, pkts) in partition_new_raw_chunks(samples, &existing_chunks) {
+                    let pkt_refs: Vec<&HrPacket> = pkts.iter().collect();
+                    let encoded = encode_raw_chunk_with_bounds(&pkt_refs)?;
                     let inserted = tx.execute(
                         "INSERT INTO raw_sample_chunks (
                              session_pk, seq, start_ts_ms, end_ts_ms, sample_count, payload_blob
@@ -545,8 +583,26 @@ impl LedgerStore {
                         ],
                     )?;
                     if inserted > 0 {
-                        summary.raw_samples_imported += pkts.len();
+                        summary.raw_samples_imported += pkt_refs.len();
                     }
+                }
+            }
+
+            if !touched_session_pks.is_empty() {
+                let mut reconcile_stmt = tx.prepare_cached(
+                    "UPDATE sessions
+                     SET epochs_count = MAX(
+                             epochs_count,
+                             (SELECT COUNT(*) FROM session_epochs WHERE session_pk = ?1)
+                         ),
+                         raw_samples_count = MAX(
+                             raw_samples_count,
+                             COALESCE((SELECT SUM(sample_count) FROM raw_sample_chunks WHERE session_pk = ?1), 0)
+                         )
+                     WHERE pk = ?1",
+                )?;
+                for session_pk in touched_session_pks {
+                    reconcile_stmt.execute(params![session_pk])?;
                 }
             }
 
@@ -602,4 +658,53 @@ impl LedgerStore {
 
         Ok((summary, state))
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RawChunkSpan {
+    seq: u32,
+    sample_count: u32,
+}
+
+impl RawChunkSpan {
+    fn contains(self, target_seq: u32) -> bool {
+        target_seq >= self.seq && target_seq < self.seq.saturating_add(self.sample_count)
+    }
+}
+
+/// Filters sorted, deduplicated `(seq, HrPacket)` samples against existing chunk spans and
+/// partitions remaining contiguous runs into `<= RAW_CHUNK_MAX_SAMPLES` chunks.
+fn partition_new_raw_chunks(
+    samples: Vec<(u32, HrPacket)>,
+    existing_chunks: &[RawChunkSpan],
+) -> Vec<(u32, Vec<HrPacket>)> {
+    let mut chunks = Vec::new();
+    let mut cur_seq: Option<u32> = None;
+    let mut prev_seq = 0_u32;
+    let mut cur_pkts: Vec<HrPacket> = Vec::new();
+
+    for (seq, pkt) in samples {
+        if existing_chunks.iter().any(|span| span.contains(seq)) {
+            continue;
+        }
+
+        // Split on seq gaps so every stored chunk covers a contiguous [seq, seq + sample_count) span.
+        let has_seq_gap = cur_seq.is_some() && seq != prev_seq.saturating_add(1);
+        if (cur_pkts.len() >= RAW_CHUNK_MAX_SAMPLES || has_seq_gap)
+            && let Some(start_seq) = cur_seq.take()
+        {
+            chunks.push((start_seq, std::mem::take(&mut cur_pkts)));
+        }
+
+        if cur_seq.is_none() {
+            cur_seq = Some(seq);
+        }
+        prev_seq = seq;
+        cur_pkts.push(pkt);
+    }
+
+    if let Some(start_seq) = cur_seq {
+        chunks.push((start_seq, cur_pkts));
+    }
+    chunks
 }
