@@ -94,7 +94,7 @@ impl LedgerStore {
         // Set auto_vacuum before VACUUM so incremental mode is guaranteed, then truncate WAL
         // so VACUUM's rewritten pages are flushed to the main DB and deleted data cannot linger in -wal.
         vacuum_and_truncate_wal(&self.conn)?;
-        self.flush_wal()?;
+        enforce_private_db_permissions(&self.db_path)?;
         Ok(cal_state)
     }
 

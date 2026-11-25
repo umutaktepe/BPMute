@@ -162,7 +162,7 @@ for path in sorted(glob.glob("src/daemon/state/**/*.rs", recursive=True)):
 for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
     content = open(path, encoding="utf-8").read()
     has_vacuum = bool(re.search(r'\bVACUUM;|PRAGMA\s+incremental_vacuum\b', content))
-    if has_vacuum and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(|write_tx_and_flush\(', content):
+    if has_vacuum and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(|write_tx_and_flush\(|vacuum_and_truncate_wal\(', content):
         sys.exit(
             f"error: {path} runs VACUUM or PRAGMA incremental_vacuum without wal_checkpoint(TRUNCATE) / flush_wal() / write_tx_and_flush()"
         )
@@ -173,10 +173,15 @@ for path in sorted(glob.glob("src/storage/**/*.rs", recursive=True)):
             )
     for fn_block in re.split(r'(?=^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+)', content, flags=re.M)[1:]:
         fn_sig = fn_block.splitlines()[0].strip()
+        if fn_sig.startswith("fn migrate_") and ("VACUUM;" in fn_block or "vacuum_and_truncate_wal(" in fn_block):
+            if not re.search(r'WAL_RUNTIME_PRAGMAS|PRAGMA\s+journal_mode\s*=\s*WAL', fn_block):
+                sys.exit(
+                    f"error: {path} ({fn_sig}) runs VACUUM / vacuum_and_truncate_wal without switching to WAL mode first"
+                )
         if not fn_sig.startswith("pub fn "):
             continue
         needs_flush = bool(re.search(r'\bVACUUM;|PRAGMA\s+incremental_vacuum\b|recompute_and_persist_in_tx\(', fn_block))
-        if needs_flush and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(|write_tx_and_flush\(', fn_block):
+        if needs_flush and not re.search(r'wal_checkpoint\(TRUNCATE\)|flush_wal\(|write_tx_and_flush\(|vacuum_and_truncate_wal\(', fn_block):
             sys.exit(
                 f"error: {path} ({fn_sig}) mutates/recomputes ledger without wal_checkpoint(TRUNCATE) / flush_wal() / write_tx_and_flush()"
             )

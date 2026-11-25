@@ -187,13 +187,16 @@ fn ensure_v1_additive_columns(conn: &Connection) -> Result<(), StorageError> {
 }
 
 fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
+    tracing::debug!("v1 -> v2 migration: enabling WAL runtime pragmas");
     conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
+    tracing::debug!("v1 -> v2 migration: ensuring early v1 additive columns");
     ensure_v1_additive_columns(conn)?;
 
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
     let migration_result: Result<(), StorageError> = (|| {
         let tx = conn.unchecked_transaction()?;
 
+        tracing::debug!("v1 -> v2 migration: renaming legacy v1 tables and creating v2 schema");
         tx.execute_batch(
             "DROP INDEX IF EXISTS idx_sessions_start_ts;
              DROP INDEX IF EXISTS idx_session_epochs_session_ts;
@@ -206,6 +209,7 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
 
         tx.execute_batch(DDL_V2)?;
 
+        tracing::debug!("v1 -> v2 migration: copying sessions, epochs, and feedback");
         tx.execute_batch(
             "INSERT INTO sessions (
                  id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason,
@@ -253,8 +257,10 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
              FROM _v1_session_feedback;",
         )?;
 
+        tracing::debug!("v1 -> v2 migration: packing raw_samples into lossless chunks");
         pack_v1_raw_samples_into_v2_chunks(&tx)?;
 
+        tracing::debug!("v1 -> v2 migration: reconciling counts and dropping legacy tables");
         tx.execute_batch(
             "UPDATE sessions
              SET epochs_count = (SELECT COUNT(*) FROM session_epochs WHERE session_pk = sessions.pk),
@@ -278,6 +284,7 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
     }
 
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    tracing::debug!("v1 -> v2 migration: verifying foreign keys");
     let fk_violation: Option<String> = {
         let mut stmt = conn.prepare("PRAGMA foreign_key_check;")?;
         let mut rows = stmt.query([])?;
@@ -289,6 +296,7 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
         )));
     }
 
+    tracing::debug!("v1 -> v2 migration: running VACUUM and WAL truncation");
     vacuum_and_truncate_wal(conn)?;
     Ok(())
 }

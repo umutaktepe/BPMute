@@ -5,21 +5,7 @@ How the engineering skills should consume this repo's domain documentation when 
 ## Before exploring, read these
 
 - **`GLOSSARY.md`** at the repo root for domain vocabulary.
-- **`docs/adr/`**: read ADRs that touch the area you're about to work in:
-  - `0001-rust-static-musl-direct-zbus-stack.md`
-  - `0002-unix-socket-ndjson-daemon-ipc.md`
-  - `0003-zero-polling-gatt-profile-and-adaptive-bonding.md`
-  - `0004-forward-hmm-sleep-onset-engine.md`
-  - `0005-recomputable-sqlite-calibration-ledger.md`
-  - `0006-layered-idle-probe-and-unprivileged-logind-actions.md`
-  - `0007-deterministic-clock-injected-engine-and-replay-harness.md`
-  - `0008-local-privacy-rolling-retention-and-calibration-boundaries.md`
-  - `0009-declarative-config-semantic-cli-and-biometric-redacted-logging.md`
-  - `0010-render-emitted-tui-hit-map.md`
-  - `0011-grace-period-activity-hold-window.md`
-  - `0012-disconnect-session-closure-and-manual-end.md`
-  - `0013-state-gated-active-hours-passive-standby-and-pre-candidate-baseline.md`
-  To locate an ADR by numeric reference (e.g., `ADR-0013`), match against the index list above or use wildcard pattern `docs/adr/0013-*.md` rather than guessing the descriptive slug.
+- **`docs/adr/`**: list `docs/adr/*.md` and read ADRs touching the area you're about to work in (locate by numeric prefix with `docs/adr/00NN-*.md`, e.g., `docs/adr/0014-*.md` for `ADR-0014`, rather than guessing descriptive slugs).
 - **`docs/research/`**: read only when exact numeric constants, protocol details, or empirical justification are needed:
   - `ble-hrs-bluez-dbus.md`
   - `linux-daemon-actions-stack.md`
