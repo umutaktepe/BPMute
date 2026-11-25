@@ -82,8 +82,23 @@ if grep -REn '^[[:space:]]*(let[[:space:]]+_[[:space:]]*=[[:space:]]*)?(std::)?t
   exit 1
 fi
 
+if grep -En 'Command::new\("dbus-daemon"\)' tests/*.rs; then
+  echo "error: raw Command::new(\"dbus-daemon\") forbidden in tests/*.rs; reuse tests/common/dbus.rs (docs/agents/testing.md)" >&2
+  exit 1
+fi
+
 if grep -En 'let[[:space:]]+_[[:space:]]*=[[:space:]]*(adapter|device|mgr|proxy)\.' src/bluetooth/*.rs; then
   echo "error: silent let _ = on BlueZ D-Bus proxy calls is forbidden in src/bluetooth/; log or propagate errors" >&2
+  exit 1
+fi
+
+if grep -REn 'let[[:space:]]+_[[:space:]]*=[[:space:]]*[[:alnum:]_]*(proxy|conn|manager)\.' src/actions/ src/idle/ || grep -REn 'let[[:space:]]+Ok\([^)]+\)[[:space:]]*=.*(Proxy::|session_bus\(|session_conn\(|receive_).*else[[:space:]]*\{[[:space:]]*return' src/actions/ src/idle/; then
+  echo "error: silent D-Bus error discarding is forbidden in src/actions/ and src/idle/; log or propagate errors" >&2
+  exit 1
+fi
+
+if grep -REn '\.receive_[a-z0-9_]+_changed\(' src/ | grep -Ev '\.receive_(properties|owner)_changed\('; then
+  echo "error: zbus PropertyStream (.receive_*_changed()) is forbidden in src/ due to initial cached-value/coalescing races; subscribe via PropertiesProxy::receive_properties_changed() + CacheProperties::No before reading initial state" >&2
   exit 1
 fi
 
@@ -209,6 +224,40 @@ if find src tests -name '*.rs' -print0 | xargs -0 awk '
   END { exit !found }
 '; then
   echo "error: tokio::time::{sleep,timeout,interval} inside unpaused #[tokio::test]; use #[tokio::test(start_paused = true)] or event-driven awaits (docs/agents/testing.md)" >&2
+  exit 1
+fi
+
+if python3 - <<'PY'
+import glob, re, sys
+
+bad = []
+for path in sorted(glob.glob("tests/**/*.rs", recursive=True)):
+    text = open(path, encoding="utf-8").read()
+    if "multi_thread" not in text:
+        continue
+    in_paused_test = False
+    test_indent = 0
+    for idx, raw in enumerate(text.splitlines(), 1):
+        m = re.match(r"^(\s*)#\[tokio::test", raw)
+        if m:
+            in_paused_test = "start_paused" in raw and "true" in raw
+            test_indent = len(m.group(1))
+        elif in_paused_test and re.match(rf"^ {{{test_indent}}}\}}$", raw):
+            in_paused_test = False
+        elif in_paused_test and "tokio::time::pause()" in raw:
+            in_paused_test = True
+        code = raw.split("//", 1)[0]
+        if not in_paused_test and re.search(r"\btokio::time::sleep\(", code):
+            bad.append(f"{path}:{idx}: {raw.strip()}")
+
+if bad:
+    print("\n".join(bad), file=sys.stderr)
+    sys.exit(1)
+PY
+then
+  :
+else
+  echo "error: real-time tokio::time::sleep(...) in multi_thread test helpers is forbidden; synchronize via watch/oneshot channels (docs/agents/testing.md)" >&2
   exit 1
 fi
 

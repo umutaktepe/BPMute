@@ -151,33 +151,68 @@ impl SystemIdleProbe {
         start: tokio::time::Instant,
         settle_delay: Duration,
     ) {
-        let Ok(conn) = self.session_bus().await else {
-            return;
+        let conn = match self.session_bus().await {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!(error = %err, "MutterIdleMonitor failed to connect to session D-Bus");
+                return;
+            }
         };
-        let Ok(proxy) = MutterIdleMonitorProxy::new(&conn).await else {
-            return;
+        let proxy = match MutterIdleMonitorProxy::new(&conn).await {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to build MutterIdleMonitorProxy");
+                return;
+            }
         };
-        let Ok(mut watch_id) = proxy.add_user_active_watch().await else {
-            return;
+        // Subscribe to WatchFired before adding the watch so immediate activity is never missed.
+        let mut stream = match proxy.receive_watch_fired().await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to subscribe to Mutter WatchFired signal");
+                return;
+            }
         };
-        let Ok(mut stream) = proxy.receive_watch_fired().await else {
-            return;
+        let mut watch_id = match proxy.add_user_active_watch().await {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to register Mutter user-active watch");
+                return;
+            }
         };
         tokio::spawn(async move {
             while let Some(signal) = stream.next().await {
-                if let Ok(fired_id) = signal.args()
-                    && fired_id.id == watch_id
-                {
+                let fired_id = match signal.args() {
+                    Ok(args) => args,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "failed to decode Mutter WatchFired signal");
+                        continue;
+                    }
+                };
+                if fired_id.id == watch_id {
                     if tokio::time::Instant::now().duration_since(start) >= settle_delay {
                         let _ = tx.send(()).await;
-                        let _ = proxy.remove_watch(watch_id).await;
+                        if let Err(err) = proxy.remove_watch(watch_id).await {
+                            tracing::debug!(
+                                watch_id,
+                                error = %err,
+                                "failed to remove fired Mutter watch"
+                            );
+                        }
                         break;
                     } else {
                         tracing::debug!(
                             "Mutter user activity fired within settle delay; re-arming one-shot watch"
                         );
-                        if let Ok(new_id) = proxy.add_user_active_watch().await {
-                            watch_id = new_id;
+                        match proxy.add_user_active_watch().await {
+                            Ok(new_id) => watch_id = new_id,
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "failed to re-arm Mutter user-active watch"
+                                );
+                                break;
+                            }
                         }
                     }
                 }
