@@ -12,9 +12,9 @@ impl LedgerStore {
     pub fn recover_stale_sessions(&mut self, now_ms: i64) -> Result<usize, StorageError> {
         let recovered = self.write_tx(|tx| {
             let mut stmt = tx.prepare(
-                "SELECT id, start_ts_ms, end_ts_ms FROM sessions WHERE status = 'active'",
+                "SELECT pk, start_ts_ms, end_ts_ms FROM sessions WHERE status = 'active'",
             )?;
-            let stale: Vec<(String, i64, i64)> = stmt
+            let stale: Vec<(i64, i64, i64)> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             drop(stmt);
@@ -23,11 +23,11 @@ impl LedgerStore {
                 return Ok(0);
             }
 
-            for (id, start_ts, end_ts) in &stale {
+            for (session_pk, start_ts, end_ts) in &stale {
                 let max_ep_ts: Option<i64> = tx
                     .query_row(
-                        "SELECT MAX(ts_ms) FROM session_epochs WHERE session_id = ?1",
-                        params![id],
+                        "SELECT MAX(ts_ms) FROM session_epochs WHERE session_pk = ?1",
+                        params![session_pk],
                         |r| r.get(0),
                     )
                     .optional()?
@@ -38,8 +38,8 @@ impl LedgerStore {
                      SET status = 'closed',
                          end_ts_ms = ?2,
                          end_reason = COALESCE(end_reason, 'stream_ended')
-                     WHERE id = ?1",
-                    params![id, final_end_ts],
+                     WHERE pk = ?1",
+                    params![session_pk, final_end_ts],
                 )?;
             }
 

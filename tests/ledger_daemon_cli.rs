@@ -595,11 +595,11 @@ async fn live_daemon_respects_raw_samples_opt_out_and_shift_ipc_controls() {
 
     daemon.shutdown().await;
 
-    // Verify raw_samples table has 0 rows on disk
+    // Verify raw_sample_chunks table has 0 rows on disk
     let db_path = db_path_in_data_dir(&paths.data_dir);
     let ro = Connection::open(&db_path).unwrap();
     let raw_count: i64 = ro
-        .query_row("SELECT COUNT(*) FROM raw_samples", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM raw_sample_chunks", [], |r| r.get(0))
         .unwrap();
     assert_eq!(raw_count, 0);
 }

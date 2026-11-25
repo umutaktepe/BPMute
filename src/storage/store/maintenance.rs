@@ -8,7 +8,7 @@ use crate::calibration::{BoundaryReason, CalibrationBoundaryRecord, CalibrationS
 use crate::config::{RawSamplesRetention, RetentionConfig, SessionEpochsRetention};
 use crate::paths::ensure_private_dir;
 use crate::storage::lock::LedgerFileLock;
-use crate::storage::schema::{WAL_RUNTIME_PRAGMAS, enforce_private_db_permissions};
+use crate::storage::schema::{enforce_private_db_permissions, vacuum_and_truncate_wal};
 use crate::storage::{PruneSummary, StorageError, StorageStats};
 
 impl LedgerStore {
@@ -47,32 +47,18 @@ impl LedgerStore {
         Ok(summary)
     }
 
-    /// Purges and zero-overwrites all `raw_samples` for closed sessions and reclaims storage via incremental vacuum.
+    /// Purges and zero-overwrites all `raw_sample_chunks` for closed sessions and reclaims storage via incremental vacuum.
     pub fn purge_raw_samples(&mut self) -> Result<usize, StorageError> {
         let deleted = self.write_tx(|tx| {
-            let mut deleted = 0;
-            loop {
-                let count = tx.execute(
-                    "DELETE FROM raw_samples WHERE rowid IN (
-                        SELECT rowid FROM raw_samples
-                        WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed')
-                        LIMIT 500
-                    )",
-                    [],
-                )?;
-                deleted += count;
-                if count == 0 {
-                    break;
-                }
-            }
-            if deleted > 0 {
+            let deleted_samples = delete_raw_chunks_batched(tx, None)?;
+            if deleted_samples > 0 {
                 tx.execute(
                     "UPDATE sessions SET raw_samples_count = 0
                      WHERE status = 'closed' AND raw_samples_count != 0",
                     [],
                 )?;
             }
-            Ok(deleted)
+            Ok(deleted_samples)
         })?;
         if deleted > 0 {
             self.reclaim_freelist_pages()?;
@@ -88,7 +74,7 @@ impl LedgerStore {
         now_ms: i64,
     ) -> Result<CalibrationState, StorageError> {
         let cal_state = self.write_tx(|tx| {
-            tx.execute("DELETE FROM raw_samples", [])?;
+            tx.execute("DELETE FROM raw_sample_chunks", [])?;
             tx.execute("DELETE FROM session_epochs", [])?;
             tx.execute("DELETE FROM session_feedback", [])?;
             tx.execute("DELETE FROM sessions", [])?;
@@ -107,15 +93,8 @@ impl LedgerStore {
         };
         // Set auto_vacuum before VACUUM so incremental mode is guaranteed, then truncate WAL
         // so VACUUM's rewritten pages are flushed to the main DB and deleted data cannot linger in -wal.
-        self.conn.execute_batch(&format!(
-            "PRAGMA secure_delete = ON;
-             PRAGMA auto_vacuum = INCREMENTAL;
-             VACUUM;
-             {WAL_RUNTIME_PRAGMAS}
-             PRAGMA foreign_keys = ON;
-             PRAGMA wal_checkpoint(TRUNCATE);"
-        ))?;
-        enforce_private_db_permissions(&self.db_path)?;
+        vacuum_and_truncate_wal(&self.conn)?;
+        self.flush_wal()?;
         Ok(cal_state)
     }
 
@@ -167,11 +146,11 @@ impl LedgerStore {
                 .query_row("SELECT COUNT(*) FROM session_epochs", [], |r| {
                     r.get::<_, i64>(0)
                 })? as usize;
-        let raw_samples_count =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM raw_samples", [], |r| {
-                    r.get::<_, i64>(0)
-                })? as usize;
+        let raw_samples_count = self.conn.query_row(
+            "SELECT COALESCE(SUM(sample_count), 0) FROM raw_sample_chunks",
+            [],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
         let session_feedback_count =
             self.conn
                 .query_row("SELECT COUNT(*) FROM session_feedback", [], |r| {
@@ -230,6 +209,40 @@ impl LedgerStore {
     }
 }
 
+fn delete_raw_chunks_batched(
+    tx: &Connection,
+    cutoff_ms: Option<i64>,
+) -> Result<usize, StorageError> {
+    let mut deleted_samples = 0usize;
+    loop {
+        let batch: Vec<(i64, i64, i64)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT c.session_pk, c.seq, c.sample_count
+                 FROM raw_sample_chunks c
+                 JOIN sessions s ON s.pk = c.session_pk
+                 WHERE s.status = 'closed' AND (?1 IS NULL OR c.end_ts_ms < ?1)
+                 LIMIT 500",
+            )?;
+            stmt.query_map(params![cutoff_ms], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        let mut del =
+            tx.prepare_cached("DELETE FROM raw_sample_chunks WHERE session_pk = ?1 AND seq = ?2")?;
+        for (session_pk, seq, sample_count) in batch {
+            let changed = del.execute(params![session_pk, seq])?;
+            if changed > 0 {
+                deleted_samples += sample_count.max(0) as usize;
+            }
+        }
+    }
+    Ok(deleted_samples)
+}
+
 pub(crate) fn prune_retention_in_tx(
     tx: &Connection,
     retention: &RetentionConfig,
@@ -242,21 +255,7 @@ pub(crate) fn prune_retention_in_tx(
         RawSamplesRetention::Disabled => {}
         RawSamplesRetention::Days(days) => {
             let cutoff_ms = now_ms - (days as i64 * 86_400_000);
-            loop {
-                let count = tx.execute(
-                    "DELETE FROM raw_samples WHERE rowid IN (
-                        SELECT rowid FROM raw_samples
-                        WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed')
-                          AND ts_ms < ?1
-                        LIMIT 500
-                    )",
-                    params![cutoff_ms],
-                )?;
-                raw_pruned += count;
-                if count == 0 {
-                    break;
-                }
-            }
+            raw_pruned = delete_raw_chunks_batched(tx, Some(cutoff_ms))?;
         }
         RawSamplesRetention::Unlimited => {}
     }
@@ -265,18 +264,25 @@ pub(crate) fn prune_retention_in_tx(
         SessionEpochsRetention::Days(days) => {
             let cutoff_ms = now_ms - (days as i64 * 86_400_000);
             loop {
-                let count = tx.execute(
-                    "DELETE FROM session_epochs WHERE rowid IN (
-                        SELECT rowid FROM session_epochs
-                        WHERE session_id IN (SELECT id FROM sessions WHERE status = 'closed')
-                          AND ts_ms < ?1
-                        LIMIT 500
-                    )",
-                    params![cutoff_ms],
-                )?;
-                epochs_pruned += count;
-                if count == 0 {
+                let batch: Vec<(i64, i64)> = {
+                    let mut stmt = tx.prepare_cached(
+                        "SELECT e.session_pk, e.seq
+                         FROM session_epochs e
+                         JOIN sessions s ON s.pk = e.session_pk
+                         WHERE s.status = 'closed' AND e.ts_ms < ?1
+                         LIMIT 500",
+                    )?;
+                    stmt.query_map(params![cutoff_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                if batch.is_empty() {
                     break;
+                }
+                let mut del = tx.prepare_cached(
+                    "DELETE FROM session_epochs WHERE session_pk = ?1 AND seq = ?2",
+                )?;
+                for (session_pk, seq) in batch {
+                    epochs_pruned += del.execute(params![session_pk, seq])?;
                 }
             }
         }
@@ -286,8 +292,8 @@ pub(crate) fn prune_retention_in_tx(
     if raw_pruned > 0 || epochs_pruned > 0 {
         tx.execute(
             "UPDATE sessions
-             SET raw_samples_count = (SELECT COUNT(*) FROM raw_samples WHERE session_id = sessions.id),
-                 epochs_count = (SELECT COUNT(*) FROM session_epochs WHERE session_id = sessions.id)
+             SET raw_samples_count = COALESCE((SELECT SUM(sample_count) FROM raw_sample_chunks WHERE session_pk = sessions.pk), 0),
+                 epochs_count = (SELECT COUNT(*) FROM session_epochs WHERE session_pk = sessions.pk)
              WHERE status = 'closed'",
             [],
         )?;

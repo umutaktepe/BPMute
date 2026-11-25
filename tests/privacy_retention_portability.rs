@@ -1236,14 +1236,14 @@ fn test_purge_and_hard_wipe_reclaim_storage_and_truncate_wal() {
                 detection_sensitivity: Sensitivity::Balanced,
             })
             .unwrap();
-        let raw: Vec<(u32, HrPacket)> = (0..200)
+        let raw: Vec<(u32, HrPacket)> = (0..3_000)
             .map(|i| {
                 (
                     i,
                     HrPacket {
                         ts_ms: base + (i as i64) * 1000,
-                        bpm: 65.0,
-                        rr_ms: vec![920.0],
+                        bpm: 60.0 + ((i % 24) as f64) * 0.5,
+                        rr_ms: vec![f64::from(900 + (i % 120) as u16) * 1000.0 / 1024.0],
                         contact_status: ContactStatus::Contact,
                     },
                 )
@@ -1255,18 +1255,18 @@ fn test_purge_and_hard_wipe_reclaim_storage_and_truncate_wal() {
             .close_session_and_recompute(
                 &CloseSessionRequest {
                     session_id: sid,
-                    summary: sample_summary(base, base + 200_000, 56.0),
+                    summary: sample_summary(base, base + 3_000_000, 56.0),
                     trigger_power_action: PowerAction::None,
                     rapid_resume_within_5m: false,
                 },
-                base + 200_000,
+                base + 3_000_000,
             )
             .unwrap();
     }
 
     let size_before_purge = store.get_storage_stats().unwrap().db_size_bytes;
     let purged = store.purge_raw_samples().unwrap();
-    assert_eq!(purged, 400);
+    assert_eq!(purged, 6_000);
     assert_eq!(wal_len(), 0, "purge_raw_samples must truncate WAL");
     let after_purge_stats = store.get_storage_stats().unwrap();
     assert_eq!(after_purge_stats.wal_size_bytes, 0);
@@ -1297,7 +1297,7 @@ fn test_purge_and_hard_wipe_reclaim_storage_and_truncate_wal() {
         "Band",
         4_000_000,
         60.0,
-        300,
+        3_000,
     );
 
     // Repeated hard_wipe calls must reclaim space, truncate WAL, and stay constant in size.
@@ -1369,8 +1369,8 @@ fn seed_wearable_and_closed_session(
                     i,
                     HrPacket {
                         ts_ms: start_ts_ms + i64::from(i) * 1000,
-                        bpm: 62.0,
-                        rr_ms: vec![960.0],
+                        bpm: 58.0 + ((i % 28) as f64) * 0.5,
+                        rr_ms: vec![f64::from(880 + (i % 150) as u16) * 1000.0 / 1024.0],
                         contact_status: ContactStatus::Contact,
                     },
                 )
@@ -1555,7 +1555,7 @@ fn test_sibling_storage_mutations_truncate_wal_and_reclaim_replace_space() {
         "Band2",
         6_000_000,
         66.0,
-        400,
+        3_000,
     );
     let size_with_raw = store.get_storage_stats().unwrap().db_size_bytes;
     store
@@ -1595,15 +1595,15 @@ fn test_delete_session_reclaims_storage_pages_and_shrinks_db() {
         "Band1",
         1_000_000,
         65.0,
-        500,
+        28_800,
     );
     let (_wid2, _sid2) = seed_wearable_and_closed_session(
         &mut store,
         "AA:BB:CC:DD:EE:01",
         "Band1",
-        2_000_000,
+        30_000_000,
         65.0,
-        500,
+        28_800,
     );
 
     let stats_before = store.get_storage_stats().unwrap();
@@ -1820,4 +1820,648 @@ async fn test_manual_close_session_end_reason_persistence_and_bundle_round_trip(
     let detail2 = store2.get_session(&sid).unwrap();
     assert_eq!(detail2.session.end_reason, SessionEndReason::ManualClose);
     assert_eq!(detail2.session.end_ts_ms, 1_060_000);
+}
+
+fn create_populated_v1_database(
+    db_path: &std::path::Path,
+    include_additive_cols: bool,
+    raw_sample_count: usize,
+) -> (Vec<HrPacket>, Vec<Epoch>) {
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    let conn = Connection::open(db_path).unwrap();
+    let address_type_col = if include_additive_cols {
+        "address_type TEXT NOT NULL DEFAULT 'public',"
+    } else {
+        ""
+    };
+    let address_type_unique = if include_additive_cols {
+        ", UNIQUE (mac, address_type)"
+    } else {
+        ""
+    };
+    let pre_candidate_cols = if include_additive_cols {
+        "pre_candidate_mu_hr REAL,
+         pre_candidate_sigma_hr REAL,
+         pre_candidate_ln_rmssd REAL,"
+    } else {
+        ""
+    };
+
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA user_version = 1;
+         CREATE TABLE wearables (
+             id TEXT PRIMARY KEY,
+             mac TEXT NOT NULL,
+             {address_type_col}
+             alias TEXT,
+             advertised_name TEXT,
+             supports_rr INTEGER NOT NULL DEFAULT 0,
+             supports_contact INTEGER NOT NULL DEFAULT 0,
+             hr_var_floor REAL NOT NULL DEFAULT 0.25,
+             typical_sqi REAL,
+             enrolled_at_ms INTEGER NOT NULL,
+             last_seen_at_ms INTEGER NOT NULL,
+             active INTEGER NOT NULL DEFAULT 1
+             {address_type_unique}
+         );
+         CREATE TABLE sessions (
+             id TEXT PRIMARY KEY,
+             wearable_id TEXT NOT NULL REFERENCES wearables(id),
+             status TEXT NOT NULL CHECK (status IN ('active', 'closed')),
+             start_ts_ms INTEGER NOT NULL,
+             end_ts_ms INTEGER NOT NULL,
+             end_reason TEXT,
+             detection_sensitivity TEXT NOT NULL,
+             had_rr INTEGER NOT NULL DEFAULT 0,
+             warmup_mu_hr REAL,
+             warmup_sigma_hr REAL,
+             warmup_ln_rmssd REAL,
+             {pre_candidate_cols}
+             onset_candidate_ts_ms INTEGER,
+             onset_confirmed_ts_ms INTEGER,
+             sleeping_ts_ms INTEGER,
+             sleep_mu_hr REAL,
+             onset_hr_bpm REAL,
+             delta_hr_onset REAL,
+             sleep_ln_rmssd REAL,
+             sleep_hr_var_ratio REAL,
+             typical_sqi REAL,
+             post_trigger_sleep_sec INTEGER NOT NULL DEFAULT 0,
+             trigger_power_action TEXT NOT NULL DEFAULT 'none',
+             rapid_resume_within_5m INTEGER NOT NULL DEFAULT 0,
+             grace_cancel_count INTEGER NOT NULL DEFAULT 0,
+             rapid_wake_fp_count INTEGER NOT NULL DEFAULT 0,
+             snooze_count INTEGER NOT NULL DEFAULT 0,
+             auto_anomalous INTEGER NOT NULL DEFAULT 0,
+             epochs_count INTEGER NOT NULL DEFAULT 0,
+             raw_samples_count INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX idx_sessions_start_ts ON sessions(start_ts_ms DESC, id DESC);
+         CREATE TABLE session_epochs (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             seq INTEGER NOT NULL,
+             ts_ms INTEGER NOT NULL,
+             hr_bpm_60s REAL NOT NULL,
+             z_hr REAL NOT NULL,
+             hr_slope_4m REAL NOT NULL,
+             r_var_120s REAL NOT NULL,
+             ln_rmssd_60s REAL,
+             delta_ln_rmssd_60s REAL,
+             rmssd_sdnn_120s REAL,
+             hrv_valid INTEGER NOT NULL,
+             rr_artifact_frac REAL NOT NULL,
+             coverage REAL NOT NULL,
+             flatline_stale INTEGER NOT NULL,
+             accumulators_frozen INTEGER NOT NULL,
+             baseline_mu_hr REAL NOT NULL,
+             baseline_sigma_hr REAL NOT NULL,
+             baseline_frozen INTEGER NOT NULL,
+             p_active_wake REAL NOT NULL,
+             p_quiet_wake REAL NOT NULL,
+             p_sleep REAL NOT NULL,
+             state TEXT NOT NULL,
+             UNIQUE(session_id, seq)
+         );
+         CREATE INDEX idx_session_epochs_session_ts ON session_epochs(session_id, ts_ms);
+         CREATE TABLE raw_samples (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+             seq INTEGER NOT NULL,
+             ts_ms INTEGER NOT NULL,
+             bpm REAL NOT NULL,
+             rr_ms_json TEXT NOT NULL,
+             contact_status TEXT NOT NULL,
+             UNIQUE(session_id, seq)
+         );
+         CREATE INDEX idx_raw_samples_session_ts ON raw_samples(session_id, ts_ms);
+         CREATE TABLE session_feedback (
+             id TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
+             verdict TEXT,
+             manual_onset_ts_ms INTEGER,
+             manual_avg_sleep_hr REAL,
+             notes TEXT,
+             updated_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE calibration_boundaries (
+             id TEXT PRIMARY KEY,
+             effective_ts_ms INTEGER NOT NULL,
+             reason TEXT NOT NULL,
+             seed_sleep_hr REAL,
+             reset_floors INTEGER NOT NULL DEFAULT 0,
+             created_at_ms INTEGER NOT NULL,
+             reverted_at_ms INTEGER
+         );
+         CREATE TABLE calibration_meta (
+             singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+             day1_seed_sleep_hr REAL,
+             day1_seed_updated_at_ms INTEGER,
+             dismissed_shift_anchor_ts_ms INTEGER,
+             dismissed_shift_direction TEXT
+         );
+         CREATE TABLE calibration_state (
+             singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+             algorithm_version INTEGER NOT NULL,
+             computed_at_ms INTEGER NOT NULL,
+             state_json TEXT NOT NULL
+         );"
+    ))
+    .unwrap();
+
+    let wid = "01930000-0000-7000-8000-000000000001";
+    conn.execute(
+        "INSERT INTO wearables (id, mac, alias, advertised_name, supports_rr, supports_contact, hr_var_floor, typical_sqi, enrolled_at_ms, last_seen_at_ms, active)
+         VALUES (?1, 'AA:BB:CC:DD:EE:99', 'V1Wearable', 'Polar H10', 1, 1, 0.22, 0.96, 1700000000000, 1700200000000, 1)",
+        rusqlite::params![wid],
+    )
+    .unwrap();
+
+    let base_ts = 1_700_100_000_000_i64;
+    let mut expected_epochs = Vec::new();
+    let mut expected_packets = Vec::with_capacity(raw_sample_count);
+
+    // Insert 4 closed sessions after an earlier boundary so Calibration Maturity reaches Learning.
+    conn.execute(
+        "INSERT INTO calibration_boundaries (id, effective_ts_ms, reason, seed_sleep_hr, reset_floors, created_at_ms, reverted_at_ms)
+         VALUES ('01930000-0000-7000-8000-00000000b001', ?1, 'manual_rebaseline', 55.0, 0, ?1, NULL)",
+        rusqlite::params![base_ts - 10_000],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO calibration_meta (singleton_id, day1_seed_sleep_hr, day1_seed_updated_at_ms)
+         VALUES (1, 55.0, ?1)",
+        rusqlite::params![base_ts - 10_000],
+    )
+    .unwrap();
+
+    let epoch_count = (raw_sample_count / 15).max(2);
+    for s_idx in 0..4_i64 {
+        let sid = format!("01930000-0000-7000-8000-00000000010{s_idx}");
+        let start = base_ts + s_idx * 10_000_000;
+        let end = start + (raw_sample_count as i64).max(30) * 1000;
+        let s_epochs = if s_idx == 0 { epoch_count } else { 1 };
+        let s_raw = if s_idx == 0 { raw_sample_count } else { 0 };
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason, detection_sensitivity,
+                 had_rr, warmup_mu_hr, warmup_sigma_hr, warmup_ln_rmssd, onset_candidate_ts_ms,
+                 onset_confirmed_ts_ms, sleeping_ts_ms, sleep_mu_hr, onset_hr_bpm, delta_hr_onset,
+                 sleep_ln_rmssd, sleep_hr_var_ratio, typical_sqi, post_trigger_sleep_sec,
+                 trigger_power_action, epochs_count, raw_samples_count
+             ) VALUES (?1, ?2, 'closed', ?3, ?4, 'stream_ended', 'balanced', 1, 66.0, 2.2, 3.4, ?5, ?6, ?7, 56.0, 58.0, -8.0, 3.7, 0.45, 0.95, 1800, 'suspend', ?8, ?9)",
+            rusqlite::params![
+                sid,
+                wid,
+                start,
+                end,
+                start + 60_000,
+                start + 120_000,
+                start + 180_000,
+                s_epochs as i64,
+                s_raw as i64,
+            ],
+        )
+        .unwrap();
+
+        if s_idx == 0 {
+            conn.execute(
+                "INSERT INTO session_feedback (id, session_id, verdict, manual_onset_ts_ms, manual_avg_sleep_hr, notes, updated_at_ms)
+                 VALUES ('01930000-0000-7000-8000-00000000f001', ?1, 'confirmed', ?2, 56.5, 'v1 note', ?3)",
+                rusqlite::params![sid, start + 115_000, end],
+            )
+            .unwrap();
+
+            let tx = conn.unchecked_transaction().unwrap();
+            for seq in 0..epoch_count {
+                let ts = start + (seq as i64 + 1) * 15_000;
+                let ep = sample_epoch(
+                    ts,
+                    60.0 + (seq % 7) as f64 * 0.5,
+                    0.85,
+                    DetectorState::Sleeping,
+                );
+                expected_epochs.push(ep.clone());
+                let ep_id = format!("01930000-0000-7000-8001-{seq:012}");
+                tx.execute(
+                    "INSERT INTO session_epochs (
+                         id, session_id, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
+                         ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
+                         rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
+                         baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
+                         p_active_wake, p_quiet_wake, p_sleep, state
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                    rusqlite::params![
+                        ep_id,
+                        sid,
+                        seq as i64,
+                        ep.ts_ms,
+                        ep.features.hr_bpm_60s,
+                        ep.features.z_hr,
+                        ep.features.hr_slope_4m,
+                        ep.features.r_var_120s,
+                        ep.features.ln_rmssd_60s,
+                        ep.features.delta_ln_rmssd_60s,
+                        ep.features.rmssd_sdnn_120s,
+                        i32::from(ep.hrv_valid),
+                        ep.rr_artifact_frac,
+                        ep.coverage,
+                        i32::from(ep.flatline_stale),
+                        i32::from(ep.accumulators_frozen),
+                        ep.baseline_mu_hr,
+                        ep.baseline_sigma_hr,
+                        i32::from(ep.baseline_frozen),
+                        ep.p_active_wake,
+                        ep.p_quiet_wake,
+                        ep.p_sleep,
+                        ep.state.as_str(),
+                    ],
+                )
+                .unwrap();
+            }
+            for seq in 0..raw_sample_count {
+                let ts = start + (seq as i64) * 1000;
+                let (bpm, rr_ms, contact) = match seq % 5 {
+                    0 => (60.0 + (seq % 15) as f64, vec![], ContactStatus::Unsupported),
+                    1 => (
+                        62.5,
+                        vec![f64::from(940 + (seq % 60) as u16) * 1000.0 / 1024.0],
+                        ContactStatus::Contact,
+                    ),
+                    2 => (63.375, vec![915.25, 922.75], ContactStatus::NoContact),
+                    3 => (61.0, vec![980.0, 990.0], ContactStatus::Contact),
+                    _ => (
+                        59.5,
+                        vec![f64::from(960 + (seq % 40) as u16) * 1000.0 / 1024.0],
+                        ContactStatus::Contact,
+                    ),
+                };
+                let pkt = HrPacket {
+                    ts_ms: ts,
+                    bpm,
+                    rr_ms: rr_ms.clone(),
+                    contact_status: contact,
+                };
+                expected_packets.push(pkt);
+                let raw_id = format!("01930000-0000-7000-8002-{seq:012}");
+                let rr_json = serde_json::to_string(&rr_ms).unwrap();
+                tx.execute(
+                    "INSERT INTO raw_samples (id, session_id, seq, ts_ms, bpm, rr_ms_json, contact_status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![raw_id, sid, seq as i64, ts, bpm, rr_json, contact.as_str()],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        } else {
+            let ep = sample_epoch(start + 15_000, 56.0, 0.9, DetectorState::Sleeping);
+            let ep_id = format!("01930000-0000-7000-8003-{s_idx:012}");
+            conn.execute(
+                "INSERT INTO session_epochs (
+                     id, session_id, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
+                     ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
+                     rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
+                     baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
+                     p_active_wake, p_quiet_wake, p_sleep, state
+                 ) VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                rusqlite::params![
+                    ep_id,
+                    sid,
+                    ep.ts_ms,
+                    ep.features.hr_bpm_60s,
+                    ep.features.z_hr,
+                    ep.features.hr_slope_4m,
+                    ep.features.r_var_120s,
+                    ep.features.ln_rmssd_60s,
+                    ep.features.delta_ln_rmssd_60s,
+                    ep.features.rmssd_sdnn_120s,
+                    i32::from(ep.hrv_valid),
+                    ep.rr_artifact_frac,
+                    ep.coverage,
+                    i32::from(ep.flatline_stale),
+                    i32::from(ep.accumulators_frozen),
+                    ep.baseline_mu_hr,
+                    ep.baseline_sigma_hr,
+                    i32::from(ep.baseline_frozen),
+                    ep.p_active_wake,
+                    ep.p_quiet_wake,
+                    ep.p_sleep,
+                    ep.state.as_str(),
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    (expected_packets, expected_epochs)
+}
+
+#[test]
+fn test_v1_to_v2_migration_backs_up_losslessly_and_reclaims_space() {
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    // Build an early v1 DB (missing additive address_type and pre_candidate_* columns) with 2,500 samples.
+    let (expected_packets, expected_epochs) = create_populated_v1_database(&db_path, false, 2_500);
+    let v1_size_bytes = fs::metadata(&db_path).unwrap().len();
+
+    let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+
+    // 1) Pre-migration 0600 backup created in backups/ and remains v1.
+    let backups_dir = backups_dir_in_data_dir(&paths.data_dir);
+    let backups: Vec<_> = fs::read_dir(&backups_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(backups.len(), 1);
+    let bkp_path = backups[0].path();
+    let bkp_name = bkp_path.file_name().unwrap().to_string_lossy();
+    assert!(bkp_name.starts_with("bpmute_backup_pre_migration_v1_"));
+    assert_eq!(
+        backups[0].metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let bkp_conn = Connection::open(&bkp_path).unwrap();
+    let bkp_ver: i32 = bkp_conn
+        .query_row("PRAGMA user_version;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(bkp_ver, 1);
+
+    // 2) Migrated DB is v2, WAL truncated (0 bytes), freelist == 0, and substantially smaller.
+    let stats = store.get_storage_stats().unwrap();
+    assert_eq!(stats.wal_size_bytes, 0);
+    assert_eq!(stats.sessions_count, 4);
+    assert_eq!(stats.session_epochs_count, expected_epochs.len() + 3);
+    assert_eq!(stats.raw_samples_count, expected_packets.len());
+    assert_eq!(stats.calibration_maturity, CalibrationMaturity::Learning);
+    assert!(
+        stats.db_size_bytes < v1_size_bytes / 3,
+        "v2 DB should shrink substantially vs v1: v1={v1_size_bytes}, v2={}",
+        stats.db_size_bytes
+    );
+
+    let ro_conn = Connection::open(&db_path).unwrap();
+    let user_version: i32 = ro_conn
+        .query_row("PRAGMA user_version;", [], |r| r.get(0))
+        .unwrap();
+    let freelist_count: i64 = ro_conn
+        .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
+        .unwrap();
+    let auto_vacuum: i64 = ro_conn
+        .query_row("PRAGMA auto_vacuum;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(user_version, 2);
+    assert_eq!(freelist_count, 0);
+    assert_eq!(auto_vacuum, 2);
+
+    // Legacy v1 table and secondary index names must be gone.
+    let raw_samples_exists: i64 = ro_conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('raw_samples', 'idx_raw_samples_session_ts', 'idx_session_epochs_session_ts')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw_samples_exists, 0);
+
+    // 3) Lossless replay + detail + feedback + calibration verification.
+    let sid0 = "01930000-0000-7000-8000-000000000100";
+    let detail = store.get_session(sid0).unwrap();
+    assert!(detail.has_raw_samples);
+    assert_eq!(
+        detail.session.raw_samples_count as usize,
+        expected_packets.len()
+    );
+    assert_eq!(detail.session.epochs_count as usize, expected_epochs.len());
+    assert_eq!(
+        detail.feedback.as_ref().unwrap().notes.as_deref(),
+        Some("v1 note")
+    );
+    assert_eq!(detail.epochs.len(), expected_epochs.len());
+
+    let replay = store.load_session_for_replay(sid0).unwrap();
+    assert_eq!(replay.raw_samples.len(), expected_packets.len());
+    for (orig, migrated) in expected_packets.iter().zip(replay.raw_samples.iter()) {
+        assert_eq!(migrated.ts_ms, orig.ts_ms);
+        assert_eq!(migrated.bpm.to_bits(), orig.bpm.to_bits());
+        assert_eq!(migrated.contact_status, orig.contact_status);
+        assert_eq!(migrated.rr_ms.len(), orig.rr_ms.len());
+        for (r0, r1) in orig.rr_ms.iter().zip(migrated.rr_ms.iter()) {
+            assert_eq!(r1.to_bits(), r0.to_bits());
+        }
+    }
+
+    let cal = store.recompute_from_scratch().unwrap();
+    assert_eq!(cal.maturity, CalibrationMaturity::Learning);
+    assert_eq!(cal.valid_sessions, 4);
+}
+
+#[tokio::test]
+async fn test_read_only_open_rejects_unmigrated_v1_without_mutating_disk() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+
+    create_populated_v1_database(&db_path, true, 30);
+    let before_bytes = fs::read(&db_path).unwrap();
+
+    let err = match LedgerStore::open_read_only(&db_path) {
+        Ok(_) => panic!("opening unmigrated v1 DB read-only must fail"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("requires migration") && msg.contains("v2"),
+        "unexpected error message: {msg}"
+    );
+
+    let (code, _, cli_err) = run_inproc_cli(&["bpmute", "data", "stats", "--json"], &env).await;
+    assert_ne!(code, ExitCode::Success);
+    assert!(
+        cli_err.contains("requires migration"),
+        "CLI stderr should surface actionable migration message: {cli_err}"
+    );
+
+    // Must not create backups/ or mutate the v1 database file on disk.
+    assert!(
+        !backups_dir_in_data_dir(&paths.data_dir)
+            .try_exists()
+            .unwrap()
+    );
+    assert_eq!(fs::read(&db_path).unwrap(), before_bytes);
+}
+
+#[test]
+fn test_raw_chunk_remainder_flush_lossless_export_and_end_ts_retention_boundary() {
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let base_ts = 1_700_000_000_000_i64;
+    let wid = store
+        .upsert_wearable(
+            &WearableDescriptor {
+                mac: "AA:11:22:33:44:55".to_string(),
+                address_type: "public".to_string(),
+                alias: Some("ChunkWearable".to_string()),
+                advertised_name: None,
+                supports_rr: true,
+                supports_contact: true,
+            },
+            base_ts,
+        )
+        .unwrap();
+    let sid = store
+        .open_session(&OpenSessionRequest {
+            wearable_id: wid,
+            start_ts_ms: base_ts,
+            detection_sensitivity: Sensitivity::Balanced,
+        })
+        .unwrap();
+
+    // 15 packets in first Epoch flush + 5 trailing packets at session end (20 total).
+    let packets: Vec<(u32, HrPacket)> = (0..20_u32)
+        .map(|i| {
+            let contact = match i % 3 {
+                0 => ContactStatus::Unsupported,
+                1 => ContactStatus::NoContact,
+                _ => ContactStatus::Contact,
+            };
+            let bpm = match i % 4 {
+                0 => 62.0,
+                1 => 62.5,
+                2 => 61.375,
+                _ => 60.0 + f64::from(i) * 0.25,
+            };
+            let rr_ms = match i % 4 {
+                0 => vec![],
+                1 => vec![f64::from(980_u16 + i as u16) * 1000.0 / 1024.0],
+                2 => vec![950.0, 965.0],
+                _ => vec![931.125, 940.5],
+            };
+            (
+                i,
+                HrPacket {
+                    ts_ms: base_ts + i64::from(i) * 1000,
+                    bpm,
+                    rr_ms,
+                    contact_status: contact,
+                },
+            )
+        })
+        .collect();
+
+    let first_batch: Vec<(u32, &HrPacket)> = packets[..15].iter().map(|(s, p)| (*s, p)).collect();
+    let ep = sample_epoch(base_ts + 15_000, 62.0, 0.4, DetectorState::Monitoring);
+    store
+        .append_epoch_and_raw(&sid, Some((0, &ep)), &first_batch)
+        .unwrap();
+
+    let remainder_batch: Vec<(u32, &HrPacket)> =
+        packets[15..].iter().map(|(s, p)| (*s, p)).collect();
+    store
+        .append_epoch_and_raw(&sid, None, &remainder_batch)
+        .unwrap();
+
+    store
+        .close_session_and_recompute(
+            &CloseSessionRequest {
+                session_id: sid.clone(),
+                summary: sample_summary(base_ts, base_ts + 25_000, 58.0),
+                trigger_power_action: PowerAction::None,
+                rapid_resume_within_5m: false,
+            },
+            base_ts + 25_000,
+        )
+        .unwrap();
+
+    // Lossless replay + JSONL trace export verification.
+    let replay = store.load_session_for_replay(&sid).unwrap();
+    assert_eq!(replay.raw_samples.len(), 20);
+    for ((_, orig), loaded) in packets.iter().zip(replay.raw_samples.iter()) {
+        assert_eq!(loaded.ts_ms, orig.ts_ms);
+        assert_eq!(loaded.bpm.to_bits(), orig.bpm.to_bits());
+        assert_eq!(loaded.contact_status, orig.contact_status);
+        assert_eq!(loaded.rr_ms.len(), orig.rr_ms.len());
+        for (r0, r1) in orig.rr_ms.iter().zip(loaded.rr_ms.iter()) {
+            assert_eq!(r1.to_bits(), r0.to_bits());
+        }
+    }
+
+    let jsonl_path = temp.path().join("trace.jsonl");
+    let exported = store
+        .export_trace(&sid, &jsonl_path, bpmute::replay::TraceFormat::Jsonl, false)
+        .unwrap();
+    assert_eq!(exported, 20);
+
+    // Retention boundary test: cutoff falls inside chunk 1 (start_ts_ms = +15s, end_ts_ms = +19s).
+    // Chunk 0 (end_ts_ms = +14s < +17s) is pruned; Chunk 1 (end_ts_ms = +19s >= +17s) MUST stay!
+    store.set_retention_config(RetentionConfig {
+        raw_samples_days: RawSamplesRetention::Days(1),
+        session_epochs_days: SessionEpochsRetention::Unlimited,
+    });
+    let day_ms = 86_400_000_i64;
+    let prune1 = store.prune_retention(base_ts + 17_000 + day_ms).unwrap();
+    assert_eq!(prune1.raw_samples_pruned, 15);
+    assert_eq!(store.get_storage_stats().unwrap().raw_samples_count, 5);
+    assert_eq!(
+        store.get_session(&sid).unwrap().session.raw_samples_count,
+        5
+    );
+    assert!(store.get_session(&sid).unwrap().has_raw_samples);
+
+    // Once cutoff passes chunk 1's end_ts_ms (+19s), the remainder chunk is pruned cleanly.
+    let prune2 = store.prune_retention(base_ts + 20_000 + day_ms).unwrap();
+    assert_eq!(prune2.raw_samples_pruned, 5);
+    assert_eq!(store.get_storage_stats().unwrap().raw_samples_count, 0);
+    assert_eq!(
+        store.get_session(&sid).unwrap().session.raw_samples_count,
+        0
+    );
+    assert!(!store.get_session(&sid).unwrap().has_raw_samples);
+}
+
+#[test]
+fn test_without_rowid_cascades_on_wearable_delete_with_zero_freelist() {
+    let temp = TempDir::new().unwrap();
+    let (paths, _env) = test_paths_and_env(&temp);
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+
+    let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+    let (wid, _sid) = seed_wearable_and_closed_session(
+        &mut store,
+        "AA:BB:CC:DD:EE:77",
+        "CascadeWearable",
+        1_700_000_000_000,
+        64.0,
+        1_000,
+    );
+    assert_eq!(store.get_storage_stats().unwrap().raw_samples_count, 1_000);
+
+    let (_un, cal) = store
+        .unenroll_wearable(&wid, true, 1_700_001_000_000)
+        .unwrap();
+    assert!(cal.is_some());
+
+    let stats = store.get_storage_stats().unwrap();
+    assert_eq!(stats.sessions_count, 0);
+    assert_eq!(stats.session_epochs_count, 0);
+    assert_eq!(stats.raw_samples_count, 0);
+    assert_eq!(stats.wal_size_bytes, 0);
+
+    let ro_conn = Connection::open(&db_path).unwrap();
+    let freelist_count: i64 = ro_conn
+        .query_row("PRAGMA freelist_count;", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(freelist_count, 0);
 }

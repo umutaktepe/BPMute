@@ -8,8 +8,9 @@ use crate::calibration::{
 };
 use crate::config::{ClockTime, PatchField, PowerAction, Sensitivity};
 use crate::logging::mask_mac;
-use crate::sleep_engine::{
-    ContactStatus, DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason,
+use crate::sleep_engine::{DetectorState, Epoch, EpochFeatures, HrPacket, SessionEndReason};
+use crate::storage::raw_codec::{
+    RAW_CHUNK_MAX_SAMPLES, decode_raw_chunk, encode_raw_chunk_with_bounds,
 };
 use crate::storage::schema::generate_uuid_v7_with;
 use crate::storage::{
@@ -67,44 +68,37 @@ impl LedgerStore {
             return Ok(());
         }
 
-        let ep_id = epoch.map(|(_, ep)| generate_uuid_v7_with(&self.uuid_ctx, ep.ts_ms));
-        let raw_ids: Vec<String> = raw_samples
-            .iter()
-            .map(|(_, pkt)| generate_uuid_v7_with(&self.uuid_ctx, pkt.ts_ms))
-            .collect();
-
         self.write_tx(|tx| {
-            let status: Option<String> = tx
+            let session_pk: Option<i64> = tx
                 .query_row(
-                    "SELECT status FROM sessions WHERE id = ?1",
+                    "SELECT pk FROM sessions WHERE id = ?1",
                     params![session_id],
                     |r| r.get(0),
                 )
                 .optional()?;
-            if status.is_none() {
+            let Some(session_pk) = session_pk else {
                 return Err(StorageError::NotFound(format!(
                     "session '{session_id}' not found"
                 )));
-            }
+            };
 
-            if let (Some((seq, ep)), Some(ep_id)) = (epoch, ep_id) {
+            if let Some((seq, ep)) = epoch {
                 let inserted = tx.execute(
                     "INSERT OR IGNORE INTO session_epochs (
-                         id, session_id, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
+                         session_pk, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
                          ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
                          rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
                          baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
                          p_active_wake, p_quiet_wake, p_sleep, state
                      ) VALUES (
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                         ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16,
-                         ?17, ?18, ?19,
-                         ?20, ?21, ?22, ?23
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                         ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18,
+                         ?19, ?20, ?21, ?22
                      )",
                     params![
-                        ep_id,
-                        session_id,
+                        session_pk,
                         seq,
                         ep.ts_ms,
                         ep.features.hr_bpm_60s,
@@ -134,9 +128,9 @@ impl LedgerStore {
                          SET epochs_count = epochs_count + 1,
                              end_ts_ms = MAX(end_ts_ms, ?2),
                              had_rr = had_rr OR ?3
-                         WHERE id = ?1",
+                         WHERE pk = ?1",
                         params![
-                            session_id,
+                            session_pk,
                             ep.ts_ms,
                             i32::from(ep.hrv_valid || ep.features.ln_rmssd_60s.is_some())
                         ],
@@ -146,28 +140,29 @@ impl LedgerStore {
 
             if !raw_samples.is_empty() {
                 let mut raw_stmt = tx.prepare(
-                    "INSERT OR IGNORE INTO raw_samples (
-                         id, session_id, seq, ts_ms, bpm, rr_ms_json, contact_status
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "INSERT OR IGNORE INTO raw_sample_chunks (
+                         session_pk, seq, start_ts_ms, end_ts_ms, sample_count, payload_blob
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
                 let mut inserted_count = 0_u32;
                 let mut max_raw_ts = i64::MIN;
                 let mut saw_rr = false;
-                for ((seq, pkt), raw_id) in raw_samples.iter().zip(raw_ids.iter()) {
-                    let rr_json = serde_json::to_string(&pkt.rr_ms)?;
+                for chunk in raw_samples.chunks(RAW_CHUNK_MAX_SAMPLES) {
+                    let chunk_seq = chunk[0].0;
+                    let pkts: Vec<&HrPacket> = chunk.iter().map(|(_, p)| *p).collect();
+                    let encoded = encode_raw_chunk_with_bounds(&pkts)?;
                     let inserted = raw_stmt.execute(params![
-                        raw_id,
-                        session_id,
-                        seq,
-                        pkt.ts_ms,
-                        pkt.bpm,
-                        rr_json,
-                        pkt.contact_status.as_str(),
+                        session_pk,
+                        chunk_seq,
+                        encoded.start_ts_ms,
+                        encoded.end_ts_ms,
+                        encoded.sample_count,
+                        encoded.payload_blob,
                     ])?;
                     if inserted > 0 {
-                        inserted_count += 1;
-                        max_raw_ts = max_raw_ts.max(pkt.ts_ms);
-                        saw_rr |= !pkt.rr_ms.is_empty();
+                        inserted_count += encoded.sample_count;
+                        max_raw_ts = max_raw_ts.max(encoded.end_ts_ms);
+                        saw_rr |= pkts.iter().any(|p| !p.rr_ms.is_empty());
                     }
                 }
                 drop(raw_stmt);
@@ -178,8 +173,8 @@ impl LedgerStore {
                          SET raw_samples_count = raw_samples_count + ?2,
                              end_ts_ms = MAX(end_ts_ms, ?3),
                              had_rr = had_rr OR ?4
-                         WHERE id = ?1",
-                        params![session_id, inserted_count, max_raw_ts, i32::from(saw_rr)],
+                         WHERE pk = ?1",
+                        params![session_pk, inserted_count, max_raw_ts, i32::from(saw_rr)],
                     )?;
                 }
             }
@@ -399,7 +394,9 @@ impl LedgerStore {
         }
         let session_id = resolve_session_id(&self.conn, id_or_prefix)?;
         let total_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM session_epochs WHERE session_id = ?1",
+            "SELECT COUNT(*) FROM session_epochs e
+             JOIN sessions s ON s.pk = e.session_pk
+             WHERE s.id = ?1",
             params![session_id],
             |r| r.get(0),
         )?;
@@ -654,8 +651,12 @@ pub(crate) fn load_session_detail_with_epoch_limit(
         Some(0) => Vec::new(),
         Some(limit) => load_session_epochs_page(conn, session_id, limit, 0)?,
     };
-    let raw_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM raw_samples WHERE session_id = ?1",
+    let has_raw_samples: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM raw_sample_chunks c
+             JOIN sessions s ON s.pk = c.session_pk
+             WHERE s.id = ?1
+         )",
         params![session_id],
         |r| r.get(0),
     )?;
@@ -666,7 +667,7 @@ pub(crate) fn load_session_detail_with_epoch_limit(
         wearable,
         feedback,
         epochs,
-        has_raw_samples: raw_count > 0,
+        has_raw_samples: has_raw_samples != 0,
     })
 }
 
@@ -685,11 +686,11 @@ pub(crate) fn load_session_feedback(
         .flatten())
 }
 
-const EPOCH_SELECT_COLUMNS: &str = "ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
-    ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
-    rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
-    baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
-    p_active_wake, p_quiet_wake, p_sleep, state";
+const EPOCH_SELECT_COLUMNS: &str = "e.ts_ms, e.hr_bpm_60s, e.z_hr, e.hr_slope_4m, e.r_var_120s,
+    e.ln_rmssd_60s, e.delta_ln_rmssd_60s, e.rmssd_sdnn_120s, e.hrv_valid,
+    e.rr_artifact_frac, e.coverage, e.flatline_stale, e.accumulators_frozen,
+    e.baseline_mu_hr, e.baseline_sigma_hr, e.baseline_frozen,
+    e.p_active_wake, e.p_quiet_wake, e.p_sleep, e.state";
 
 fn map_epoch_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Epoch> {
     let state_str: String = row.get(19)?;
@@ -726,9 +727,10 @@ pub(crate) fn load_session_epochs(
 ) -> Result<Vec<Epoch>, StorageError> {
     let sql = format!(
         "SELECT {EPOCH_SELECT_COLUMNS}
-         FROM session_epochs
-         WHERE session_id = ?1
-         ORDER BY seq ASC"
+         FROM session_epochs e
+         JOIN sessions s ON s.pk = e.session_pk
+         WHERE s.id = ?1
+         ORDER BY e.seq ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let epochs = stmt
@@ -745,9 +747,10 @@ pub(crate) fn load_session_epochs_page(
 ) -> Result<Vec<Epoch>, StorageError> {
     let sql = format!(
         "SELECT {EPOCH_SELECT_COLUMNS}
-         FROM session_epochs
-         WHERE session_id = ?1
-         ORDER BY seq ASC
+         FROM session_epochs e
+         JOIN sessions s ON s.pk = e.session_pk
+         WHERE s.id = ?1
+         ORDER BY e.seq ASC
          LIMIT ?2 OFFSET ?3"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -762,30 +765,19 @@ pub(crate) fn load_raw_samples(
     session_id: &str,
 ) -> Result<Vec<HrPacket>, StorageError> {
     let mut stmt = conn.prepare(
-        "SELECT ts_ms, bpm, rr_ms_json, contact_status
-         FROM raw_samples
-         WHERE session_id = ?1
-         ORDER BY seq ASC",
+        "SELECT c.payload_blob
+         FROM raw_sample_chunks c
+         JOIN sessions s ON s.pk = c.session_pk
+         WHERE s.id = ?1
+         ORDER BY c.seq ASC",
     )?;
-    let rows = stmt
-        .query_map(params![session_id], |row| {
-            let ts_ms: i64 = row.get(0)?;
-            let bpm: f64 = row.get(1)?;
-            let rr_json: String = row.get(2)?;
-            let contact_str: String = row.get(3)?;
-            Ok((ts_ms, bpm, rr_json, contact_str))
-        })?
+    let blobs = stmt
+        .query_map(params![session_id], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
-    let mut packets = Vec::with_capacity(rows.len());
-    for (ts_ms, bpm, rr_json, contact_str) in rows {
-        let rr_ms: Vec<f64> = serde_json::from_str(&rr_json)?;
-        packets.push(HrPacket {
-            ts_ms,
-            bpm,
-            rr_ms,
-            contact_status: contact_str.parse().unwrap_or(ContactStatus::Unsupported),
-        });
+    let mut packets = Vec::new();
+    for blob in blobs {
+        packets.extend(decode_raw_chunk(&blob)?);
     }
     Ok(packets)
 }

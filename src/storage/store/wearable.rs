@@ -159,11 +159,11 @@ impl LedgerStore {
                     params![id],
                 )?;
                 tx.execute(
-                    "DELETE FROM session_epochs WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
+                    "DELETE FROM session_epochs WHERE session_pk IN (SELECT pk FROM sessions WHERE wearable_id = ?1)",
                     params![id],
                 )?;
                 tx.execute(
-                    "DELETE FROM raw_samples WHERE session_id IN (SELECT id FROM sessions WHERE wearable_id = ?1)",
+                    "DELETE FROM raw_sample_chunks WHERE session_pk IN (SELECT pk FROM sessions WHERE wearable_id = ?1)",
                     params![id],
                 )?;
                 tx.execute(

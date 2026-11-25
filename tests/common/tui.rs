@@ -449,21 +449,28 @@ impl RealSocketTuiHarness {
                     })
                     .unwrap();
                 if with_raw_samples {
-                    store
-                        .append_epoch_and_raw(
-                            &sid,
-                            None,
-                            &[(
-                                0,
-                                &HrPacket {
-                                    ts_ms: start_ts + 1_000,
-                                    bpm: 64.0,
-                                    rr_ms: vec![930.0],
+                    let raw: Vec<(u32, HrPacket)> = (0..1_500)
+                        .map(|s| {
+                            (
+                                s,
+                                HrPacket {
+                                    ts_ms: start_ts + i64::from(s) * 1_000,
+                                    bpm: if s == 0 {
+                                        64.0
+                                    } else {
+                                        58.0 + ((s % 24) as f64) * 0.5
+                                    },
+                                    rr_ms: vec![
+                                        f64::from(900 + (s % 120) as u16) * 1000.0 / 1024.0,
+                                    ],
                                     contact_status: ContactStatus::Contact,
                                 },
-                            )],
-                        )
-                        .unwrap();
+                            )
+                        })
+                        .collect();
+                    let raw_refs: Vec<(u32, &HrPacket)> =
+                        raw.iter().map(|(seq, pkt)| (*seq, pkt)).collect();
+                    store.append_epoch_and_raw(&sid, None, &raw_refs).unwrap();
                 }
                 store
                     .close_session_and_recompute(

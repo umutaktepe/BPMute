@@ -1,17 +1,19 @@
-//! SQLite WAL schema initialization, `0600` file permission checks, and UUIDv7 generation.
+//! SQLite WAL schema initialization (`v2`), `v1 -> v2` migration, `0600` permissions, and UUIDv7 generation.
 
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use uuid::{ContextV7, Timestamp, Uuid};
 
+use crate::sleep_engine::{ContactStatus, HrPacket};
 use crate::storage::StorageError;
+use crate::storage::raw_codec::{RAW_CHUNK_MAX_SAMPLES, encode_raw_chunk_with_bounds};
 
 /// Current SQLite ledger schema version tracked via `PRAGMA user_version`.
-pub const CURRENT_DB_SCHEMA_VERSION: i32 = 1;
+pub const CURRENT_DB_SCHEMA_VERSION: i32 = 2;
 
 /// Returns `<data_dir>/bpmute.db`.
 pub fn db_path_in_data_dir(data_dir: &Path) -> PathBuf {
@@ -109,40 +111,17 @@ pub fn initialize_rw_connection(
         // Must precede first table creation so SQLite enables incremental auto-vacuuming.
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;")?;
         conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
-        conn.execute_batch(DDL_V1)?;
+        conn.execute_batch(DDL_V2)?;
         conn.execute_batch(&format!(
             "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
         ))?;
-    } else if user_version < CURRENT_DB_SCHEMA_VERSION {
+    } else if user_version == 1 {
         if let Some(path) = db_path {
-            let _ = backup_pre_migration(conn, path, user_version);
+            backup_pre_migration(conn, path, user_version)?;
         }
-        conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
-        conn.execute_batch(&format!(
-            "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
-        ))?;
+        migrate_v1_to_v2(conn)?;
     } else if user_version == CURRENT_DB_SCHEMA_VERSION {
         conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
-        let _ = conn.execute(
-            "ALTER TABLE wearables ADD COLUMN address_type TEXT NOT NULL DEFAULT 'public';",
-            [],
-        );
-        let _ = conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wearables_mac_type ON wearables(mac, address_type);",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE sessions ADD COLUMN pre_candidate_mu_hr REAL;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE sessions ADD COLUMN pre_candidate_sigma_hr REAL;",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE sessions ADD COLUMN pre_candidate_ln_rmssd REAL;",
-            [],
-        );
     } else {
         return Err(StorageError::Validation(format!(
             "unsupported SQLite ledger schema version {user_version}; expected {CURRENT_DB_SCHEMA_VERSION}"
@@ -151,13 +130,18 @@ pub fn initialize_rw_connection(
     Ok(())
 }
 
-/// Configures a read-only SQLite connection (`query_only = ON`).
+/// Configures a read-only SQLite connection (`query_only = ON`) and verifies schema `v2`.
 pub fn initialize_ro_connection(conn: &Connection) -> Result<(), StorageError> {
     conn.execute_batch(
         "PRAGMA busy_timeout = 5000;
          PRAGMA query_only = ON;",
     )?;
     let user_version: i32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+    if user_version < CURRENT_DB_SCHEMA_VERSION {
+        return Err(StorageError::Validation(format!(
+            "SQLite ledger schema version {user_version} requires migration to v{CURRENT_DB_SCHEMA_VERSION}; run a read-write command (such as `bpmute daemon`) to upgrade before opening read-only"
+        )));
+    }
     if user_version > CURRENT_DB_SCHEMA_VERSION {
         return Err(StorageError::Validation(format!(
             "unsupported SQLite ledger schema version {user_version}; expected {CURRENT_DB_SCHEMA_VERSION}"
@@ -166,7 +150,252 @@ pub fn initialize_ro_connection(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-const DDL_V1: &str = r#"
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StorageError> {
+    let sql = format!("PRAGMA table_info({table});");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_v1_additive_columns(conn: &Connection) -> Result<(), StorageError> {
+    if !table_has_column(conn, "wearables", "address_type")? {
+        conn.execute(
+            "ALTER TABLE wearables ADD COLUMN address_type TEXT NOT NULL DEFAULT 'public';",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_wearables_mac_type ON wearables(mac, address_type);",
+            [],
+        )?;
+    }
+    for col in [
+        "pre_candidate_mu_hr",
+        "pre_candidate_sigma_hr",
+        "pre_candidate_ln_rmssd",
+    ] {
+        if !table_has_column(conn, "sessions", col)? {
+            conn.execute(&format!("ALTER TABLE sessions ADD COLUMN {col} REAL;"), [])?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(WAL_RUNTIME_PRAGMAS)?;
+    ensure_v1_additive_columns(conn)?;
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let migration_result: Result<(), StorageError> = (|| {
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute_batch(
+            "DROP INDEX IF EXISTS idx_sessions_start_ts;
+             DROP INDEX IF EXISTS idx_session_epochs_session_ts;
+             DROP INDEX IF EXISTS idx_raw_samples_session_ts;
+             ALTER TABLE sessions RENAME TO _v1_sessions;
+             ALTER TABLE session_epochs RENAME TO _v1_session_epochs;
+             ALTER TABLE raw_samples RENAME TO _v1_raw_samples;
+             ALTER TABLE session_feedback RENAME TO _v1_session_feedback;",
+        )?;
+
+        tx.execute_batch(DDL_V2)?;
+
+        tx.execute_batch(
+            "INSERT INTO sessions (
+                 id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason,
+                 detection_sensitivity, had_rr, warmup_mu_hr, warmup_sigma_hr,
+                 warmup_ln_rmssd, pre_candidate_mu_hr, pre_candidate_sigma_hr,
+                 pre_candidate_ln_rmssd, onset_candidate_ts_ms, onset_confirmed_ts_ms,
+                 sleeping_ts_ms, sleep_mu_hr, onset_hr_bpm, delta_hr_onset,
+                 sleep_ln_rmssd, sleep_hr_var_ratio, typical_sqi, post_trigger_sleep_sec,
+                 trigger_power_action, rapid_resume_within_5m, grace_cancel_count,
+                 rapid_wake_fp_count, snooze_count, auto_anomalous, epochs_count, raw_samples_count
+             )
+             SELECT
+                 id, wearable_id, status, start_ts_ms, end_ts_ms, end_reason,
+                 detection_sensitivity, had_rr, warmup_mu_hr, warmup_sigma_hr,
+                 warmup_ln_rmssd, pre_candidate_mu_hr, pre_candidate_sigma_hr,
+                 pre_candidate_ln_rmssd, onset_candidate_ts_ms, onset_confirmed_ts_ms,
+                 sleeping_ts_ms, sleep_mu_hr, onset_hr_bpm, delta_hr_onset,
+                 sleep_ln_rmssd, sleep_hr_var_ratio, typical_sqi, post_trigger_sleep_sec,
+                 trigger_power_action, rapid_resume_within_5m, grace_cancel_count,
+                 rapid_wake_fp_count, snooze_count, auto_anomalous, epochs_count, raw_samples_count
+             FROM _v1_sessions
+             ORDER BY start_ts_ms ASC, id ASC;
+
+             INSERT INTO session_epochs (
+                 session_pk, seq, ts_ms, hr_bpm_60s, z_hr, hr_slope_4m, r_var_120s,
+                 ln_rmssd_60s, delta_ln_rmssd_60s, rmssd_sdnn_120s, hrv_valid,
+                 rr_artifact_frac, coverage, flatline_stale, accumulators_frozen,
+                 baseline_mu_hr, baseline_sigma_hr, baseline_frozen,
+                 p_active_wake, p_quiet_wake, p_sleep, state
+             )
+             SELECT
+                 s.pk, e.seq, e.ts_ms, e.hr_bpm_60s, e.z_hr, e.hr_slope_4m, e.r_var_120s,
+                 e.ln_rmssd_60s, e.delta_ln_rmssd_60s, e.rmssd_sdnn_120s, e.hrv_valid,
+                 e.rr_artifact_frac, e.coverage, e.flatline_stale, e.accumulators_frozen,
+                 e.baseline_mu_hr, e.baseline_sigma_hr, e.baseline_frozen,
+                 e.p_active_wake, e.p_quiet_wake, e.p_sleep, e.state
+             FROM _v1_session_epochs e
+             JOIN sessions s ON s.id = e.session_id
+             ORDER BY s.pk ASC, e.seq ASC;
+
+             INSERT INTO session_feedback (
+                 id, session_id, verdict, manual_onset_ts_ms, manual_avg_sleep_hr, notes, updated_at_ms
+             )
+             SELECT id, session_id, verdict, manual_onset_ts_ms, manual_avg_sleep_hr, notes, updated_at_ms
+             FROM _v1_session_feedback;",
+        )?;
+
+        pack_v1_raw_samples_into_v2_chunks(&tx)?;
+
+        tx.execute_batch(
+            "UPDATE sessions
+             SET epochs_count = (SELECT COUNT(*) FROM session_epochs WHERE session_pk = sessions.pk),
+                 raw_samples_count = COALESCE((SELECT SUM(sample_count) FROM raw_sample_chunks WHERE session_pk = sessions.pk), 0);
+
+             DROP TABLE _v1_raw_samples;
+             DROP TABLE _v1_session_epochs;
+             DROP TABLE _v1_session_feedback;
+             DROP TABLE _v1_sessions;",
+        )?;
+        tx.execute_batch(&format!(
+            "PRAGMA user_version = {CURRENT_DB_SCHEMA_VERSION};"
+        ))?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    if let Err(err) = migration_result {
+        let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+        return Err(err);
+    }
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let fk_violation: Option<String> = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_check;")?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?
+    };
+    if let Some(table) = fk_violation {
+        return Err(StorageError::Validation(format!(
+            "foreign key integrity violation in `{table}` after v1 -> v2 migration"
+        )));
+    }
+
+    vacuum_and_truncate_wal(conn)?;
+    Ok(())
+}
+
+/// Switches to `auto_vacuum = INCREMENTAL`, runs `VACUUM`, restores WAL pragmas, and truncates WAL.
+pub(crate) fn vacuum_and_truncate_wal(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(&format!(
+        "PRAGMA secure_delete = ON;
+         PRAGMA auto_vacuum = INCREMENTAL;
+         VACUUM;
+         {WAL_RUNTIME_PRAGMAS}
+         PRAGMA foreign_keys = ON;
+         PRAGMA wal_checkpoint(TRUNCATE);"
+    ))?;
+    Ok(())
+}
+
+fn pack_v1_raw_samples_into_v2_chunks(conn: &Connection) -> Result<(), StorageError> {
+    let mut select_stmt = conn.prepare(
+        "SELECT s.pk, r.seq, r.ts_ms, r.bpm, r.rr_ms_json, r.contact_status
+         FROM _v1_raw_samples r
+         JOIN sessions s ON s.id = r.session_id
+         ORDER BY s.pk ASC, r.seq ASC",
+    )?;
+    let mut insert_stmt = conn.prepare(
+        "INSERT INTO raw_sample_chunks (
+             session_pk, seq, start_ts_ms, end_ts_ms, sample_count, payload_blob
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+
+    let mut current_session_pk: Option<i64> = None;
+    let mut chunk_first_seq: i64 = 0;
+    let mut chunk_packets: Vec<HrPacket> = Vec::with_capacity(RAW_CHUNK_MAX_SAMPLES);
+
+    let mut rows = select_stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let session_pk: i64 = row.get(0)?;
+        let seq: i64 = row.get(1)?;
+        let ts_ms: i64 = row.get(2)?;
+        let bpm: f64 = row.get(3)?;
+        let rr_json: String = row.get(4)?;
+        let contact_str: String = row.get(5)?;
+        let rr_ms: Vec<f64> = serde_json::from_str(&rr_json)?;
+        let contact_status = contact_str.parse().unwrap_or(ContactStatus::Unsupported);
+
+        let should_flush = match current_session_pk {
+            Some(active_pk) => {
+                active_pk != session_pk || chunk_packets.len() >= RAW_CHUNK_MAX_SAMPLES
+            }
+            None => false,
+        };
+        if should_flush {
+            let active_pk = current_session_pk.expect("active session_pk present when flushing");
+            flush_migration_chunk(
+                &mut insert_stmt,
+                active_pk,
+                chunk_first_seq,
+                &mut chunk_packets,
+            )?;
+        }
+
+        if current_session_pk != Some(session_pk) || chunk_packets.is_empty() {
+            current_session_pk = Some(session_pk);
+            chunk_first_seq = seq;
+        }
+        chunk_packets.push(HrPacket {
+            ts_ms,
+            bpm,
+            rr_ms,
+            contact_status,
+        });
+    }
+
+    if let Some(active_pk) = current_session_pk
+        && !chunk_packets.is_empty()
+    {
+        flush_migration_chunk(
+            &mut insert_stmt,
+            active_pk,
+            chunk_first_seq,
+            &mut chunk_packets,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn flush_migration_chunk(
+    insert_stmt: &mut rusqlite::Statement<'_>,
+    session_pk: i64,
+    chunk_seq: i64,
+    packets: &mut Vec<HrPacket>,
+) -> Result<(), StorageError> {
+    let encoded = encode_raw_chunk_with_bounds(packets)?;
+    insert_stmt.execute(params![
+        session_pk,
+        chunk_seq,
+        encoded.start_ts_ms,
+        encoded.end_ts_ms,
+        encoded.sample_count,
+        encoded.payload_blob,
+    ])?;
+    packets.clear();
+    Ok(())
+}
+
+const DDL_V2: &str = r#"
 CREATE TABLE IF NOT EXISTS wearables (
     id TEXT PRIMARY KEY,
     mac TEXT NOT NULL,
@@ -186,7 +415,8 @@ CREATE TABLE IF NOT EXISTS wearables (
 -- Note: Column projection order is synchronized with `SESSION_LEDGER_COLUMNS_COUNT`
 -- and `map_session_ledger_row` in `src/storage/store/session.rs`.
 CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
+    pk INTEGER PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE,
     wearable_id TEXT NOT NULL REFERENCES wearables(id),
     status TEXT NOT NULL CHECK (status IN ('active', 'closed')),
     start_ts_ms INTEGER NOT NULL,
@@ -224,8 +454,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_start_ts
     ON sessions(start_ts_ms DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS session_epochs (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    session_pk INTEGER NOT NULL REFERENCES sessions(pk) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     ts_ms INTEGER NOT NULL,
     hr_bpm_60s REAL NOT NULL,
@@ -247,25 +476,18 @@ CREATE TABLE IF NOT EXISTS session_epochs (
     p_quiet_wake REAL NOT NULL,
     p_sleep REAL NOT NULL,
     state TEXT NOT NULL,
-    UNIQUE(session_id, seq)
-);
+    PRIMARY KEY (session_pk, seq)
+) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_session_epochs_session_ts
-    ON session_epochs(session_id, ts_ms);
-
-CREATE TABLE IF NOT EXISTS raw_samples (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS raw_sample_chunks (
+    session_pk INTEGER NOT NULL REFERENCES sessions(pk) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
-    ts_ms INTEGER NOT NULL,
-    bpm REAL NOT NULL,
-    rr_ms_json TEXT NOT NULL,
-    contact_status TEXT NOT NULL,
-    UNIQUE(session_id, seq)
-);
-
-CREATE INDEX IF NOT EXISTS idx_raw_samples_session_ts
-    ON raw_samples(session_id, ts_ms);
+    start_ts_ms INTEGER NOT NULL,
+    end_ts_ms INTEGER NOT NULL,
+    sample_count INTEGER NOT NULL,
+    payload_blob BLOB NOT NULL,
+    PRIMARY KEY (session_pk, seq)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS session_feedback (
     id TEXT PRIMARY KEY,

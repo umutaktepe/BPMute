@@ -2,6 +2,7 @@
 
 pub mod bundle;
 pub mod lock;
+pub(crate) mod raw_codec;
 pub mod schema;
 pub mod store;
 pub mod worker;
