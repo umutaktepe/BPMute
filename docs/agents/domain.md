@@ -13,7 +13,7 @@ How the engineering skills should consume this repo's domain documentation when 
 
 ## Use the glossary's vocabulary
 
-When your output names a domain concept (in an issue title, a refactor proposal, a hypothesis, a test name), use the term as defined in `GLOSSARY.md`. Don't drift to synonyms the glossary explicitly avoids.
+When your output names a domain concept (in an issue title, a refactor proposal, a hypothesis, a test name), use the term as defined in `GLOSSARY.md`. Don't drift to synonyms the glossary explicitly avoids; when an existing issue or spec uses a colloquial synonym (such as `archive` or `dump` for `Ledger Bundle`), normalize it to the `GLOSSARY.md` term in new code, comments, and test identifiers.
 
 If the concept you need isn't in the glossary yet, that's a signal: either you're inventing language the project doesn't use (reconsider) or there's a real gap (note it for `/domain-modeling`).
 

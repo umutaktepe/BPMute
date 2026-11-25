@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! cargo fmt --check >/dev/null 2>&1; then
-  echo "error: working tree is not formatted; run 'cargo fmt' (or './scripts/check.sh --fix') before committing" >&2
-  exit 1
-fi
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/check.sh" --lint
