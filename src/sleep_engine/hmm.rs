@@ -22,6 +22,8 @@ const TRANSITION: [[f64; 3]; 3] = [
 const LOG_NORM_NU3: f64 = -1.001_009_092_458_936;
 /// Exact for `nu = 5`: `ln(8 / (3 * PI * sqrt(5)))`.
 const LOG_NORM_NU5: f64 = -0.963_482_274_142_251;
+/// Tightened negative-slope scale for `ActiveWake` so steep recovery drops cannot beat `QuietWake` or `SleepNREM`.
+const ACTIVE_WAKE_NEG_SLOPE_SIGMA: f64 = 0.25;
 
 /// 3-state Forward-Filtered HMM (`ActiveWake`, `QuietWake`, `SleepNREM`).
 #[derive(Debug, Clone)]
@@ -84,7 +86,19 @@ impl HmmFilter {
         for k in 0..3 {
             let mut ll = pred[k].ln();
             ll += student_t_log_pdf_nu3(features.z_hr, z_params[k].0, z_params[k].1);
-            ll += student_t_log_pdf_nu5(features.hr_slope_4m, slope_params[k].0, slope_params[k].1);
+            // ActiveWake models upward surges/oscillations (sigma_pos = 1.60), not steep
+            // downward recovery/sleep re-entry; tighten its negative slope tail so rapid
+            // deceleration cannot beat QuietWake or SleepNREM.
+            ll += if k == STATE_ACTIVE_WAKE {
+                student_t_log_pdf_nu5_asymmetric(
+                    features.hr_slope_4m,
+                    slope_params[k].0,
+                    ACTIVE_WAKE_NEG_SLOPE_SIGMA,
+                    slope_params[k].1,
+                )
+            } else {
+                student_t_log_pdf_nu5(features.hr_slope_4m, slope_params[k].0, slope_params[k].1)
+            };
             ll += student_t_log_pdf_nu5(features.r_var_120s, rvar_params[k].0, rvar_params[k].1);
 
             if hrv_valid
@@ -125,9 +139,15 @@ fn student_t_log_pdf_nu3(x: f64, mu: f64, sigma: f64) -> f64 {
 
 #[inline]
 fn student_t_log_pdf_nu5(x: f64, mu: f64, sigma: f64) -> f64 {
-    let s = sigma.max(1e-6);
-    let r = (x - mu) / s;
-    LOG_NORM_NU5 - s.ln() - 3.0 * (1.0 + (r * r) / 5.0).ln()
+    student_t_log_pdf_nu5_asymmetric(x, mu, sigma, sigma)
+}
+
+#[inline]
+fn student_t_log_pdf_nu5_asymmetric(x: f64, mu: f64, sigma_neg: f64, sigma_pos: f64) -> f64 {
+    let peak_s = sigma_pos.max(1e-6);
+    let tail_s = if x < mu { sigma_neg } else { sigma_pos }.max(1e-6);
+    let r = (x - mu) / tail_s;
+    LOG_NORM_NU5 - peak_s.ln() - 3.0 * (1.0 + (r * r) / 5.0).ln()
 }
 
 #[cfg(test)]
@@ -148,16 +168,78 @@ mod tests {
 
         let mut filter_bpm_only = HmmFilter::new();
         let p_bpm_only = filter_bpm_only.step(&features, false, -2.4);
-        let expected_bpm_only = [0.000_856_425_893, 0.165_499_631_394, 0.833_643_942_713];
+        let expected_bpm_only = [0.000_503_090_205, 0.165_558_158_444, 0.833_938_751_352];
         for (got, exp) in p_bpm_only.iter().zip(expected_bpm_only) {
             assert!((got - exp).abs() < 1e-11, "got {got}, expected {exp}");
         }
 
         let mut filter_bpm_rr = HmmFilter::new();
         let p_bpm_rr = filter_bpm_rr.step(&features, true, -2.4);
-        let expected_bpm_rr = [0.000_267_664_431, 0.102_148_075_602, 0.897_584_259_967];
+        let expected_bpm_rr = [0.000_157_195_882, 0.102_159_362_773, 0.897_683_441_345];
         for (got, exp) in p_bpm_rr.iter().zip(expected_bpm_rr) {
             assert!((got - exp).abs() < 1e-11, "got {got}, expected {exp}");
         }
+    }
+
+    #[test]
+    fn steep_negative_slope_does_not_classify_as_active_wake() {
+        // Rapid sleep re-entry after a brief nocturnal rise (e.g. 75 -> 60 bpm over 4 min)
+        // produces a steep negative 4-min slope alongside transient step-edge variability.
+        let mut filter = HmmFilter::new();
+        let peak_wake = EpochFeatures {
+            hr_bpm_60s: 75.0,
+            z_hr: 2.2,
+            hr_slope_4m: 1.5,
+            r_var_120s: 1.50,
+            ln_rmssd_60s: None,
+            delta_ln_rmssd_60s: None,
+            rmssd_sdnn_120s: None,
+        };
+        for _ in 0..8 {
+            filter.step(&peak_wake, false, -2.4);
+        }
+        assert!(
+            filter.probs()[STATE_ACTIVE_WAKE] > 0.70,
+            "precondition: peak arousal enters ActiveWake, got {:?}",
+            filter.probs()
+        );
+
+        let sleep_reentry = EpochFeatures {
+            hr_bpm_60s: 64.0,
+            z_hr: -0.5,
+            hr_slope_4m: -3.2,
+            r_var_120s: 1.35,
+            ln_rmssd_60s: None,
+            delta_ln_rmssd_60s: None,
+            rmssd_sdnn_120s: None,
+        };
+        for _ in 0..4 {
+            filter.step(&sleep_reentry, false, -2.4);
+        }
+        let p = filter.probs();
+        assert!(
+            p[STATE_ACTIVE_WAKE] < 0.25,
+            "steep negative deceleration must drop out of ActiveWake, got probs={p:?}"
+        );
+
+        // Positive arousal slope still favors ActiveWake over QuietWake/SleepNREM.
+        let mut rising_filter = HmmFilter::new();
+        let active_rise = EpochFeatures {
+            hr_bpm_60s: 74.0,
+            z_hr: 2.0,
+            hr_slope_4m: 2.5,
+            r_var_120s: 1.45,
+            ln_rmssd_60s: None,
+            delta_ln_rmssd_60s: None,
+            rmssd_sdnn_120s: None,
+        };
+        for _ in 0..6 {
+            rising_filter.step(&active_rise, false, -2.4);
+        }
+        assert!(
+            rising_filter.probs()[STATE_ACTIVE_WAKE] > 0.70,
+            "steep positive slope must remain ActiveWake, got {:?}",
+            rising_filter.probs()
+        );
     }
 }

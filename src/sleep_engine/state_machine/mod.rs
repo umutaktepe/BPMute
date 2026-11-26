@@ -22,9 +22,11 @@ const SHORT_GAP_MAX_MS: i64 = 120_000; // <= 2 min
 const MEDIUM_GAP_MAX_MS: i64 = 900_000; // 2-15 min
 const MEDIUM_GAP_STABILIZATION_EPOCHS: u32 = 8; // 2 min
 const CANCEL_COOLDOWN_MS: i64 = 900_000; // 15 min
-const POST_SLEEP_WAKE_SPLIT_SEC: u32 = 600; // 10 min
+const POST_SLEEP_WAKE_SPLIT_SEC: u32 = 1200; // 20 min
 const POST_SLEEP_ACTIVE_WAKE_THRESHOLD: f64 = 0.50;
-const POST_SLEEP_WAKE_Z_THRESHOLD: f64 = 2.0;
+const POST_SLEEP_ACTIVE_WAKE_Z_THRESHOLD: f64 = 0.5;
+const POST_SLEEP_WAKE_Z_THRESHOLD: f64 = 3.0;
+const POST_SLEEP_SLEEP_BAND_MARGIN_BPM: f64 = 4.0;
 const DESKTOP_REBOUND_WINDOW_MS: i64 = 300_000; // 5 min
 
 struct EpochStepInput<'a> {
@@ -73,6 +75,7 @@ impl SleepSampleVecs {
 struct SleepSampleBuffers {
     committed: SleepSampleVecs,
     wake_tail: SleepSampleVecs,
+    cached_committed_hr_median: Option<f64>,
 }
 
 impl SleepSampleBuffers {
@@ -89,7 +92,16 @@ impl SleepSampleBuffers {
             // Rejoin buffered brief wake/REM intervals when consolidated sleep resumes.
             self.committed.append_from(&mut self.wake_tail);
             self.committed.push(hr, ln_rmssd, var_ratio);
+            self.cached_committed_hr_median = None;
         }
+    }
+
+    fn committed_median_hr(&mut self) -> Option<f64> {
+        if self.cached_committed_hr_median.is_none() && !self.committed.hr.is_empty() {
+            self.cached_committed_hr_median =
+                crate::sleep_engine::ppg::quantile(&self.committed.hr, 0.5);
+        }
+        self.cached_committed_hr_median
     }
 
     fn medians_for(vecs: &SleepSampleVecs) -> (Option<f64>, Option<f64>, Option<f64>) {
@@ -121,6 +133,7 @@ impl SleepSampleBuffers {
     fn clear(&mut self) {
         self.committed.clear();
         self.wake_tail.clear();
+        self.cached_committed_hr_median = None;
     }
 }
 
@@ -612,9 +625,21 @@ impl SleepEngine {
                 DetectorState::Sleeping => {
                     self.baseline.set_frozen(true);
                     let is_non_sleep_epoch = p_sleep < 0.30;
-                    let is_sustained_wake_epoch = probs[STATE_ACTIVE_WAKE]
+                    let meets_wake_gate = (probs[STATE_ACTIVE_WAKE]
                         >= POST_SLEEP_ACTIVE_WAKE_THRESHOLD
+                        && features.z_hr > POST_SLEEP_ACTIVE_WAKE_Z_THRESHOLD)
                         || (is_non_sleep_epoch && features.z_hr >= POST_SLEEP_WAKE_Z_THRESHOLD);
+                    let above_sleeping_band = if meets_wake_gate {
+                        self.sleep_samples
+                            .committed_median_hr()
+                            .or(self.sleeping_hr_anchor)
+                            .is_none_or(|sleep_hr| {
+                                features.hr_bpm_60s >= sleep_hr + POST_SLEEP_SLEEP_BAND_MARGIN_BPM
+                            })
+                    } else {
+                        false
+                    };
+                    let is_sustained_wake_epoch = above_sleeping_band && meets_wake_gate;
                     let ln_r = hrv_valid.then_some(features.ln_rmssd_60s).flatten();
                     self.sleep_samples.record_epoch(
                         is_non_sleep_epoch,

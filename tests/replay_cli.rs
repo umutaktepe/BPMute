@@ -431,7 +431,7 @@ async fn replay_reports_sleep_diagnostics_for_open_and_closed_sessions() {
             StageKind::N1Onset { duration_sec: 420 },
             StageKind::N2Sleep { duration_sec: 900 },
             StageKind::PostSleepWake {
-                duration_sec: 900,
+                duration_sec: 1440,
                 elevation_bpm: 18.0,
             },
         ],

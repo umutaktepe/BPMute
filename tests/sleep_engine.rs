@@ -967,8 +967,8 @@ fn slice4_tiered_gaps_and_post_sleep_1_to_1_session_splitting() {
     assert_eq!(eng_split.state(), DetectorState::Sleeping);
     assert_eq!(eng_split.current_session_index(), Some(1));
 
-    // User wakes up and stays awake >= 10 min at 74 bpm
-    let split_out = push_calm_wake(&mut eng_split, tc_sec + 35, tc_sec + 950, 74.0, true);
+    // User wakes up and stays awake >= 20 min at elevated waking HR (78 bpm)
+    let split_out = push_calm_wake(&mut eng_split, tc_sec + 35, tc_sec + 1500, 78.0, true);
     assert!(split_out.iter().any(|o| matches!(
         o,
         EngineOutput::SessionEnded(s) if s.session_index == 1 && s.end_reason == SessionEndReason::SustainedWakefulness
@@ -1243,9 +1243,9 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
             StageKind::N1Onset { duration_sec: 360 },
             StageKind::N2Sleep { duration_sec: 900 },
             StageKind::PostSleepWake {
-                duration_sec: 1200,
-                elevation_bpm: 6.0,
-            }, // 20 min wake -> splits session 1 and enters session 2
+                duration_sec: 1440,
+                elevation_bpm: 12.0,
+            }, // 24 min elevated wake -> splits session 1 and enters session 2
             StageKind::QuietWake { duration_sec: 900 },
             StageKind::N1Onset { duration_sec: 360 },
             StageKind::N2Sleep { duration_sec: 900 },
@@ -1740,7 +1740,7 @@ fn push_wake_arousal(
 fn wake_tail_excluded_on_sustained_wakefulness_session_close() {
     use common::synthetic::{Phenotype, StageKind, generate_paired_trace};
 
-    // Real physiological BPM+RR trace: 15 min QuietWake -> 7 min N1 -> 12 min N2 (~60 bpm) -> 12 min PostSleepWake (~86 bpm).
+    // Real physiological BPM+RR trace: 15 min QuietWake -> 7 min N1 -> 12 min N2 (~60 bpm) -> 24 min PostSleepWake (~84 bpm).
     let pheno = Phenotype::typical();
     let trace = generate_paired_trace(
         42,
@@ -1750,7 +1750,7 @@ fn wake_tail_excluded_on_sustained_wakefulness_session_close() {
             StageKind::N1Onset { duration_sec: 420 },
             StageKind::N2Sleep { duration_sec: 720 },
             StageKind::PostSleepWake {
-                duration_sec: 900,
+                duration_sec: 1440,
                 elevation_bpm: 18.0,
             },
         ],
@@ -1920,7 +1920,7 @@ fn wake_tail_excluded_on_rebound_and_promoted_when_committed_empty() {
         rmssd_sdnn_120s: None,
     };
     let mut fb_summary = None;
-    for _ in 0..45 {
+    for _ in 0..90 {
         ts += 15_000;
         for o in eng_fb.feed_epoch_features(ts, high_wake_feat.clone(), false, 1.0, false) {
             if let EngineOutput::SessionEnded(s) = o {
@@ -2012,9 +2012,9 @@ fn rem_cycle_quiet_wake_plateau_does_not_split_sleeping_session() {
                 elevation_bpm: 2.0,
             },
             StageKind::N2Sleep { duration_sec: 900 },
-            // 15-min real morning active wake-up
+            // 24-min real morning active wake-up
             StageKind::PostSleepWake {
-                duration_sec: 900,
+                duration_sec: 1440,
                 elevation_bpm: 16.0,
             },
         ],
@@ -2974,4 +2974,341 @@ fn calibrated_post_workout_recovery_stops_purging_once_entering_quiet_wake_band(
         (66.0..=71.0).contains(&pre_mu),
         "Pre-Candidate Baseline must stay near calibrated quiet-wake band, got {pre_mu:.2}"
     );
+}
+
+#[test]
+fn sustained_wakefulness_requires_20min_elevated_above_sleep_band_and_resets_on_drop() {
+    use bpmute::sleep_engine::EpochFeatures;
+
+    let make_feat = |hr: f64, z_hr: f64, slope: f64, r_var: f64| EpochFeatures {
+        hr_bpm_60s: hr,
+        z_hr,
+        hr_slope_4m: slope,
+        r_var_120s: r_var,
+        ln_rmssd_60s: None,
+        delta_ln_rmssd_60s: None,
+        rmssd_sdnn_120s: None,
+    };
+
+    let setup_sleeping = |wake_hr: f64, sleep_hr: f64| -> (SleepEngine, i64) {
+        let mut eng = default_engine();
+        eng.handle_event(EngineEvent::StreamState(StreamState {
+            ts_ms: 0,
+            status: StreamStatus::Streaming,
+        }));
+        let mut ts = 15_000_i64;
+        let wake_feat = make_feat(wake_hr, 0.0, 0.0, 0.90);
+        for _ in 0..32 {
+            eng.feed_epoch_features(ts, wake_feat.clone(), false, 1.0, false);
+            ts += 15_000;
+        }
+        let sleep_feat = make_feat(sleep_hr, -2.6, -0.25, 0.35);
+        while eng.state() != DetectorState::Confirmed {
+            eng.feed_epoch_features(ts, sleep_feat.clone(), false, 1.0, false);
+            ts += 15_000;
+        }
+        eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+            ts_ms: ts,
+            outcome: GraceResult::Expired,
+        }));
+        assert_eq!(eng.state(), DetectorState::Sleeping);
+        // Commit sleeping HR samples into sleep_samples so committed median anchors sleep band.
+        for _ in 0..8 {
+            ts += 15_000;
+            eng.feed_epoch_features(ts, sleep_feat.clone(), false, 1.0, false);
+        }
+        (eng, ts)
+    };
+
+    let assert_no_session_end =
+        |eng: &mut SleepEngine, ts: &mut i64, epochs: usize, feat: &EpochFeatures, msg: &str| {
+            for idx in 1..=epochs {
+                *ts += 15_000;
+                let out = eng.feed_epoch_features(*ts, feat.clone(), false, 1.0, false);
+                assert!(
+                    !out.iter()
+                        .any(|o| matches!(o, EngineOutput::SessionEnded(_))),
+                    "{msg} (closed at epoch {idx})"
+                );
+            }
+        };
+
+    // 1. z_hr = 2.5 (< 3.0) with QuietWake variability (P(ActiveWake) < 0.50) must NOT close
+    //    even after 25 minutes (100 epochs).
+    let (mut eng_quiet, mut ts) = setup_sleeping(68.0, 58.0);
+    let mild_quiet_feat = make_feat(73.0, 2.5, 0.0, 0.70);
+    for _ in 0..100 {
+        ts += 15_000;
+        let out = eng_quiet.feed_epoch_features(ts, mild_quiet_feat.clone(), false, 1.0, false);
+        let ep = out
+            .iter()
+            .find_map(|o| match o {
+                EngineOutput::EpochEmitted(e) => Some(e),
+                _ => None,
+            })
+            .expect("epoch emitted");
+        assert!(ep.p_active_wake < 0.50);
+        assert!(
+            !out.iter()
+                .any(|o| matches!(o, EngineOutput::SessionEnded(_))),
+            "z_hr=2.5 without P(ActiveWake)>=0.50 must not trigger SustainedWakefulness"
+        );
+    }
+
+    // 2. ActiveWake with z_hr <= 0.5 (at baseline) must NOT trigger SustainedWakefulness,
+    //    even after 25 minutes.
+    let (mut eng_low_z, mut ts) = setup_sleeping(68.0, 58.0);
+    let low_z_active_feat = make_feat(68.8, 0.4, 0.5, 1.90);
+    assert_no_session_end(
+        &mut eng_low_z,
+        &mut ts,
+        100,
+        &low_z_active_feat,
+        "P(ActiveWake)>=0.50 with z_hr=0.4 must not trigger SustainedWakefulness",
+    );
+
+    // 2b. Even if z_hr > 0.5 and P(ActiveWake) >= 0.50 (pathological low-baseline case),
+    //     staying inside the sleeping heart-rate band (< sleep_hr + 4.0) must NOT close.
+    let (mut eng_band, mut ts) = setup_sleeping(59.0, 58.0);
+    let inside_sleep_band_feat = make_feat(61.5, 1.25, 0.4, 1.80);
+    assert_no_session_end(
+        &mut eng_band,
+        &mut ts,
+        100,
+        &inside_sleep_band_feat,
+        "HR inside sleeping band (< sleep_hr + 4.0) must not trigger SustainedWakefulness",
+    );
+
+    // 3. Elevated wakefulness for 15 min (60 epochs) followed by 1 epoch returning to baseline
+    //    resets the counter immediately; then requires a full 20 continuous minutes (80 epochs)
+    //    to close (not closing at 19 min 45 s = 79 epochs).
+    let (mut eng_reset, mut ts) = setup_sleeping(68.0, 58.0);
+    let high_wake_feat = make_feat(80.0, 3.5, 0.1, 1.60);
+    assert_no_session_end(
+        &mut eng_reset,
+        &mut ts,
+        60,
+        &high_wake_feat,
+        "15 min elevated wakefulness must not close yet",
+    );
+    // Single epoch returning toward baseline (z_hr = 0.3 <= 0.5) resets counter immediately.
+    let dip_feat = make_feat(68.6, 0.3, -0.5, 0.90);
+    assert_no_session_end(
+        &mut eng_reset,
+        &mut ts,
+        1,
+        &dip_feat,
+        "dip back to baseline must reset counter without closing",
+    );
+
+    // Next 79 epochs (19m45s = 1185s) must NOT close yet.
+    assert_no_session_end(
+        &mut eng_reset,
+        &mut ts,
+        79,
+        &high_wake_feat,
+        "must not close before 20 continuous minutes",
+    );
+    // 80th continuous epoch (1200 s) closes cleanly with SustainedWakefulness.
+    ts += 15_000;
+    let close_out = eng_reset.feed_epoch_features(ts, high_wake_feat, false, 1.0, false);
+    let summary = extract_session_ended(&close_out);
+    assert_eq!(summary.end_reason, SessionEndReason::SustainedWakefulness);
+}
+
+#[test]
+fn overnight_bpm_only_rem_rise_and_steep_sleep_reentry_stays_single_session() {
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+
+    let mut all_out = Vec::new();
+    let mut sec = 1_i64;
+    let push_bpm_until = |eng: &mut SleepEngine,
+                          out: &mut Vec<EngineOutput>,
+                          start: i64,
+                          count: i64,
+                          stop_state: Option<DetectorState>,
+                          hr_fn: &dyn Fn(i64, i64) -> f64|
+     -> i64 {
+        let mut s = start;
+        for step in 0..count {
+            let bpm = hr_fn(step, s).round();
+            out.extend(eng.handle_event(EngineEvent::HrPacket(HrPacket {
+                ts_ms: s * 1000,
+                bpm,
+                rr_ms: vec![],
+                contact_status: ContactStatus::Contact,
+            })));
+            s += 1;
+            if stop_state.is_some_and(|target| eng.state() == target) {
+                break;
+            }
+        }
+        s
+    };
+
+    // 1. 15 min calm waking BPM-only baseline (~68 bpm).
+    sec = push_bpm_until(&mut eng, &mut all_out, sec, 900, None, &|_, s| {
+        68.0 + 1.6 * (s as f64 * 0.4).sin()
+    });
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    // 2. Pre-onset N1 descent into Candidate, brief Candidate reset, then resumed N1 -> Confirmed.
+    sec = push_bpm_until(
+        &mut eng,
+        &mut all_out,
+        sec,
+        600,
+        Some(DetectorState::Candidate),
+        &|step, s| {
+            let target = (68.0 - 0.9 * (step as f64 / 60.0)).max(60.0);
+            target + 0.35 * (s as f64 * 0.4).sin()
+        },
+    );
+    assert_eq!(
+        eng.state(),
+        DetectorState::Candidate,
+        "must enter Candidate during initial N1 descent"
+    );
+
+    sec = push_bpm_until(
+        &mut eng,
+        &mut all_out,
+        sec,
+        180,
+        Some(DetectorState::Monitoring),
+        &|_, s| 66.5 + 3.6 * (s as f64 * 0.55).sin(),
+    );
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    sec = push_bpm_until(
+        &mut eng,
+        &mut all_out,
+        sec,
+        720,
+        Some(DetectorState::Confirmed),
+        &|step, s| {
+            let target = (64.5 - 0.8 * (step as f64 / 60.0)).max(59.0);
+            let amp = if step < 90 { 2.2 } else { 0.35 };
+            target + amp * (s as f64 * 0.45).sin()
+        },
+    );
+    assert_eq!(eng.state(), DetectorState::Confirmed);
+    all_out.extend(eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: sec * 1000,
+        outcome: GraceResult::Expired,
+    })));
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+
+    // 3. 90 min consolidated sleep (~59 bpm).
+    sec = push_bpm_until(&mut eng, &mut all_out, sec, 5400, None, &|_, s| {
+        59.0 + 0.6 * (s as f64 * 0.4).sin()
+    });
+
+    // 4. Mid-sleep REM/light-sleep rise (74 bpm for 14 min) followed by steep 4-min drop
+    //    back to 59 bpm (~ -3.75 bpm/min slope).
+    sec = push_bpm_until(&mut eng, &mut all_out, sec, 840, None, &|step, s| {
+        let base = if step < 120 {
+            59.0 + 15.0 * (step as f64 / 120.0)
+        } else {
+            74.0
+        };
+        base + 1.6 * (s as f64 * 0.4).sin()
+    });
+    let reentry_start_ms = sec * 1000;
+    sec = push_bpm_until(&mut eng, &mut all_out, sec, 240, None, &|step, s| {
+        (74.0 - 15.0 * (step as f64 / 240.0)) + 1.2 * (s as f64 * 0.4).sin()
+    });
+    let reentry_end_ms = sec * 1000;
+
+    // 5. Another 2 hours of consolidated sleep (~59 bpm).
+    sec = push_bpm_until(&mut eng, &mut all_out, sec, 7200, None, &|_, s| {
+        59.0 + 0.6 * (s as f64 * 0.4).sin()
+    });
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+
+    // 6. Genuine morning wake-up (~82 bpm for 25 min -> closes cleanly after 20 continuous min).
+    let morning_start_ms = sec * 1000;
+    let _ = push_bpm_until(&mut eng, &mut all_out, sec, 1500, None, &|step, s| {
+        let base = if step < 60 {
+            59.0 + 23.0 * (step as f64 / 60.0)
+        } else {
+            82.0
+        };
+        base + 1.8 * (s as f64 * 0.4).sin()
+    });
+
+    let confirmed_count = all_out
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                EngineOutput::StateChanged {
+                    to: DetectorState::Confirmed,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        confirmed_count, 1,
+        "overnight session must confirm onset once"
+    );
+
+    let ended: Vec<_> = all_out
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::SessionEnded(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "expected exactly 1 SessionEnded at morning wake-up"
+    );
+    let summary = ended[0];
+    assert_eq!(summary.end_reason, SessionEndReason::SustainedWakefulness);
+    assert!(
+        summary.end_ts_ms >= morning_start_ms + 1_200_000,
+        "must close only after >= 20 min of morning wakefulness (closed at {} ms, morning_start {} ms)",
+        summary.end_ts_ms,
+        morning_start_ms
+    );
+    let pre_mu = summary
+        .pre_candidate_mu_hr
+        .expect("pre_candidate_mu_hr must be recorded");
+    assert!(
+        (pre_mu - 68.0).abs() < 2.0,
+        "Pre-Candidate Baseline must stay near 68 bpm, got {pre_mu:.2}"
+    );
+
+    let steep_reentry_epochs: Vec<_> = all_out
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::EpochEmitted(ep)
+                if ep.ts_ms >= reentry_start_ms
+                    && ep.ts_ms <= reentry_end_ms + 60_000
+                    && ep.features.hr_slope_4m <= -1.5 =>
+            {
+                Some(ep)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !steep_reentry_epochs.is_empty(),
+        "expected steep negative slope epochs during sleep re-entry"
+    );
+    for ep in steep_reentry_epochs {
+        assert!(
+            ep.p_active_wake < 0.50,
+            "steep downward sleep re-entry (slope={:.2}) must not classify as ActiveWake (p_active={:.3})",
+            ep.features.hr_slope_4m,
+            ep.p_active_wake
+        );
+    }
 }

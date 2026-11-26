@@ -1093,32 +1093,32 @@ async fn test_overnight_sleep_crosses_window_end_and_preserves_session_until_wak
     assert_eq!(st_boundary["monitoring_state"], "Sleeping");
     assert_eq!(st_boundary["armed"], false);
 
-    // Send 970s of morning wakefulness (74 bpm, P(Sleep) < 0.30)
+    // Send 1500s (25 min) of elevated morning wakefulness (80 bpm >= 20 continuous min)
     common::daemon::send_synthetic_wave_stream(
         &wearable_tx,
         &desc,
         common::daemon::SyntheticStreamParams {
             start_ts_ms: start_utc.timestamp_millis() + 1531 * 1000,
-            count_sec: 970,
-            base_bpm: 74.0,
+            count_sec: 1500,
+            base_bpm: 80.0,
             bpm_amplitude: 2.6,
             contact: bpmute::sleep_engine::ContactStatus::Contact,
         },
     )
     .await;
-    tokio::time::advance(Duration::from_secs(970)).await;
+    tokio::time::advance(Duration::from_secs(1500)).await;
 
     // Wakefulness confirmed outside active hours: session closes and transitions directly to Standby!
     // Wakefulness confirmed outside active hours: session closes and transitions directly to Standby!
     let state_final = client
-        .next_matching_event("StateChanged", 2000)
+        .next_matching_event("StateChanged", 5000)
         .await
         .unwrap()
         .expect("StateChanged to Standby");
     assert_eq!(state_final.data["monitoring_state"], "Standby");
 
     let sess_closed = client
-        .next_matching_event("SessionClosed", 2000)
+        .next_matching_event("SessionClosed", 5000)
         .await
         .unwrap()
         .expect("SessionClosed on morning wakefulness");
