@@ -8,7 +8,7 @@ Authoritative state boundaries across TUI, daemon IPC, sleep-onset monitoring, a
 TuiApp (src/tui/app.rs)
   └─ TuiIpcBridge (src/tui/client.rs, client_commands.rs)
        └─ Unix NDJSON IPC (src/ipc/server.rs)
-            └─ DaemonCore (src/daemon/state/mod.rs, ipc.rs)
+            └─ DaemonCore (src/daemon/state/mod.rs, ipc.rs, schedule.rs)
                  ├─ MonitoringContext (src/daemon/monitoring.rs) + SleepEngine (src/sleep_engine/state_machine/)
                  ├─ GraceCoordinator (src/actions/grace.rs)
                  └─ PersistenceWorker -> LedgerStore (src/storage/worker.rs, store/)
