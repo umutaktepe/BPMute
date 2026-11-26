@@ -20,7 +20,8 @@ use crate::ipc::protocol::{
     AlertChangedEvent, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonStatus,
     DiscoveredWearable, EnrollmentUpdateEvent, EpochUpdateEvent, GraceTickEvent, HrSampleEvent,
     MAX_FRAME_BYTES, PROTOCOL_VERSION, PushEventEnvelope, RequestEnvelope, ResponseEnvelope,
-    SessionClosedEvent, SessionStartedEvent, SnapshotEvent, WearablesUpdatedEvent,
+    SessionClosedEvent, SessionDiscardedEvent, SessionStartedEvent, SnapshotEvent,
+    WearablesUpdatedEvent,
 };
 
 #[derive(Deserialize)]
@@ -270,6 +271,13 @@ async fn handle_incoming_push(push: PushEventEnvelope, event_tx: &mpsc::Sender<T
             if let Ok(ev) = serde_json::from_value::<SessionClosedEvent>(push.data) {
                 let _ = event_tx
                     .send(TuiEvent::ipc(IpcEvent::SessionClosed(Box::new(ev.session))))
+                    .await;
+            }
+        }
+        "SessionDiscarded" => {
+            if let Ok(ev) = serde_json::from_value::<SessionDiscardedEvent>(push.data) {
+                let _ = event_tx
+                    .send(TuiEvent::ipc(IpcEvent::SessionDiscarded(ev)))
                     .await;
             }
         }

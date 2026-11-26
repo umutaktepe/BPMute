@@ -10,7 +10,7 @@ use crate::cli::args::{CalibrationCommand, SessionsCommand};
 use crate::config::{LoadedConfig, PatchField};
 use crate::exit_code::ExitCode;
 use crate::ipc::protocol::{
-    CalibrationSetBoundaryParams, SessionDeleteParams, SessionDeleteResponse,
+    CalibrationSetBoundaryParams, SessionDeleteParams, SessionDeleteResponse, SessionEndResponse,
     SessionExportTraceParams, SessionExportTraceResponse, SessionListParams, SetFeedbackParams,
     SetSeedParams,
 };
@@ -526,36 +526,48 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
                 Err(code) => return code,
             };
 
-            let detail: SessionFullDetail =
+            let response: SessionEndResponse =
                 match ipc_request_typed(&mut client, "session.end", serde_json::json!({}), stderr)
                     .await
                 {
-                    Ok(detail) => detail,
+                    Ok(resp) => resp,
                     Err(code) => return code,
                 };
 
             if json {
-                return write_json_line(&detail, stdout, stderr);
+                return write_json_line(&response, stdout, stderr);
             }
 
-            let wearable_label = format_wearable_label(
-                detail.wearable.alias.as_deref(),
-                &detail.wearable.mac_masked,
-                false,
-            );
-            let _ = writeln!(
-                stdout,
-                "Ended Monitoring Session {} (reason: {})",
-                detail.session.id,
-                detail.session.end_reason.as_str()
-            );
-            let _ = writeln!(stdout, "  Wearable: {wearable_label}");
-            let _ = writeln!(
-                stdout,
-                "  Window: {}..{} ms",
-                detail.session.start_ts_ms, detail.session.end_ts_ms
-            );
-            write_session_metrics(stdout, &detail.session);
+            match response {
+                SessionEndResponse::Closed(detail) => {
+                    let wearable_label = format_wearable_label(
+                        detail.wearable.alias.as_deref(),
+                        &detail.wearable.mac_masked,
+                        false,
+                    );
+                    let _ = writeln!(
+                        stdout,
+                        "Ended Monitoring Session {} (reason: {})",
+                        detail.session.id,
+                        detail.session.end_reason.as_str()
+                    );
+                    let _ = writeln!(stdout, "  Wearable: {wearable_label}");
+                    let _ = writeln!(
+                        stdout,
+                        "  Window: {}..{} ms",
+                        detail.session.start_ts_ms, detail.session.end_ts_ms
+                    );
+                    write_session_metrics(stdout, &detail.session);
+                }
+                SessionEndResponse::Discarded(discarded) => {
+                    let _ = writeln!(
+                        stdout,
+                        "Discarded incomplete-Warmup Monitoring Session {} (reason: {})",
+                        discarded.session_id,
+                        discarded.end_reason.as_str()
+                    );
+                }
+            }
             ExitCode::Success
         }
     }

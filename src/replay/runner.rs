@@ -82,6 +82,8 @@ pub struct ReplaySessionSummary {
     pub rapid_wake_fp_count: u8,
     #[serde(default)]
     pub snooze_count: u8,
+    #[serde(default)]
+    pub warmup_completed: bool,
     pub epochs_count: usize,
 }
 
@@ -106,6 +108,7 @@ impl ReplaySessionSummary {
             grace_cancel_count: s.grace_cancel_count,
             rapid_wake_fp_count: s.rapid_wake_fp_count,
             snooze_count: s.snooze_count,
+            warmup_completed: s.warmup_completed,
             epochs_count: s.epochs_count,
         }
     }
@@ -526,6 +529,7 @@ fn finalize_replay_report(
                 grace_cancel_count: 0,
                 rapid_wake_fp_count: 0,
                 snooze_count: 0,
+                warmup_completed: false,
                 epochs_count: act.epochs_count,
             }
         };

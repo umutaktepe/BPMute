@@ -310,9 +310,25 @@ pub(super) async fn execute_command(
             }
         }
         TuiCommand::SessionEnd => {
-            let resp =
-                send_op_request(req_tx, pending, next_id, "session.end", json!({}), event_tx)
-                    .await?;
+            let resp = send_request(req_tx, pending, next_id, "session.end", json!({})).await?;
+            let discarded = resp
+                .data
+                .as_ref()
+                .and_then(|d| d.get("discarded"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            let message = if resp.ok {
+                discarded.then(|| "Incomplete Warmup session discarded".to_string())
+            } else {
+                resp.error.as_ref().map(|e| e.message.clone())
+            };
+            let _ = event_tx
+                .send(TuiEvent::ipc(IpcEvent::OpCompleted {
+                    op: "session.end".to_string(),
+                    success: resp.ok,
+                    message,
+                }))
+                .await;
             if resp.ok {
                 refresh_sessions(req_tx, pending, next_id, event_tx, false).await?;
                 refresh_calibration(req_tx, pending, next_id, event_tx).await?;

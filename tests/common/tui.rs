@@ -333,6 +333,7 @@ pub fn make_session_summary(
         grace_cancel_count: 0,
         rapid_wake_fp_count: 0,
         snooze_count: 0,
+        warmup_completed: true,
         epochs_count: usize::from(with_raw_samples),
     }
 }

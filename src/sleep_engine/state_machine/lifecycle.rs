@@ -342,6 +342,7 @@ impl SleepEngine {
         self.pre_candidate_ln_rmssd = None;
         self.onset_hr_bpm = None;
         self.epochs_count = 0;
+        self.warmup_completed = false;
         self.warmup_clean_epochs = 0;
         self.stabilization_remaining_epochs = 0;
         self.anomalous = false;
@@ -456,6 +457,7 @@ impl SleepEngine {
             grace_cancel_count: self.grace_cancel_count,
             rapid_wake_fp_count: self.rapid_wake_fp_count,
             snooze_count: self.snooze_count,
+            warmup_completed: self.warmup_completed,
             epochs_count: self.epochs_count,
         }
     }

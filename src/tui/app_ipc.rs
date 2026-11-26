@@ -253,6 +253,25 @@ impl TuiApp {
                     return Some(TuiCommand::RefreshSessions);
                 }
             }
+            IpcEvent::SessionDiscarded(discarded) => {
+                self.history_sessions
+                    .retain(|s| s.id != discarded.session_id);
+                if self
+                    .selected_session_detail
+                    .as_ref()
+                    .is_some_and(|d| d.session.id == discarded.session_id)
+                {
+                    self.selected_session_detail = None;
+                    self.history_inspect.clear();
+                }
+                self.selected_session_idx = self
+                    .selected_session_idx
+                    .min(self.history_sessions.len().saturating_sub(1));
+                self.session_close_deadline_ms = None;
+                if self.daemon_connected {
+                    return Some(TuiCommand::RefreshSessions);
+                }
+            }
             IpcEvent::StateChanged(status) => {
                 self.apply_daemon_status(status);
             }
@@ -497,7 +516,7 @@ impl TuiApp {
                 } else if op == "session.end" && success {
                     self.op_feedback = Some(OpFeedback {
                         is_error: false,
-                        message: "Monitoring session ended".to_string(),
+                        message: message.unwrap_or_else(|| "Monitoring session ended".to_string()),
                     });
                 } else {
                     self.op_feedback = None;

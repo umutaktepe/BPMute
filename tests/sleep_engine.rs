@@ -3547,3 +3547,93 @@ fn overnight_bpm_only_rem_rise_and_steep_sleep_reentry_stays_single_session() {
         );
     }
 }
+
+#[test]
+fn session_summary_tracks_explicit_warmup_completion_independent_of_fallback_hr() {
+    // 1. Incomplete Warmup closures (after >= 1 clean epoch so fallback warmup_mu_hr is Some).
+    for close_kind in [
+        "stream_ended",
+        "gap_exceeded",
+        "manual_close",
+        "active_hours",
+    ] {
+        let mut eng = default_engine();
+        eng.set_active_hours(true);
+        let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+            ts_ms: 0,
+            status: StreamStatus::Streaming,
+        }));
+        let _ = push_calm_wake(&mut eng, 1, 90, 70.0, false);
+        assert_eq!(
+            eng.state(),
+            DetectorState::Warmup,
+            "90s must stay in Warmup for {close_kind}"
+        );
+
+        let out = match close_kind {
+            "stream_ended" => eng.force_close_session(91_000, SessionEndReason::StreamEnded),
+            "gap_exceeded" => {
+                let _ = eng.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+                    ts_ms: 91_000,
+                    reason: StreamDisconnectReason::Remote,
+                }));
+                eng.check_gap_timeout(91_000 + 130_000)
+            }
+            "manual_close" => {
+                let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+                    ts_ms: 91_000,
+                    status: StreamStatus::SignalLost,
+                }));
+                eng.manual_close_session().expect("manual close in gap")
+            }
+            "active_hours" => {
+                eng.set_active_hours(false);
+                eng.close_active_hours_expired(91_000)
+            }
+            _ => unreachable!(),
+        };
+
+        let summary = extract_session_ended(&out);
+        assert!(
+            summary.warmup_mu_hr.is_some(),
+            "fallback warmup_mu_hr is populated after 90s in {close_kind}"
+        );
+        assert!(
+            !summary.warmup_completed,
+            "warmup_completed must be false when closing during Warmup ({close_kind})"
+        );
+        assert!(
+            summary.is_incomplete_warmup_without_onset(),
+            "incomplete Warmup with no onset must flag discardable ({close_kind})"
+        );
+    }
+
+    // 2. Completed Warmup -> Monitoring closures mark warmup_completed = true, and a subsequent
+    //    session resets warmup_completed back to false.
+    let mut eng = default_engine();
+    eng.set_active_hours(true);
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 510, 70.0, false);
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    let completed_out = eng.force_close_session(511_000, SessionEndReason::StreamEnded);
+    let completed_summary = extract_session_ended(&completed_out);
+    assert!(completed_summary.warmup_completed);
+    assert!(!completed_summary.is_incomplete_warmup_without_onset());
+
+    // Open session #2 and close before Warmup completes -> must reset to false.
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 600_000,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 601, 660, 69.0, false);
+    assert_eq!(eng.state(), DetectorState::Warmup);
+    let second_out = eng.force_close_session(661_000, SessionEndReason::StreamEnded);
+    let second_summary = extract_session_ended(&second_out);
+    assert_eq!(second_summary.session_index, 2);
+    assert!(!second_summary.warmup_completed);
+    assert!(second_summary.is_incomplete_warmup_without_onset());
+}

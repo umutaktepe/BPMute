@@ -78,6 +78,10 @@ enum DbCommand {
         now_ms: i64,
         reply: oneshot::Sender<Result<(String, CalibrationState), StorageError>>,
     },
+    DiscardIncompleteSession {
+        session_id: String,
+        reply: oneshot::Sender<Result<bool, StorageError>>,
+    },
     ExportTrace {
         id_or_prefix: String,
         dest_path: PathBuf,
@@ -392,6 +396,9 @@ fn dispatch_command(store: &mut LedgerStore, cmd: DbCommand) {
             reply,
         } => {
             let _ = reply.send(store.delete_session_and_recompute(&id_or_prefix, now_ms));
+        }
+        DbCommand::DiscardIncompleteSession { session_id, reply } => {
+            let _ = reply.send(store.discard_incomplete_session(&session_id));
         }
         DbCommand::ExportTrace {
             id_or_prefix,
@@ -723,6 +730,14 @@ impl PersistenceHandle {
             reply,
         })
         .await
+    }
+
+    pub(crate) async fn discard_incomplete_session(
+        &self,
+        session_id: String,
+    ) -> Result<bool, StorageError> {
+        self.call(|reply| DbCommand::DiscardIncompleteSession { session_id, reply })
+            .await
     }
 
     pub async fn export_trace(

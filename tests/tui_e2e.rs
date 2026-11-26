@@ -4183,8 +4183,26 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
         None
     );
 
+    // Complete Warmup into Monitoring so manual closure persists session #1 as Closed.
+    common::daemon::send_synthetic_wave_stream(
+        &w_tx,
+        &desc,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t_resume + 1_000,
+            count_sec: 500,
+            base_bpm: 66.0,
+            bpm_amplitude: 2.2,
+            contact: ContactStatus::Contact,
+        },
+    )
+    .await;
+    wait_for_app_state_with_budget(&mut app2, &mut event_rx2, Some(&cmd_tx2), 2000, |a| {
+        a.monitoring_state == MonitoringState::Monitoring
+    })
+    .await;
+
     // 6. Disconnect again and test mouse click closure
-    let t_dc2 = t_resume + 5_000;
+    let t_dc2 = t_resume + 505_000;
     w_tx.send(WearableEvent::StreamState {
         wearable: desc.clone(),
         state: StreamState {
@@ -4232,7 +4250,7 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     assert!(find_text_coords(terminal.backend().buffer(), "Monitoring session ended").is_some());
     assert!(find_text_coords(terminal.backend().buffer(), "[E] End Session").is_none());
 
-    // 7. Test keyboard 'E' closure on subsequent session
+    // 7. Test keyboard 'E' closure on subsequent incomplete-Warmup session -> discards from History
     let t_new = t_dc2 + 10_000;
     w_tx.send(WearableEvent::StreamState {
         wearable: desc.clone(),
@@ -4257,7 +4275,7 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     .unwrap();
 
     wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
-        a.monitoring_state != MonitoringState::Idle
+        a.monitoring_state != MonitoringState::Idle && a.history_sessions.len() == 2
     })
     .await;
 
@@ -4278,7 +4296,7 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     })
     .await;
 
-    // Key 'E' immediately invokes session.end
+    // Key 'E' immediately invokes session.end and discards incomplete-Warmup session #2
     let key_cmd = app2.handle_event(TuiEvent::Key(key(KeyCode::Char('E'))));
     assert_eq!(key_cmd, Some(TuiCommand::SessionEnd));
     cmd_tx2.send(key_cmd.unwrap()).await.unwrap();
@@ -4286,9 +4304,11 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     wait_for_app_state_with_cmds(&mut app2, &mut event_rx2, Some(&cmd_tx2), |a| {
         a.monitoring_state == MonitoringState::Idle
             && a.session_close_deadline_ms.is_none()
-            && a.history_sessions
-                .first()
-                .is_some_and(|s| s.end_reason == Some(SessionEndReason::ManualClose))
+            && a.history_sessions.len() == 1
+            && a.history_sessions[0].end_reason == Some(SessionEndReason::ManualClose)
+            && a.op_feedback
+                .as_ref()
+                .is_some_and(|f| f.message == "Incomplete Warmup session discarded")
     })
     .await;
 

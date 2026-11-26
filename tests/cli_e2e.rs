@@ -728,9 +728,29 @@ async fn test_sessions_end_cli_gap_gated_and_preconditions() {
     assert_eq!(code_streaming, ExitCode::PreconditionConflict);
     assert!(err_streaming.contains("streaming"));
 
+    // Complete Warmup into Monitoring so manual closure persists session #1
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &wearable,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t0 + 2_000,
+            count_sec: 500,
+            base_bpm: 66.0,
+            bpm_amplitude: 2.2,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
+            break;
+        }
+    }
+
     // 5. Disconnect wearable at t_dc (start gap)
-    let t_dc = t0 + 10_000;
-    tokio::time::advance(Duration::from_secs(9)).await;
+    let t_dc = t0 + 510_000;
+    tokio::time::advance(Duration::from_secs(509)).await;
     wearable_tx
         .send(WearableEvent::StreamDisconnected {
             wearable: wearable.clone(),
@@ -765,6 +785,49 @@ async fn test_sessions_end_cli_gap_gated_and_preconditions() {
     // 8. Subsequent call on Idle -> ExitCode::PreconditionConflict (4)
     let (code_after, _, _) = run_inproc_cli(&["bpmute", "sessions", "end"], &env).await;
     assert_eq!(code_after, ExitCode::PreconditionConflict);
+
+    // 9. Incomplete-Warmup session closed via CLI `sessions end --json` is discarded cleanly
+    let t_s2 = t_dc + 10_000;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: t_s2,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+    let s2_id = loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "SessionStarted" {
+            break ev.data["session_id"].as_str().unwrap().to_string();
+        }
+    };
+    wearable_tx
+        .send(WearableEvent::StreamDisconnected {
+            wearable: wearable.clone(),
+            ts_ms: t_s2 + 5_000,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+    loop {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
+            break;
+        }
+    }
+    let (code_disc, out_disc, err_disc) =
+        run_inproc_cli(&["bpmute", "sessions", "end", "--json"], &env).await;
+    assert_eq!(code_disc, ExitCode::Success, "stderr: {err_disc}");
+    let disc_json: Value = serde_json::from_str(out_disc.trim()).unwrap();
+    assert_eq!(disc_json["discarded"], true);
+    assert_eq!(disc_json["session_id"], s2_id);
+    assert_eq!(disc_json["end_reason"], "manual_close");
+    let (code_missing, _, _) = run_inproc_cli(&["bpmute", "sessions", "show", &s2_id], &env).await;
+    assert_ne!(code_missing, ExitCode::Success);
 
     daemon.shutdown().await;
 }

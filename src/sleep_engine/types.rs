@@ -560,10 +560,20 @@ pub struct SessionSummary {
     pub rapid_wake_fp_count: u8,
     #[serde(default)]
     pub snooze_count: u8,
+    #[serde(default)]
+    pub warmup_completed: bool,
     pub epochs_count: usize,
 }
 
 impl SessionSummary {
+    /// Returns `true` when the session closed before completing `Warmup` without sleep onset.
+    pub fn is_incomplete_warmup_without_onset(&self) -> bool {
+        !self.warmup_completed
+            && self.candidate_ts_ms.is_none()
+            && self.confirmed_ts_ms.is_none()
+            && self.sleeping_ts_ms.is_none()
+    }
+
     /// Resolves the waking reference heart rate, prioritizing pre-candidate quiet wake over warmup.
     pub fn wake_ref(&self) -> Option<f64> {
         self.pre_candidate_mu_hr.or(self.warmup_mu_hr)

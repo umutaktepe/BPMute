@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::Arc;
 
 use bpmute::bluetooth::packet::parse_hr_measurement;
@@ -110,6 +112,33 @@ impl TestHarness {
             wearable,
         }
     }
+}
+
+async fn complete_warmup_stream(
+    feed_tx: &mpsc::Sender<WearableEvent>,
+    wearable: &WearableDescriptor,
+    sub_client: &mut IpcClient,
+    start_ts_ms: i64,
+) -> i64 {
+    common::daemon::send_synthetic_wave_stream(
+        feed_tx,
+        wearable,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms,
+            count_sec: 500,
+            base_bpm: 68.0,
+            bpm_amplitude: 2.4,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
+            break;
+        }
+    }
+    start_ts_ms + 500_000
 }
 
 #[tokio::test]
@@ -230,13 +259,15 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
     let session_id = sessions[0]["id"].as_str().unwrap().to_string();
     assert_eq!(sessions[0]["wearable_alias"].as_str(), Some("Test Strap"));
 
-    // 5. Feed StreamState Disconnected and close the stream source to flush/close the session
+    // 5. Complete Warmup into Monitoring, then feed Disconnected and close the stream source
+    let t_after_warmup =
+        complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 6000).await;
     feed_tx
         .send(WearableEvent::StreamState {
             wearable: wearable.clone(),
             state: StreamState {
                 status: StreamStatus::Disconnected,
-                ts_ms: t0 + 6000,
+                ts_ms: t_after_warmup + 1000,
             },
         })
         .await
@@ -314,13 +345,17 @@ async fn virtual_time_sustained_disconnection_gap_timeout_closes_session() {
     let session_id = sessions[0]["id"].as_str().unwrap().to_string();
     assert_eq!(sessions[0]["status"].as_str(), Some("active"));
 
-    // Disconnect at t0 + 2000 ms. Do NOT drop feed_tx!
+    // Complete Warmup into Monitoring before disconnecting
+    let t_mon = complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 2000).await;
+    tokio::time::advance(std::time::Duration::from_secs(502)).await;
+
+    // Disconnect at t_mon + 1000 ms. Do NOT drop feed_tx!
     feed_tx
         .send(WearableEvent::StreamState {
             wearable: wearable.clone(),
             state: StreamState {
                 status: StreamStatus::Disconnected,
-                ts_ms: t0 + 2000,
+                ts_ms: t_mon + 1000,
             },
         })
         .await
@@ -413,18 +448,21 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
         }
     };
 
-    // 2. Explicit Remote disconnect at t0 + 2_000 -> deadline = t0 + 122_001 via StateChanged, daemon.status, and Snapshot.
-    tokio::time::advance(Duration::from_secs(1)).await;
+    // Complete Warmup into Monitoring so session 1 persists on GapExceeded.
+    let w1_end = complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 2_000).await;
+    tokio::time::advance(Duration::from_secs(501)).await;
+
+    // 2. Explicit Remote disconnect at w1_end -> deadline = w1_end + 120_001 via StateChanged, daemon.status, and Snapshot.
     feed_tx
         .send(WearableEvent::StreamDisconnected {
             wearable: wearable.clone(),
-            ts_ms: t0 + 2_000,
+            ts_ms: w1_end,
             reason: StreamDisconnectReason::Remote,
         })
         .await
         .unwrap();
 
-    let expected_remote_deadline = t0 + 2_000 + 120_001;
+    let expected_remote_deadline = w1_end + 120_001;
     loop {
         let ev = sub_client.next_event().await.unwrap();
         if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
@@ -453,15 +491,16 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
         late_snap.data["status"]["session_close_deadline_ms"].as_i64(),
         Some(expected_remote_deadline)
     );
+    drop(late_sub);
 
-    // 3. Reconnect within 2 minutes (at t0 + 62_000) -> clears deadline and continues session 1.
+    // 3. Reconnect within 2 minutes (at w1_end + 60_000) -> clears deadline and continues session 1.
     tokio::time::advance(Duration::from_secs(60)).await;
     feed_tx
         .send(WearableEvent::StreamState {
             wearable: wearable.clone(),
             state: StreamState {
                 status: StreamStatus::Streaming,
-                ts_ms: t0 + 62_000,
+                ts_ms: w1_end + 60_000,
             },
         })
         .await
@@ -476,20 +515,21 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     let status_resumed = client.request("daemon.status", json!({})).await.unwrap();
     assert!(status_resumed.get("session_close_deadline_ms").is_none());
 
-    // 4. SignalLost at t0 + 70_000 (+15 min), then Remote at t0 + 100_000 (tightens to +2 min from t0 + 100_000).
+    // 4. SignalLost at w1_end + 68_000 (+15 min), then Remote at w1_end + 98_000 (tightens to +2 min from w1_end + 98_000).
+    let t_sig_lost = w1_end + 68_000;
     tokio::time::advance(Duration::from_secs(8)).await;
     feed_tx
         .send(WearableEvent::StreamState {
             wearable: wearable.clone(),
             state: StreamState {
                 status: StreamStatus::SignalLost,
-                ts_ms: t0 + 70_000,
+                ts_ms: t_sig_lost,
             },
         })
         .await
         .unwrap();
 
-    let expected_sig_deadline = t0 + 70_000 + 900_001;
+    let expected_sig_deadline = t_sig_lost + 900_001;
     loop {
         let ev = sub_client.next_event().await.unwrap();
         if ev.event == "StateChanged"
@@ -500,16 +540,17 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     }
 
     tokio::time::advance(Duration::from_secs(30)).await;
+    let t_remote_tighten = t_sig_lost + 30_000;
     feed_tx
         .send(WearableEvent::StreamDisconnected {
             wearable: wearable.clone(),
-            ts_ms: t0 + 100_000,
+            ts_ms: t_remote_tighten,
             reason: StreamDisconnectReason::Remote,
         })
         .await
         .unwrap();
 
-    let expected_tight_deadline = t0 + 100_000 + 120_001;
+    let expected_tight_deadline = t_remote_tighten + 120_001;
     loop {
         let ev = sub_client.next_event().await.unwrap();
         if ev.event == "StateChanged"
@@ -523,13 +564,13 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     tokio::time::advance(Duration::from_secs(115)).await;
     tokio::task::yield_now().await;
     let status_pre_close = client.request("daemon.status", json!({})).await.unwrap();
-    assert_eq!(status_pre_close["monitoring_state"], "Warmup");
+    assert_eq!(status_pre_close["monitoring_state"], "Monitoring");
     assert_eq!(
         status_pre_close["session_close_deadline_ms"].as_i64(),
         Some(expected_tight_deadline)
     );
 
-    // Advance past tightened 2-min deadline (+6s -> t0 + 221_000) -> closes with end_ts_ms = t0 + 70_000 (original SignalLost).
+    // Advance past tightened 2-min deadline (+6s) -> closes with end_ts_ms = t_sig_lost (original SignalLost).
     tokio::time::advance(Duration::from_secs(6)).await;
     let mut saw_idle_clear = false;
     let mut saw_closed = false;
@@ -549,14 +590,14 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
             );
             assert_eq!(
                 ev.data["session"]["session"]["end_ts_ms"].as_i64(),
-                Some(t0 + 70_000)
+                Some(t_sig_lost)
             );
             saw_closed = true;
         }
     }
 
     // 5. Timeout disconnect preserves 15-minute tolerance (> 2 min stays open, > 15 min closes).
-    let t_s2 = t0 + 300_000;
+    let t_s2 = t_remote_tighten + 200_000;
     tokio::time::advance(Duration::from_secs(79)).await;
     feed_tx
         .send(WearableEvent::StreamState {
@@ -576,17 +617,18 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     };
     assert_ne!(session_2_id, session_1_id);
 
-    tokio::time::advance(Duration::from_secs(1)).await;
+    let w2_end = complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t_s2 + 1_000).await;
+    tokio::time::advance(Duration::from_secs(501)).await;
     feed_tx
         .send(WearableEvent::StreamDisconnected {
             wearable: wearable.clone(),
-            ts_ms: t_s2 + 1_000,
+            ts_ms: w2_end,
             reason: StreamDisconnectReason::Timeout,
         })
         .await
         .unwrap();
 
-    let expected_timeout_deadline = t_s2 + 1_000 + 900_001;
+    let expected_timeout_deadline = w2_end + 900_001;
     loop {
         let ev = sub_client.next_event().await.unwrap();
         if ev.event == "StateChanged"
@@ -600,13 +642,13 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     tokio::time::advance(Duration::from_secs(130)).await;
     tokio::task::yield_now().await;
     let status_mid_timeout = client.request("daemon.status", json!({})).await.unwrap();
-    assert_eq!(status_mid_timeout["monitoring_state"], "Warmup");
+    assert_eq!(status_mid_timeout["monitoring_state"], "Monitoring");
     assert_eq!(
         status_mid_timeout["session_close_deadline_ms"].as_i64(),
         Some(expected_timeout_deadline)
     );
 
-    // Advance remaining 771s (total 901s > 900s) -> closes session 2 with GapExceeded at t_s2 + 1_000.
+    // Advance remaining 771s (total 901s > 900s) -> closes session 2 with GapExceeded at w2_end.
     tokio::time::advance(Duration::from_secs(771)).await;
     loop {
         let ev = sub_client.next_event().await.unwrap();
@@ -621,7 +663,7 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
             );
             assert_eq!(
                 ev.data["session"]["session"]["end_ts_ms"].as_i64(),
-                Some(t_s2 + 1_000)
+                Some(w2_end)
             );
             break;
         }
@@ -632,10 +674,10 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     let store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
     let d1 = store.get_session(&session_1_id).unwrap();
     assert_eq!(d1.session.end_reason, SessionEndReason::GapExceeded);
-    assert_eq!(d1.session.end_ts_ms, t0 + 70_000);
+    assert_eq!(d1.session.end_ts_ms, t_sig_lost);
     let d2 = store.get_session(&session_2_id).unwrap();
     assert_eq!(d2.session.end_reason, SessionEndReason::GapExceeded);
-    assert_eq!(d2.session.end_ts_ms, t_s2 + 1_000);
+    assert_eq!(d2.session.end_ts_ms, w2_end);
 
     daemon.shutdown().await;
 }
@@ -711,8 +753,12 @@ async fn virtual_time_gap_gated_manual_session_closure_and_rejections() {
         panic!("expected Server error");
     }
 
+    // Complete Warmup into Monitoring before disconnecting
+    let t_after_warmup =
+        complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 20_000).await;
+
     // Feed a few trailing raw packets that do not form a complete 15-s epoch
-    let t_trailing = t0 + 20_000;
+    let t_trailing = t_after_warmup;
     feed_tx
         .send(WearableEvent::HrPacket {
             wearable: wearable.clone(),
@@ -727,7 +773,7 @@ async fn virtual_time_gap_gated_manual_session_closure_and_rejections() {
         .unwrap();
 
     // 4. Disconnect wearable (start gap at t_dc)
-    let t_dc = t0 + 25_000;
+    let t_dc = t_after_warmup + 5_000;
     feed_tx
         .send(WearableEvent::StreamDisconnected {
             wearable: wearable.clone(),
@@ -866,6 +912,10 @@ async fn virtual_time_manual_session_closure_aborts_active_grace_without_penalty
         }
     };
 
+    // Complete Warmup into Monitoring before triggering grace / manual closure
+    let t_after_warmup =
+        complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 10_000).await;
+
     // 2. Start Grace Period via test trigger
     let trig_res = client
         .request("monitor.test_trigger", json!({ "grace_sec": 60 }))
@@ -875,7 +925,7 @@ async fn virtual_time_manual_session_closure_aborts_active_grace_without_penalty
     assert!(daemon.core().is_in_grace_period());
 
     // 3. Disconnect wearable (start gap at t_dc while Grace Period is active)
-    let t_dc = t0 + 20_000;
+    let t_dc = t_after_warmup + 10_000;
     feed_tx
         .send(WearableEvent::StreamDisconnected {
             wearable: wearable.clone(),

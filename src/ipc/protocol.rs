@@ -8,7 +8,7 @@ use crate::actions::GracePhase;
 use crate::calibration::{CalibrationState, FeedbackVerdict};
 use crate::config::{ClockTime, Config, LogFormat, PatchField, ScheduleConfig};
 use crate::replay::TraceFormat;
-use crate::sleep_engine::{ContactStatus, DetectorState, Epoch, StreamStatus};
+use crate::sleep_engine::{ContactStatus, DetectorState, Epoch, SessionEndReason, StreamStatus};
 use crate::storage::{EnrolledWearable, ImportMode, ImportSummary, SessionFullDetail};
 
 /// Current NDJSON IPC protocol version (ADR-0002).
@@ -612,6 +612,31 @@ pub struct EpochUpdateEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionClosedEvent {
     pub session: SessionFullDetail,
+}
+
+/// Control event payload pushed as `SessionDiscarded` when an incomplete-Warmup
+/// `Monitoring Session` closes without sleep onset and is removed from persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDiscardedEvent {
+    pub session_id: String,
+    pub wearable_id: String,
+    pub end_reason: SessionEndReason,
+}
+
+/// Response payload returned by `session.end` when an incomplete-Warmup session is discarded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDiscardedResponse {
+    pub discarded: bool,
+    pub session_id: String,
+    pub end_reason: SessionEndReason,
+}
+
+/// Response payload returned by `session.end` (persisted detail or discarded summary).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SessionEndResponse {
+    Closed(Box<SessionFullDetail>),
+    Discarded(SessionDiscardedResponse),
 }
 
 /// Control event payload pushed as `CalibrationUpdated` after any ledger recompute.

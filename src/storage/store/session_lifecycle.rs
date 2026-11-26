@@ -71,4 +71,20 @@ impl LedgerStore {
             Ok(())
         })
     }
+
+    /// Deletes an active incomplete-Warmup `Monitoring Session` without altering calibration.
+    pub fn discard_incomplete_session(&mut self, session_id: &str) -> Result<bool, StorageError> {
+        let deleted = self.write_tx(|tx| {
+            let rows = tx.execute(
+                "DELETE FROM sessions WHERE id = ?1 AND status = 'active'",
+                params![session_id],
+            )?;
+            Ok(rows > 0)
+        })?;
+        if deleted {
+            self.reclaim_freelist_pages()?;
+        }
+        self.flush_wal()?;
+        Ok(deleted)
+    }
 }

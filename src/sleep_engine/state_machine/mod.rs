@@ -161,6 +161,7 @@ pub struct SleepEngine {
     pre_candidate_ln_rmssd: Option<f64>,
     onset_hr_bpm: Option<f64>,
     epochs_count: usize,
+    warmup_completed: bool,
     warmup_clean_epochs: u32,
     stabilization_remaining_epochs: u32,
     anomalous: bool,
@@ -222,6 +223,7 @@ impl SleepEngine {
             pre_candidate_ln_rmssd: None,
             onset_hr_bpm: None,
             epochs_count: 0,
+            warmup_completed: false,
             warmup_clean_epochs: 0,
             stabilization_remaining_epochs: 0,
             anomalous: false,
@@ -572,6 +574,7 @@ impl SleepEngine {
                     if self.warmup_clean_epochs >= self.required_warmup_epochs() {
                         self.snapshot_warmup_baseline();
                         self.evaluate_warmup_anomaly();
+                        self.warmup_completed = true;
                         self.transition_to(
                             ts_ms,
                             DetectorState::Monitoring,

@@ -11,14 +11,15 @@ use crate::daemon::EngineControlEvent;
 use crate::daemon::state::{DaemonCore, ipc_err, storage_to_ipc_err};
 use crate::daemon::wearable::{WearableDescriptor, WearableEvent};
 use crate::ipc::protocol::{
-    EpochUpdateEvent, ErrorPayload, HrSampleEvent, SessionStartedEvent, error_codes,
+    EpochUpdateEvent, ErrorPayload, HrSampleEvent, SessionDiscardedEvent, SessionDiscardedResponse,
+    SessionEndResponse, SessionStartedEvent, error_codes,
 };
 use crate::logging::BiometricLogContext;
 use crate::sleep_engine::{
     DetectorState, EngineConfig, EngineEvent, EngineOutput, GraceAbortReason, HrPacket,
     ManualCloseError, SessionEndReason, SleepEngine, StreamDisconnected, StreamStatus,
 };
-use crate::storage::{CloseSessionRequest, OpenSessionRequest, SessionFullDetail, StorageError};
+use crate::storage::{CloseSessionRequest, OpenSessionRequest, StorageError};
 
 struct MonitoringContext {
     core: Arc<DaemonCore>,
@@ -290,7 +291,7 @@ impl MonitoringContext {
         }
     }
 
-    async fn manual_close_active_session(&mut self) -> Result<SessionFullDetail, ErrorPayload> {
+    async fn manual_close_active_session(&mut self) -> Result<SessionEndResponse, ErrorPayload> {
         if self.active_session_id.is_none() {
             return Err(ipc_err(
                 error_codes::PRECONDITION_FAILED,
@@ -390,7 +391,7 @@ impl MonitoringContext {
         &mut self,
         wearable_id: &str,
         outputs: Vec<EngineOutput>,
-    ) -> Option<Result<SessionFullDetail, StorageError>> {
+    ) -> Option<Result<SessionEndResponse, StorageError>> {
         let mut closed_result = None;
         for output in outputs {
             match output {
@@ -459,49 +460,79 @@ impl MonitoringContext {
                     }
                 }
                 EngineOutput::SessionEnded(summary) => {
+                    let trigger_power = self.core.take_trigger_power_action();
+                    let is_rapid = self.core.take_rapid_resume();
                     if let Some(sid) = self.active_session_id.take() {
-                        let remaining_raw = std::mem::take(&mut self.pending_raw);
-                        if !remaining_raw.is_empty()
-                            && let Err(err) = self
+                        if summary.is_incomplete_warmup_without_onset() {
+                            self.pending_raw.clear();
+                            match self
                                 .core
                                 .persistence
-                                .append_epoch_and_raw(sid.clone(), None, remaining_raw)
+                                .discard_incomplete_session(sid.clone())
                                 .await
-                        {
-                            tracing::error!(error = %err, "failed to flush trailing raw samples");
-                        }
-
-                        let close_now_ms = self
-                            .core
-                            .clock
-                            .now_utc()
-                            .timestamp_millis()
-                            .max(summary.end_ts_ms);
-                        let trigger_power = self.core.take_trigger_power_action();
-                        let is_rapid = self.core.take_rapid_resume();
-                        match self
-                            .core
-                            .persistence
-                            .close_session_slim_and_recompute(
-                                CloseSessionRequest {
-                                    session_id: sid,
-                                    summary,
-                                    trigger_power_action: trigger_power,
-                                    rapid_resume_within_5m: is_rapid,
-                                },
-                                close_now_ms,
-                            )
-                            .await
-                        {
-                            Ok((detail, cal_state)) => {
-                                let floor = cal_state.wearable_floor(wearable_id);
-                                self.engine.update_calibration(cal_state.to_priors(), floor);
-                                self.core.on_session_closed(detail.clone(), cal_state);
-                                closed_result = Some(Ok(detail));
+                            {
+                                Ok(_) => {
+                                    self.core.on_session_discarded(SessionDiscardedEvent {
+                                        session_id: sid.clone(),
+                                        wearable_id: wearable_id.to_string(),
+                                        end_reason: summary.end_reason,
+                                    });
+                                    closed_result = Some(Ok(SessionEndResponse::Discarded(
+                                        SessionDiscardedResponse {
+                                            discarded: true,
+                                            session_id: sid,
+                                            end_reason: summary.end_reason,
+                                        },
+                                    )));
+                                }
+                                Err(err) => {
+                                    tracing::error!(error = %err, "failed to discard incomplete-warmup session");
+                                    closed_result = Some(Err(err));
+                                }
                             }
-                            Err(err) => {
-                                tracing::error!(error = %err, "failed to close session and recompute calibration");
-                                closed_result = Some(Err(err));
+                        } else {
+                            let remaining_raw = std::mem::take(&mut self.pending_raw);
+                            if !remaining_raw.is_empty()
+                                && let Err(err) = self
+                                    .core
+                                    .persistence
+                                    .append_epoch_and_raw(sid.clone(), None, remaining_raw)
+                                    .await
+                            {
+                                tracing::error!(error = %err, "failed to flush trailing raw samples");
+                            }
+
+                            let close_now_ms = self
+                                .core
+                                .clock
+                                .now_utc()
+                                .timestamp_millis()
+                                .max(summary.end_ts_ms);
+                            match self
+                                .core
+                                .persistence
+                                .close_session_slim_and_recompute(
+                                    CloseSessionRequest {
+                                        session_id: sid,
+                                        summary,
+                                        trigger_power_action: trigger_power,
+                                        rapid_resume_within_5m: is_rapid,
+                                    },
+                                    close_now_ms,
+                                )
+                                .await
+                            {
+                                Ok((detail, cal_state)) => {
+                                    let floor = cal_state.wearable_floor(wearable_id);
+                                    self.engine.update_calibration(cal_state.to_priors(), floor);
+                                    self.core.on_session_closed(detail.clone(), cal_state);
+                                    closed_result =
+                                        Some(Ok(SessionEndResponse::Closed(Box::new(detail))));
+                                }
+                                Err(err) => {
+                                    tracing::error!(error = %err, "failed to close session and recompute calibration");
+                                    closed_result = Some(Err(err));
+                                }
                             }
                         }
                     }

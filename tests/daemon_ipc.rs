@@ -1740,6 +1740,19 @@ async fn test_post_sleep_standby_inside_active_hours_syncs_armed_on_window_exit_
         .expect("SessionClosed");
     assert_eq!(sess_closed.data["session"]["session"]["id"], session_id);
 
+    // Drain remaining 1500s wake stream packets before jumping virtual clock to 08:05.
+    let wake_stream_end_ts = sleep_ts + 1500 * 1000;
+    loop {
+        let ev = client
+            .next_matching_event("HrSample", 500)
+            .await
+            .unwrap()
+            .expect("HrSample at end of wake stream");
+        if ev.data["ts_ms"].as_i64() == Some(wake_stream_end_ts) {
+            break;
+        }
+    }
+
     // Advance clock past 08:00 (08:05 next morning, 9h5m after 23:00 = 32700s total from start)
     let elapsed_so_far_sec = (sleep_ts - start_utc.timestamp_millis()) / 1000 + 1500;
     let to_0805_sec = (9 * 3600 + 5 * 60) - elapsed_so_far_sec;
@@ -1766,6 +1779,16 @@ async fn test_post_sleep_standby_inside_active_hours_syncs_armed_on_window_exit_
         .expect("StateChanged when Standby crosses outside Active Hours");
     assert_eq!(state_disarmed.data["monitoring_state"], "Standby");
     assert_eq!(state_disarmed.data["armed"], false);
+    loop {
+        let ev = client
+            .next_matching_event("HrSample", 50)
+            .await
+            .unwrap()
+            .expect("HrSample at 08:05");
+        if ev.data["ts_ms"].as_i64() == Some(ts_0805) {
+            break;
+        }
+    }
 
     // Advance clock to next Active Hours window start (22:05, +14h from 08:05) -> opens session #2
     tokio::time::advance(Duration::from_secs(14 * 3600)).await;
@@ -1797,9 +1820,330 @@ async fn test_post_sleep_standby_inside_active_hours_syncs_armed_on_window_exit_
         .unwrap()
         .expect("SessionStarted #2 at next Active Hours start");
     assert_ne!(sess2.data["session_id"], session_id);
+    assert_eq!(sess2.data["start_ts_ms"], ts_2205);
 
     let sess_list = client.request("session.list", json!({})).await.unwrap();
     assert_eq!(sess_list["total_count"], 2);
 
     daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn incomplete_warmup_sessions_are_visible_live_and_discarded_on_all_closure_reasons() {
+    use bpmute::calibration::CalibrationState;
+    use bpmute::config::PowerAction;
+    use bpmute::sleep_engine::{ContactStatus, StreamDisconnectReason, StreamState, StreamStatus};
+    use bpmute::storage::{
+        CloseSessionRequest, LedgerStore, OpenSessionRequest, db_path_in_data_dir,
+        lock_path_in_data_dir,
+    };
+
+    let temp = TempDir::new().unwrap();
+    let paths = test_paths(&temp);
+    let env = MapEnv::new();
+
+    // Start at 23:00 local inside Active Hours [22:00, 08:00).
+    let local_23h = Local.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let start_utc = local_23h.with_timezone(&Utc);
+    let base_ts = start_utc.timestamp_millis();
+
+    let desc_a = WearableDescriptor {
+        mac: "AA:11:22:33:44:55".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Warmup Watch A".to_string()),
+        advertised_name: Some("Watch A".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+    let desc_b = WearableDescriptor {
+        mac: "AA:11:22:33:44:66".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("Warmup Watch B".to_string()),
+        advertised_name: Some("Watch B".to_string()),
+        supports_rr: false,
+        supports_contact: true,
+    };
+
+    // Seed two prior closed sessions so CalibrationMaturity is Learning with personal priors.
+    let db_path = db_path_in_data_dir(&paths.data_dir);
+    let lock_path = lock_path_in_data_dir(&paths.data_dir);
+    {
+        let mut store = LedgerStore::open_read_write(&db_path, &lock_path).unwrap();
+        let wid = store
+            .upsert_wearable(&desc_a, base_ts - 200_000_000)
+            .unwrap();
+        for day in [2_i64, 1_i64] {
+            let s_start = base_ts - day * 86_400_000;
+            let sid = store
+                .open_session(&OpenSessionRequest {
+                    wearable_id: wid.clone(),
+                    start_ts_ms: s_start,
+                    detection_sensitivity: bpmute::config::Sensitivity::Balanced,
+                })
+                .unwrap();
+            let summary = common::sample_session_summary(s_start, s_start + 3_600_000, 55.0);
+            store
+                .close_session_and_recompute(
+                    &CloseSessionRequest {
+                        session_id: sid,
+                        summary,
+                        trigger_power_action: PowerAction::None,
+                        rapid_resume_within_5m: false,
+                    },
+                    s_start + 3_600_000,
+                )
+                .unwrap();
+        }
+    }
+
+    let (source, wearable_tx) = common::daemon::TestWearableSource::new();
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = ClockTime::new(8, 0).unwrap();
+
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(start_utc));
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, std::sync::Arc::new(env), clock)
+            .with_wearable_source(std::sync::Arc::new(source)),
+    )
+    .await
+    .expect("daemon should start");
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    client.request("daemon.subscribe", json!({})).await.unwrap();
+    let _snap = client.next_event().await.unwrap();
+
+    let baseline_cal: CalibrationState = serde_json::from_value(
+        client
+            .request("calibration.status", json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(baseline_cal.valid_sessions, 2);
+
+    // Helper: start Warmup streaming (90s -> ~5 epochs, still Warmup) and verify live visibility.
+    async fn start_live_warmup(
+        wearable_tx: &tokio::sync::mpsc::Sender<bpmute::daemon::WearableEvent>,
+        desc: &WearableDescriptor,
+        client: &mut IpcClient,
+        t0: i64,
+        expected_total: u64,
+    ) -> String {
+        wearable_tx
+            .send(bpmute::daemon::WearableEvent::StreamState {
+                wearable: desc.clone(),
+                state: StreamState {
+                    ts_ms: t0,
+                    status: StreamStatus::Streaming,
+                },
+            })
+            .await
+            .unwrap();
+        let started = client
+            .next_matching_event("SessionStarted", 20)
+            .await
+            .unwrap()
+            .expect("SessionStarted");
+        let sid = started.data["session_id"].as_str().unwrap().to_string();
+
+        common::daemon::send_synthetic_wave_stream(
+            wearable_tx,
+            desc,
+            common::daemon::SyntheticStreamParams {
+                start_ts_ms: t0 + 1_000,
+                count_sec: 90,
+                base_bpm: 71.0,
+                bpm_amplitude: 2.2,
+                contact: ContactStatus::Contact,
+            },
+        )
+        .await;
+        let _ep = client
+            .next_matching_event("EpochUpdate", 200)
+            .await
+            .unwrap()
+            .expect("live EpochUpdate during Warmup");
+
+        let st = client.request("daemon.status", json!({})).await.unwrap();
+        assert_eq!(st["monitoring_state"], "Warmup");
+        let list = client.request("session.list", json!({})).await.unwrap();
+        assert_eq!(list["total_count"], expected_total);
+        assert_eq!(list["sessions"][0]["id"], sid);
+        assert_eq!(list["sessions"][0]["status"], "active");
+        let detail = client
+            .request("session.get", json!({ "id": sid }))
+            .await
+            .unwrap();
+        assert_eq!(detail["status"], "active");
+        assert!(!detail["epochs"].as_array().unwrap().is_empty());
+        sid
+    }
+
+    // 1. GapExceeded during Warmup -> discarded.
+    let sid_gap = start_live_warmup(&wearable_tx, &desc_a, &mut client, base_ts, 3).await;
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamDisconnected {
+            wearable: desc_a.clone(),
+            ts_ms: base_ts + 95_000,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(130)).await;
+    let disc_gap = client
+        .next_matching_event("SessionDiscarded", 200)
+        .await
+        .unwrap()
+        .expect("SessionDiscarded on GapExceeded");
+    assert_eq!(disc_gap.data["session_id"], sid_gap);
+    assert_eq!(disc_gap.data["end_reason"], "gap_exceeded");
+    assert_eq!(
+        client.request("session.list", json!({})).await.unwrap()["total_count"],
+        2
+    );
+    assert_eq!(
+        client
+            .request("session.get", json!({ "id": sid_gap }))
+            .await
+            .unwrap_err()
+            .code(),
+        Some("NOT_FOUND")
+    );
+    let cal_after_gap: CalibrationState = serde_json::from_value(
+        client
+            .request("calibration.status", json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cal_after_gap, baseline_cal);
+
+    // 2. ManualClose (session.end) during Warmup -> discarded.
+    tokio::time::advance(Duration::from_secs(170)).await;
+    let t_manual = base_ts + 300_000;
+    let sid_manual = start_live_warmup(&wearable_tx, &desc_a, &mut client, t_manual, 3).await;
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: desc_a.clone(),
+            state: StreamState {
+                ts_ms: t_manual + 95_000,
+                status: StreamStatus::SignalLost,
+            },
+        })
+        .await
+        .unwrap();
+    loop {
+        let ev = client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data.get("session_close_deadline_ms").is_some() {
+            break;
+        }
+    }
+    let end_resp = client.request("session.end", json!({})).await.unwrap();
+    assert_eq!(end_resp["discarded"], true);
+    assert_eq!(end_resp["session_id"], sid_manual);
+    assert_eq!(end_resp["end_reason"], "manual_close");
+    let disc_manual = client
+        .next_matching_event("SessionDiscarded", 200)
+        .await
+        .unwrap()
+        .expect("SessionDiscarded on ManualClose");
+    assert_eq!(disc_manual.data["session_id"], sid_manual);
+    assert_eq!(
+        client.request("session.list", json!({})).await.unwrap()["total_count"],
+        2
+    );
+
+    // 3. StreamEnded (switching wearables forces StreamEnded on previous session) during Warmup -> discarded.
+    tokio::time::advance(Duration::from_secs(200)).await;
+    let t_switch = t_manual + 200_000;
+    let sid_switch = start_live_warmup(&wearable_tx, &desc_a, &mut client, t_switch, 3).await;
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamState {
+            wearable: desc_b.clone(),
+            state: StreamState {
+                ts_ms: t_switch + 95_000,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+    let disc_switch = client
+        .next_matching_event("SessionDiscarded", 200)
+        .await
+        .unwrap()
+        .expect("SessionDiscarded on StreamEnded");
+    assert_eq!(disc_switch.data["session_id"], sid_switch);
+    assert_eq!(disc_switch.data["end_reason"], "stream_ended");
+
+    let started_b = client
+        .next_matching_event("SessionStarted", 50)
+        .await
+        .unwrap()
+        .expect("SessionStarted for Wearable B");
+    let sid_ah = started_b.data["session_id"].as_str().unwrap().to_string();
+
+    // 4. ActiveHoursExpired during Warmup -> discarded & transitions to Standby.
+    // Virtual clock is currently at base_ts + 500s (23:08:20 local). Advance to 08:01:00 local (+31960s).
+    let to_0801_sec = 9 * 3600 + 60 - 500;
+    tokio::time::advance(Duration::from_secs(to_0801_sec as u64)).await;
+    let ts_0801 = base_ts + (9 * 3600 + 60) * 1000;
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::HrPacket {
+            wearable: desc_b.clone(),
+            packet: bpmute::sleep_engine::HrPacket {
+                ts_ms: ts_0801,
+                bpm: 71.0,
+                rr_ms: vec![],
+                contact_status: ContactStatus::Contact,
+            },
+        })
+        .await
+        .unwrap();
+    let disc_ah = client
+        .next_matching_event("SessionDiscarded", 200)
+        .await
+        .unwrap()
+        .expect("SessionDiscarded on ActiveHoursExpired");
+    assert_eq!(disc_ah.data["session_id"], sid_ah);
+    assert_eq!(disc_ah.data["end_reason"], "active_hours_expired");
+    assert_eq!(
+        client.request("daemon.status", json!({})).await.unwrap()["monitoring_state"],
+        "Standby"
+    );
+    assert_eq!(
+        client.request("session.list", json!({})).await.unwrap()["total_count"],
+        2
+    );
+
+    // 5. Re-enter Active Hours (22:01 local), start Warmup on Wearable B, then trigger daemon.shutdown() -> discarded!
+    wearable_tx
+        .send(bpmute::daemon::WearableEvent::StreamDisconnected {
+            wearable: desc_b.clone(),
+            ts_ms: ts_0801 + 5_000,
+            reason: StreamDisconnectReason::Remote,
+        })
+        .await
+        .unwrap();
+    let _ = client
+        .next_matching_event("StateChanged", 50)
+        .await
+        .unwrap()
+        .expect("StateChanged to Idle");
+
+    tokio::time::advance(Duration::from_secs(14 * 3600)).await;
+    let ts_2201 = ts_0801 + 14 * 3600 * 1000;
+    let sid_shutdown = start_live_warmup(&wearable_tx, &desc_b, &mut client, ts_2201, 3).await;
+    drop(client);
+    daemon.shutdown().await;
+
+    let store = LedgerStore::open_read_only(&db_path).unwrap().unwrap();
+    assert!(
+        store.get_session(&sid_shutdown).is_err(),
+        "daemon shutdown during Warmup must discard incomplete session from SQLite"
+    );
+    assert_eq!(store.list_sessions(10, 0).unwrap().total_count, 2);
+    assert_eq!(store.get_calibration_state().unwrap(), baseline_cal);
 }

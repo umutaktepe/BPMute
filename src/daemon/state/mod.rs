@@ -33,7 +33,7 @@ use crate::ipc::protocol::{
     AlertChangedEvent, CalibrationUpdatedEvent, ConfigSnapshotPayload, DaemonAlert, DaemonStatus,
     DiscoveredWearable, EnrollAuthResponseParams, EnrolledWearableStatus, EpochUpdateEvent,
     ErrorPayload, HrSampleEvent, PauseMode, PushEventEnvelope, SessionClosedEvent,
-    SessionStartedEvent, SnapshotEvent, WearablesUpdatedEvent, error_codes,
+    SessionDiscardedEvent, SessionStartedEvent, SnapshotEvent, WearablesUpdatedEvent, error_codes,
 };
 use crate::ipc::pubsub::{EventBroker, SubscriberQueue};
 use crate::paths::{EnvSource, ResolvedPaths};
@@ -495,6 +495,13 @@ impl DaemonCore {
             self.broker.publish_control("SessionClosed", val);
         }
         self.apply_calibration_update(cal_state);
+    }
+
+    /// Publishes `SessionDiscarded` when an incomplete-Warmup session is removed on closure.
+    pub fn on_session_discarded(&self, payload: SessionDiscardedEvent) {
+        if let Ok(val) = serde_json::to_value(payload) {
+            self.broker.publish_control("SessionDiscarded", val);
+        }
     }
 
     /// Updates in-memory calibration state, syncs shift alerts, notifies the engine loop, and pushes IPC events.

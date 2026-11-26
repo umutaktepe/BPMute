@@ -1684,35 +1684,69 @@ async fn test_real_socket_history_live_session_started_and_closed_e2e() {
         "Active session with zero epochs must show waiting message"
     );
 
-    // 2. Disconnect/stream end -> triggers SessionEnded -> close_session_and_recompute -> SessionClosed
+    // 2. Disconnect/stream end during incomplete Warmup -> SessionDiscarded removes it from History!
     drop(w_tx);
 
-    // TUI must receive SessionClosed -> RefreshSessions -> SessionsUpdated
+    // TUI must receive SessionDiscarded -> remove the incomplete session and refresh History
     wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
-        a.history_sessions
-            .first()
-            .is_some_and(|s| s.status == SessionStatus::Closed)
-            && a.selected_session_detail
-                .as_ref()
-                .is_some_and(|d| d.status == SessionStatus::Closed)
+        a.history_sessions.is_empty() && a.selected_session_detail.is_none()
     })
     .await;
 
-    // Render check on finalized closed session: shows [Ended] and retention pruning message
+    // Render check: no phantom [Ended] session left in History
     term.draw(|f| app.render(f.area(), f.buffer_mut())).unwrap();
     let out = buffer_to_string(term.backend().buffer());
     assert!(
-        out.contains("[Ended]"),
-        "Master list must show closed session as [Ended]"
-    );
-    assert!(
-        out.contains("Epochs were pruned by retention policy"),
-        "Closed session with zero epochs must show retention pruning message"
+        !out.contains("[Ended]"),
+        "Incomplete-Warmup session must be discarded from History instead of showing [Ended]"
     );
 
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;
     daemon.shutdown().await;
+}
+
+#[test]
+fn test_session_discarded_ipc_event_removes_active_session_and_requests_refresh() {
+    use bpmute::ipc::SessionDiscardedEvent;
+
+    let base_ts = 1_700_000_000_000i64;
+    let mut s_closed = make_history_session(
+        "s-closed",
+        "Watch GT5",
+        base_ts - 86_400_000,
+        base_ts - 82_800_000,
+        SessionStatus::Closed,
+        40,
+    );
+    s_closed.end_reason = Some(SessionEndReason::SustainedWakefulness);
+    let s_active = make_history_session(
+        "s-warmup",
+        "Watch GT5",
+        base_ts,
+        base_ts + 30_000,
+        SessionStatus::Active,
+        2,
+    );
+
+    let mut app = TuiApp::new(false, false, false);
+    app.daemon_connected = true;
+    app.active_tab = Tab::History;
+    app.session_close_deadline_ms = Some(base_ts + 150_000);
+    app.history_sessions = vec![s_active.clone(), s_closed];
+    app.selected_session_idx = 0;
+    app.selected_session_detail = Some(make_session_detail(&s_active, Vec::new()));
+
+    let cmd = app.handle_ipc(IpcEvent::SessionDiscarded(SessionDiscardedEvent {
+        session_id: "s-warmup".to_string(),
+        wearable_id: "w-1".to_string(),
+        end_reason: SessionEndReason::GapExceeded,
+    }));
+    assert_eq!(cmd, Some(TuiCommand::RefreshSessions));
+    assert_eq!(app.history_sessions.len(), 1);
+    assert_eq!(app.history_sessions[0].id, "s-closed");
+    assert!(app.selected_session_detail.is_none());
+    assert!(app.session_close_deadline_ms.is_none());
 }
 
 #[tokio::test(start_paused = true)]

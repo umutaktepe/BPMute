@@ -1143,50 +1143,47 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
         })
         .await
         .unwrap();
-    for sec in 1..=20_i64 {
-        wearable_tx
-            .send(WearableEvent::HrPacket {
-                wearable: wearable_a.clone(),
-                packet: HrPacket {
-                    ts_ms: base_ts + sec * 1_000,
-                    bpm: 65.0,
-                    rr_ms: vec![920.0],
-                    contact_status: ContactStatus::Contact,
-                },
-            })
-            .await
-            .unwrap();
-    }
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &wearable_a,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: base_ts + 1_000,
+            count_sec: 500,
+            base_bpm: 65.0,
+            bpm_amplitude: 2.2,
+            contact: ContactStatus::Contact,
+        },
+    )
+    .await;
 
     // Switch directly to Wearable B without an explicit disconnect on A
+    let t_b = base_ts + 505_000;
     wearable_tx
         .send(WearableEvent::StreamState {
             wearable: wearable_b.clone(),
             state: bpmute::sleep_engine::StreamState {
-                ts_ms: base_ts + 25_000,
+                ts_ms: t_b,
                 status: bpmute::sleep_engine::StreamStatus::Streaming,
             },
         })
         .await
         .unwrap();
-    for sec in 26..=45_i64 {
-        wearable_tx
-            .send(WearableEvent::HrPacket {
-                wearable: wearable_b.clone(),
-                packet: HrPacket {
-                    ts_ms: base_ts + sec * 1_000,
-                    bpm: 64.0,
-                    rr_ms: Vec::new(),
-                    contact_status: ContactStatus::Contact,
-                },
-            })
-            .await
-            .unwrap();
-    }
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &wearable_b,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t_b + 1_000,
+            count_sec: 500,
+            base_bpm: 64.0,
+            bpm_amplitude: 2.2,
+            contact: ContactStatus::Contact,
+        },
+    )
+    .await;
     drop(wearable_tx);
 
     let mut closed_wearable_aliases = Vec::new();
-    for _ in 0..500 {
+    for _ in 0..2_000 {
         let ev = client.next_event().await.unwrap();
         if ev.event == "SessionClosed" {
             let alias = ev.data["session"]["wearable"]["alias"]
