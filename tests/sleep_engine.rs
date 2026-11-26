@@ -1209,9 +1209,11 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
     assert!(freeze_ep.baseline_frozen);
 
     // Mid-session > 5% RR corruption -> |ΔP| <= 0.15 marginalization parity and still detects
+    // Inject once the slow 18-minute N1 ramp has entered sleep transition (+240 s) so we measure
+    // HRV marginalization parity rather than the mid-sigmoid logistic inflection.
     let corrupted_rr = inject_rr_corruption(
         &slow_trace.bpm_rr,
-        slow_onset_ms + 120_000,
+        slow_onset_ms + 240_000,
         slow_onset_ms + 900_000,
         5, // 20% RR artifacts
     );
@@ -2765,4 +2767,211 @@ fn post_sleep_wakefulness_outside_active_hours_transitions_to_standby_without_ne
             ..
         }
     )));
+}
+
+fn run_n1_descent_with_transient_var_and_check_baseline(
+    eng: &mut SleepEngine,
+    all_out: &mut Vec<EngineOutput>,
+    start_sec: i64,
+    start_bpm: f64,
+    slope_bpm_per_min: f64,
+    sleep_floor_bpm: f64,
+    initial_amp_bpm: f64,
+) -> (i64, f64) {
+    let mut sec = start_sec;
+    let mut confirmed = false;
+    for step in 0..900_i64 {
+        let mins = step as f64 / 60.0;
+        let target = (start_bpm - slope_bpm_per_min * mins).max(sleep_floor_bpm);
+        let amp = if step < 120 { initial_amp_bpm } else { 0.35 };
+        let bpm = target + amp * (sec as f64 * 0.45).sin();
+        all_out.extend(eng.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        })));
+        sec += 1;
+        if eng.state() == DetectorState::Confirmed {
+            confirmed = true;
+            break;
+        }
+    }
+    assert!(confirmed, "N1 -> N2 descent must confirm sleep onset");
+
+    let min_descent_mu = all_out
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::EpochEmitted(ep) if ep.ts_ms >= start_sec * 1000 => {
+                Some(ep.baseline_mu_hr)
+            }
+            _ => None,
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        min_descent_mu >= 66.0,
+        "Quiet-Wake Baseline collapsed during N1 descent: min baseline_mu_hr = {min_descent_mu:.2} bpm"
+    );
+
+    let close_out = eng.force_close_session(sec * 1000, SessionEndReason::StreamEnded);
+    let pre_mu = extract_session_ended(&close_out)
+        .pre_candidate_mu_hr
+        .expect("pre_candidate_mu_hr must be recorded upon confirmation");
+    (sec, pre_mu)
+}
+
+#[test]
+fn bpm_only_candidate_reset_and_n1_descent_preserves_quiet_wake_baseline() {
+    let mut eng = default_engine();
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+
+    // 1. 15 min calm waking BPM-only baseline around 68 bpm.
+    let mut all_out = push_calm_wake(&mut eng, 1, 900, 68.0, false);
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    // 2. Initial N1 descent into Candidate (BPM-only).
+    let (cand_out, cand_sec) = push_sleep_until_state(
+        &mut eng,
+        901,
+        1800,
+        68.0,
+        59.0,
+        false,
+        DetectorState::Candidate,
+    );
+    all_out.extend(cand_out);
+    assert_eq!(eng.state(), DetectorState::Candidate);
+
+    // 3. Brief Candidate reset with transient elevated rolling variability (arousal/posture shift).
+    let mut sec = cand_sec + 1;
+    let reset_deadline = sec + 180;
+    while sec <= reset_deadline && eng.state() == DetectorState::Candidate {
+        let bpm = 67.0 + 3.8 * (sec as f64 * 0.55).sin();
+        all_out.extend(eng.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        })));
+        sec += 1;
+    }
+    assert_eq!(
+        eng.state(),
+        DetectorState::Monitoring,
+        "transient arousal variability must reset Candidate back to Monitoring"
+    );
+
+    // Continue transient variability briefly in Monitoring so p_sleep dips < 0.30 while HR stays below 68 bpm.
+    for _ in 0..45 {
+        let bpm = 64.5 + 3.2 * (sec as f64 * 0.55).sin();
+        all_out.extend(eng.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        })));
+        sec += 1;
+    }
+
+    // 4. Resume N1 sleep descent (negative slope with decaying residual 120s MAD) into N2 sleep until Confirmed.
+    let (_, pre_mu) = run_n1_descent_with_transient_var_and_check_baseline(
+        &mut eng,
+        &mut all_out,
+        sec,
+        64.0,
+        0.8,
+        59.0,
+        2.4,
+    );
+
+    let candidate_reset_seen = all_out.iter().any(|o| {
+        matches!(
+            o,
+            EngineOutput::StateChanged {
+                from: DetectorState::Candidate,
+                to: DetectorState::Monitoring,
+                ..
+            }
+        )
+    });
+    assert!(
+        candidate_reset_seen,
+        "expected Candidate -> Monitoring reset transition"
+    );
+    assert!(
+        (pre_mu - 68.0).abs() < 2.0,
+        "frozen Pre-Candidate Baseline must stay anchored near genuine waking HR (~68 bpm), got {pre_mu:.2}"
+    );
+}
+
+#[test]
+fn calibrated_post_workout_recovery_stops_purging_once_entering_quiet_wake_band() {
+    let mut eng = SleepEngine::new(EngineConfig {
+        detection: DetectionConfig::default(),
+        priors: CalibrationPriors {
+            maturity: CalibrationMaturity::Calibrated,
+            mu_wake: Some(68.0),
+            wake_median: Some(68.0),
+            sigma_wake: Some(2.2),
+            mu_sleep: Some(60.0),
+            delta_hr_onset: Some(-8.0),
+            mu_ln_rmssd_sleep: None,
+            tau_p_sleep_offset: 0.0,
+            dwell_adjust_sec: 0,
+            wake_mad_s: Some(2.2),
+        },
+        wearable_floor: WearableFloor::default(),
+    });
+    eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+
+    // 1. Steep elevated post-workout cooldown (excess 22 bpm triggers Warmup anomaly check too)
+    //    settling into the calibrated quiet-wake band (<= 68 bpm).
+    let mut all_out = Vec::new();
+    let mut sec = 1_i64;
+    for step in 0..540_i64 {
+        let frac = step as f64 / 540.0;
+        let target = 67.5 + 22.0 * (-3.2 * frac).exp();
+        let bpm = target + 2.2 * (sec as f64 * 0.45).sin();
+        all_out.extend(eng.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        })));
+        sec += 1;
+    }
+    assert_eq!(eng.state(), DetectorState::Monitoring);
+
+    // 2. Brief 60 s calm settle (< 2 min clear streak) then N1 -> N2 descent with transient rolling
+    //    variability; once inside the calibrated quiet-wake band (<= 68 bpm), purging must stop.
+    for _ in 0..60 {
+        let bpm = 67.5 + 2.2 * (sec as f64 * 0.45).sin();
+        all_out.extend(eng.handle_event(EngineEvent::HrPacket(HrPacket {
+            ts_ms: sec * 1000,
+            bpm,
+            rr_ms: vec![],
+            contact_status: ContactStatus::Contact,
+        })));
+        sec += 1;
+    }
+
+    let (_, pre_mu) = run_n1_descent_with_transient_var_and_check_baseline(
+        &mut eng,
+        &mut all_out,
+        sec,
+        67.5,
+        0.9,
+        59.5,
+        2.2,
+    );
+    assert!(
+        (66.0..=71.0).contains(&pre_mu),
+        "Pre-Candidate Baseline must stay near calibrated quiet-wake band, got {pre_mu:.2}"
+    );
 }

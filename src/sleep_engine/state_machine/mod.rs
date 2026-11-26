@@ -564,7 +564,13 @@ impl SleepEngine {
                     }
                 }
                 DetectorState::Monitoring => {
-                    self.baseline.update_post_warmup(raw_ref, p_sleep, false);
+                    let calibrated_wake_hr = self
+                        .config
+                        .priors
+                        .wake_median
+                        .or(self.config.priors.mu_wake);
+                    self.baseline
+                        .update_post_warmup(raw_ref, p_sleep, false, calibrated_wake_hr);
                     if self.stabilization_remaining_epochs > 0 {
                         self.stabilization_remaining_epochs -= 1;
                     } else {
@@ -700,7 +706,7 @@ impl SleepEngine {
         self.pre_candidate_mu_hr = self.baseline.mu_hr();
         self.pre_candidate_sigma_hr = Some(self.baseline.sigma_hr());
         self.pre_candidate_ln_rmssd = self.baseline.mu_ln_rmssd();
-        self.baseline.set_frozen(true);
+        self.baseline.on_candidate_entered();
         self.transition_to(
             ts_ms,
             DetectorState::Candidate,

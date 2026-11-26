@@ -12,6 +12,8 @@ const MIN_RETAINED_EPOCHS: usize = 4;
 const SPIKE_MULTIPLIER: f64 = 1.15; // Exclude > +15% ActiveWake spikes
 const MAX_REANCHOR_NEG_SLOPE: f64 = -0.15; // bpm/min: block N1 deceleration descent
 const MAX_REANCHOR_POS_SLOPE: f64 = 0.75; // bpm/min: exclude rising edges of ActiveWake spikes
+const WARMUP_RECOVERY_MIN_EPOCHS: u32 = 2; // require >= 30 s steep recovery in Warmup
+const CALM_RECOVERY_CLEAR_EPOCHS: u32 = 8; // 2 min calm non-descending wake ends post-activity recovery
 
 #[derive(Debug, Clone, Copy)]
 struct BaselineEpoch {
@@ -29,6 +31,10 @@ pub struct QuietWakeBaseline {
     sigma_hr: f64,
     mu_ln_rmssd: Option<f64>,
     frozen: bool,
+    warmup_recovery_streak: u32,
+    calm_recovery_clear_streak: u32,
+    post_activity_recovery_active: bool,
+    candidate_seen: bool,
 }
 
 impl Default for QuietWakeBaseline {
@@ -46,6 +52,10 @@ impl QuietWakeBaseline {
             sigma_hr: SIGMA_MIN_BPM,
             mu_ln_rmssd: None,
             frozen: false,
+            warmup_recovery_streak: 0,
+            calm_recovery_clear_streak: 0,
+            post_activity_recovery_active: false,
+            candidate_seen: false,
         }
     }
 
@@ -84,6 +94,14 @@ impl QuietWakeBaseline {
         self.frozen = false;
     }
 
+    /// Marks that the session crossed into `Candidate`, freezing adaptation and locking out
+    /// destructive post-activity recovery purges across any subsequent `Candidate` reset.
+    pub fn on_candidate_entered(&mut self) {
+        self.frozen = true;
+        self.candidate_seen = true;
+        self.post_activity_recovery_active = false;
+    }
+
     /// Unfreezes and trims stale pre-cancel `Epochs` so baseline re-anchors during cooldown.
     pub fn on_cancel_cooldown_start(
         &mut self,
@@ -93,6 +111,10 @@ impl QuietWakeBaseline {
         recent_ln_rmssd: Option<f64>,
     ) {
         self.frozen = false;
+        self.post_activity_recovery_active = false;
+        self.candidate_seen = false;
+        self.warmup_recovery_streak = 0;
+        self.calm_recovery_clear_streak = 0;
         self.epochs.clear();
         if let Some(hr) = recent_hr {
             self.push_epoch(
@@ -120,6 +142,18 @@ impl QuietWakeBaseline {
         self.frozen = false;
         if raw.hr_slope_4m < WARMUP_RECOVERY_SLOPE_THRESHOLD {
             self.evict_older_than(raw.ts_ms, WARMUP_RECOVERY_AGE_MS);
+            self.warmup_recovery_streak = self.warmup_recovery_streak.saturating_add(1);
+            self.calm_recovery_clear_streak = 0;
+            if self.warmup_recovery_streak >= WARMUP_RECOVERY_MIN_EPOCHS {
+                self.post_activity_recovery_active = true;
+            }
+        } else {
+            self.warmup_recovery_streak = 0;
+            if raw.hr_slope_4m >= MAX_REANCHOR_NEG_SLOPE {
+                self.advance_calm_recovery_clear();
+            } else {
+                self.calm_recovery_clear_streak = 0;
+            }
         }
         self.try_record_epoch(raw);
     }
@@ -130,9 +164,11 @@ impl QuietWakeBaseline {
         raw: &RawEpochMetrics,
         p_sleep: f64,
         in_candidate_or_later: bool,
+        calibrated_wake_hr: Option<f64>,
     ) {
         if in_candidate_or_later || p_sleep >= 0.30 {
             self.frozen = true;
+            self.post_activity_recovery_active = false;
             return;
         }
 
@@ -148,17 +184,47 @@ impl QuietWakeBaseline {
         }
 
         if raw.hr_slope_4m < MAX_REANCHOR_NEG_SLOPE {
+            self.calm_recovery_clear_streak = 0;
+            if self.candidate_seen {
+                return;
+            }
             let below_current_baseline = self.mu_hr.is_none_or(|mu| raw.hr_bpm_60s <= mu);
             if !below_current_baseline || local_var_ratio < 0.80 {
                 return;
             }
-            // Waking post-activity recovery: purge only stale elevated epochs above current calm HR,
-            // preserving any older low-HR quiet-wake baseline history.
-            let upper_bound = raw.hr_bpm_60s + 1.5 * self.sigma_hr();
-            self.epochs.retain(|ep| ep.hr_bpm_60s <= upper_bound);
+            let in_calibrated_wake_or_sleep_band =
+                calibrated_wake_hr.is_some_and(|wake_hr| raw.hr_bpm_60s <= wake_hr);
+            if in_calibrated_wake_or_sleep_band {
+                self.post_activity_recovery_active = false;
+            }
+
+            if self.post_activity_recovery_active && !in_calibrated_wake_or_sleep_band {
+                // Waking post-activity recovery: purge only stale elevated epochs above current calm HR,
+                // preserving any older low-HR quiet-wake baseline history.
+                let upper_bound = raw.hr_bpm_60s + 1.5 * self.sigma_hr();
+                self.epochs.retain(|ep| ep.hr_bpm_60s <= upper_bound);
+            } else {
+                // Outside elevated post-activity recovery, never purge calm waking history; only
+                // allow unbiased calm-wake recording within normal waking oscillation around mu_hr.
+                let within_wake_band = self
+                    .mu_hr
+                    .is_some_and(|mu| raw.hr_bpm_60s >= mu - 2.0 * self.sigma_hr());
+                if !within_wake_band {
+                    return;
+                }
+            }
+        } else if self.post_activity_recovery_active {
+            self.advance_calm_recovery_clear();
         }
 
         self.try_record_epoch(raw);
+    }
+
+    fn advance_calm_recovery_clear(&mut self) {
+        self.calm_recovery_clear_streak = self.calm_recovery_clear_streak.saturating_add(1);
+        if self.calm_recovery_clear_streak >= CALM_RECOVERY_CLEAR_EPOCHS {
+            self.post_activity_recovery_active = false;
+        }
     }
 
     fn try_record_epoch(&mut self, raw: &RawEpochMetrics) {
