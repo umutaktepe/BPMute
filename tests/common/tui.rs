@@ -76,6 +76,15 @@ pub fn mouse_left_click(col: u16, row: u16) -> TuiEvent {
     })
 }
 
+pub fn mouse_left_drag(col: u16, row: u16) -> TuiEvent {
+    TuiEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: col,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })
+}
+
 pub fn mouse_scroll_down(col: u16, row: u16) -> TuiEvent {
     TuiEvent::Mouse(MouseEvent {
         kind: MouseEventKind::ScrollDown,

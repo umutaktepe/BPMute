@@ -265,6 +265,47 @@ pub enum ModalState {
     },
 }
 
+/// Interactive column cursor state for the History Epoch chart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryChartInspectState {
+    pub(crate) col: Option<u16>,
+    pub(crate) chart_width: u16,
+}
+
+impl HistoryChartInspectState {
+    pub(crate) fn is_active(self) -> bool {
+        self.col.is_some() && self.chart_width > 0
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.col = None;
+    }
+
+    pub(crate) fn set_col(&mut self, col: u16) {
+        if self.chart_width > 0 {
+            self.col = Some(col.min(self.chart_width - 1));
+        }
+    }
+
+    pub(crate) fn step(&mut self, delta: isize) {
+        if let Some(cur) = self.col
+            && self.chart_width > 0
+        {
+            let next = (cur as isize + delta).clamp(0, (self.chart_width - 1) as isize) as u16;
+            self.col = Some(next);
+        }
+    }
+
+    pub(crate) fn sync_rendered_width(&mut self, chart_width: u16) {
+        self.chart_width = chart_width;
+        if chart_width == 0 {
+            self.col = None;
+        } else if let Some(col) = self.col {
+            self.col = Some(col.min(chart_width - 1));
+        }
+    }
+}
+
 pub struct TuiApp {
     pub theme: Theme,
     pub no_mouse: bool,
@@ -315,6 +356,7 @@ pub struct TuiApp {
     pub history_boundaries: Vec<CalibrationBoundaryRecord>,
     pub selected_session_idx: usize,
     pub selected_session_detail: Option<SessionFullDetail>,
+    pub(crate) history_inspect: HistoryChartInspectState,
 
     // Settings
     pub active_config: Option<Config>,
@@ -380,6 +422,7 @@ impl TuiApp {
             history_boundaries: Vec::new(),
             selected_session_idx: 0,
             selected_session_detail: None,
+            history_inspect: HistoryChartInspectState::default(),
             active_config: None,
             selected_setting_idx: 0,
             config_error: None,
@@ -528,6 +571,12 @@ impl TuiApp {
                 .history_sessions
                 .get(self.selected_session_idx)
                 .is_some_and(|s| s.status != crate::storage::SessionStatus::Active)
+    }
+
+    pub(crate) fn is_history_chart_inspecting(&self) -> bool {
+        self.active_tab == Tab::History
+            && self.modal == ModalState::None
+            && self.history_inspect.is_active()
     }
 
     pub(crate) fn has_active_calibration_boundary(&self) -> bool {
@@ -681,7 +730,11 @@ impl TuiApp {
 
         match self.active_tab {
             Tab::Dashboard => render_dashboard(self, content_area, buf, &mut hit_map),
-            Tab::History => render_history(self, content_area, buf, &mut hit_map),
+            Tab::History => {
+                let rendered = render_history(self, content_area, buf, &mut hit_map);
+                self.history_inspect
+                    .sync_rendered_width(rendered.chart_plot_width);
+            }
             Tab::Wearables => {
                 let scroll = render_wearables(self, content_area, buf, &mut hit_map);
                 self.wearables_scroll_offset = scroll.table;

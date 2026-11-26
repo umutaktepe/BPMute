@@ -8,9 +8,10 @@ use ratatui::widgets::{Paragraph, Widget};
 use super::super::app::{ModalState, TuiApp};
 use super::super::hit_map::{ClickTarget, HitMap, ScrollTarget};
 use super::super::trace::{
-    TraceSample, TraceSeriesSpec, build_segments, clip_segments, compute_hr_y_bounds,
-    is_valid_hr_bpm, render_horizontal_ref_lines, render_hr_y_labels, render_trace_series,
-    time_to_column,
+    TraceSample, TraceSeriesSpec, build_segments, clip_segments, column_to_time,
+    compute_hr_y_bounds, compute_local_clock_ticks, is_valid_hr_bpm, render_horizontal_ref_lines,
+    render_hr_y_labels, render_local_clock_x_axis, render_trace_series,
+    render_vertical_time_gridlines, time_to_column,
 };
 use super::history_modals::{
     render_delete_session_modal, render_export_trace_modal, render_feedback_modal,
@@ -20,6 +21,12 @@ use crate::logging::format_wearable_label;
 use crate::sleep_engine::SessionEndReason;
 use crate::storage::{SessionFullDetail, SessionListEntry, SessionStatus};
 
+/// Layout metadata emitted by `render_history` so `TuiApp` can clamp chart inspection bounds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryRenderResult {
+    pub(crate) chart_plot_width: u16,
+}
+
 enum HistoryRow<'a> {
     Session {
         session_idx: usize,
@@ -28,9 +35,14 @@ enum HistoryRow<'a> {
     Boundary(&'a CalibrationBoundaryRecord),
 }
 
-pub(crate) fn render_history(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
+pub(crate) fn render_history(
+    app: &TuiApp,
+    area: Rect,
+    buf: &mut Buffer,
+    hit_map: &mut HitMap,
+) -> HistoryRenderResult {
     if area.width < 10 || area.height < 5 {
-        return;
+        return HistoryRenderResult::default();
     }
 
     let chunks = Layout::default()
@@ -45,7 +57,7 @@ pub(crate) fn render_history(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map
     let detail_area = chunks[1];
 
     render_master_list(app, master_area, buf, hit_map);
-    render_detail_pane(app, detail_area, buf);
+    let result = render_detail_pane(app, detail_area, buf, hit_map);
 
     match app.modal {
         ModalState::FeedbackModal { .. } => render_feedback_modal(app, area, buf, hit_map),
@@ -55,6 +67,8 @@ pub(crate) fn render_history(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map
         }
         _ => {}
     }
+
+    result
 }
 
 fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut HitMap) {
@@ -267,7 +281,12 @@ fn render_master_list(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map: &mut 
     }
 }
 
-fn render_detail_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
+fn render_detail_pane(
+    app: &TuiApp,
+    area: Rect,
+    buf: &mut Buffer,
+    hit_map: &mut HitMap,
+) -> HistoryRenderResult {
     let block = app.theme.card_block(" Epoch Detail & Chart ");
     let inner = block.inner(area);
     block.render(area, buf);
@@ -281,13 +300,13 @@ fn render_detail_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
             )]),
         ]);
         msg.render(inner, buf);
-        return;
+        return HistoryRenderResult::default();
     }
 
     let selected_entry = app.history_sessions.get(app.selected_session_idx);
 
     let Some(entry) = selected_entry else {
-        return;
+        return HistoryRenderResult::default();
     };
     let detail_opt = app
         .selected_session_detail
@@ -304,15 +323,17 @@ fn render_detail_pane(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     }
 
     let chart_y = inner.y + header_height;
-    if chart_y + 4 < inner.bottom() {
+    if chart_y + 4 <= inner.bottom() {
         let chart_area = Rect {
             x: inner.x,
             y: chart_y,
             width: inner.width,
             height: inner.bottom().saturating_sub(chart_y),
         };
-        render_epoch_chart(app, entry, detail_opt, chart_area, buf);
+        let chart_plot_width = render_epoch_chart(app, entry, detail_opt, chart_area, buf, hit_map);
+        return HistoryRenderResult { chart_plot_width };
     }
+    HistoryRenderResult::default()
 }
 
 fn build_detail_header<'a>(
@@ -402,6 +423,34 @@ fn build_detail_header<'a>(
     }
     lines.push(Line::from(metrics_spans));
 
+    // Events summary line when at least one marker timestamp is present
+    let manual_onset_ts_ms = detail_opt
+        .and_then(|d| d.feedback.as_ref())
+        .or(entry.feedback.as_ref())
+        .and_then(|fb| fb.manual_onset_ts_ms);
+    let event_items = [
+        (entry.onset_confirmed_ts_ms, "[O]", app.theme.warning()),
+        (entry.sleeping_ts_ms, "[T]", app.theme.danger()),
+        (manual_onset_ts_ms, "[M]", app.theme.success()),
+    ];
+    let mut event_spans: Vec<Span<'a>> = Vec::new();
+    for (ts_opt, tag, tag_style) in event_items {
+        if let Some(ts) = ts_opt
+            && let Some(hhmm) = format_local_hhmm(ts)
+        {
+            if event_spans.is_empty() {
+                event_spans.push(Span::styled(" Events: ", app.theme.muted()));
+            } else {
+                event_spans.push(Span::styled("  ", app.theme.muted()));
+            }
+            event_spans.push(Span::styled(tag, tag_style));
+            event_spans.push(Span::styled(format!(" {hhmm}"), app.theme.base()));
+        }
+    }
+    if !event_spans.is_empty() {
+        lines.push(Line::from(event_spans));
+    }
+
     // Feedback summary line if present
     if let Some(detail) = detail_opt
         && let Some(fb) = &detail.feedback
@@ -411,11 +460,7 @@ fn build_detail_header<'a>(
             fb_spans.push(Span::styled(format!("verdict={v} "), app.theme.warning()));
         }
         if let Some(onset_ts) = fb.manual_onset_ts_ms {
-            let onset_hhmm = Local
-                .timestamp_millis_opt(onset_ts)
-                .single()
-                .map(|dt| dt.format("%H:%M").to_string())
-                .unwrap_or_default();
+            let onset_hhmm = format_local_hhmm(onset_ts).unwrap_or_default();
             fb_spans.push(Span::styled(
                 format!("manual_onset={onset_hhmm} "),
                 app.theme.base(),
@@ -441,9 +486,10 @@ fn render_epoch_chart(
     detail_opt: Option<&SessionFullDetail>,
     area: Rect,
     buf: &mut Buffer,
-) {
+    hit_map: &mut HitMap,
+) -> u16 {
     if area.width < 10 || area.height < 4 {
-        return;
+        return 0;
     }
 
     let Some(detail) = detail_opt else {
@@ -453,7 +499,7 @@ fn render_epoch_chart(
             "Loading session epoch detail...",
             app.theme.muted(),
         );
-        return;
+        return 0;
     };
 
     if detail.epochs.is_empty() {
@@ -463,23 +509,26 @@ fn render_epoch_chart(
             "Epochs were pruned by retention policy; trace unavailable."
         };
         buf.set_string(area.x + 2, area.y + 1, msg, app.theme.muted());
-        return;
+        return 0;
     }
 
     let left_label_w = 7u16; // e.g. "100bpm "
     let right_label_w = 5u16; // e.g. " 100%"
     let chart_x = area.x + left_label_w;
     let chart_w = area.width.saturating_sub(left_label_w + right_label_w);
-    let chart_h = area.height.saturating_sub(2); // 1 top marker label row, 1 bottom legend row
+    let show_x_axis = area.height >= 5;
+    let reserved_rows = if show_x_axis { 3 } else { 2 }; // 1 top marker row, optional 1 X-axis row, 1 bottom legend row
+    let chart_h = area.height.saturating_sub(reserved_rows);
 
     if chart_w < 5 || chart_h < 2 {
-        return;
+        return 0;
     }
 
     let chart_y = area.y + 1;
     let right_label_x = chart_x + chart_w + 1;
     let t_start = entry.start_ts_ms;
     let t_end = entry.end_ts_ms;
+    let clock_ticks = compute_local_clock_ticks(t_start, t_end, chart_w, app.theme.ascii);
 
     let hr_samples: Vec<TraceSample> = detail
         .epochs
@@ -539,8 +588,15 @@ fn render_epoch_chart(
         app.theme.muted(),
     );
 
-    // Horizontal reference lines rendered underneath curves (distinct DIM|UNDERLINED for Sleep ref in NO_COLOR)
+    // Vertical time gridlines and horizontal reference lines rendered underneath data curves
     let plot_area = Rect::new(chart_x, chart_y, chart_w, chart_h);
+    render_vertical_time_gridlines(
+        plot_area,
+        buf,
+        &clock_ticks,
+        app.theme.muted(),
+        app.theme.ascii,
+    );
     let sleep_ref_style = app.theme.sparkline_sleep_ref().add_modifier(Modifier::DIM);
     render_horizontal_ref_lines(
         plot_area,
@@ -614,55 +670,200 @@ fn render_epoch_chart(
         }
     }
 
-    // Legend line at bottom
-    let ref_char = if app.theme.ascii { '-' } else { '┄' };
-    let legend_y = chart_y + chart_h;
-    if legend_y < area.bottom() {
-        let hr_label = if app.theme.ascii { "* HR" } else { "● HR" };
-        let p_label = if app.theme.ascii {
-            "^ P(Sleep)"
-        } else {
-            "▲ P(Sleep)"
-        };
-        let mut spans = vec![
-            Span::styled(hr_label, app.theme.sparkline_curve()),
-            Span::styled("  ", app.theme.muted()),
-            Span::styled(p_label, app.theme.sparkline_sleep_ref()),
-        ];
-        if let Some(qw) = entry.warmup_mu_hr {
-            spans.push(Span::styled("  ", app.theme.muted()));
-            spans.push(Span::styled(
-                format!("{ref_char} QW:{qw:.0}"),
-                app.theme.sparkline_qw_ref(),
-            ));
-        }
-        if let Some(sl) = entry.sleep_mu_hr
-            && area.width >= 52
-        {
-            spans.push(Span::styled("  ", app.theme.muted()));
-            spans.push(Span::styled(
-                format!("{ref_char} Sleep:{sl:.0}"),
-                sleep_ref_style,
-            ));
-        }
-        spans.push(Span::styled("  ", app.theme.muted()));
-        if area.width >= 66 {
-            spans.push(Span::styled("[O] Onset ", app.theme.warning()));
-            spans.push(Span::styled("[T] Trigger ", app.theme.danger()));
-            spans.push(Span::styled("[M] Manual", app.theme.success()));
-        } else {
-            spans.push(Span::styled("[O] ", app.theme.warning()));
-            spans.push(Span::styled("[T] ", app.theme.danger()));
-            spans.push(Span::styled("[M]", app.theme.success()));
-        }
-        let legend_line = Line::from(spans);
-        buf.set_line(
-            area.x + 1,
-            legend_y,
-            &legend_line,
-            area.width.saturating_sub(2),
+    // Emit render-aligned per-column HitMap targets across the plot area (ADR-0010)
+    for col in 0..chart_w {
+        hit_map.push_click(
+            Rect::new(chart_x + col, chart_y, 1, chart_h),
+            ClickTarget::HistoryChartCol(col),
         );
     }
+
+    // Composite active inspect cursor highlight non-destructively onto plot column
+    let inspect_col = app.history_inspect.col.map(|c| c.min(chart_w - 1));
+    if let Some(col) = inspect_col {
+        let cursor_x = chart_x + col;
+        for row_y in chart_y..chart_y + chart_h {
+            if let Some(c) = buf.cell_mut((cursor_x, row_y)) {
+                let style = c.style().add_modifier(Modifier::REVERSED);
+                c.set_style(style);
+            }
+        }
+    }
+
+    // X-axis local wall-clock row directly beneath plot area (when vertical height permits)
+    let legend_y = if show_x_axis {
+        let axis_y = chart_y + chart_h;
+        render_local_clock_x_axis(
+            chart_x,
+            axis_y,
+            chart_w,
+            &clock_ticks,
+            app.theme.muted(),
+            buf,
+        );
+        axis_y + 1
+    } else {
+        chart_y + chart_h
+    };
+
+    // Legend or active inspect cursor readout line at bottom
+    if legend_y < area.bottom() {
+        let line = if let Some(col) = inspect_col {
+            build_inspect_readout_line(
+                app,
+                &detail.epochs,
+                col,
+                t_start,
+                t_end,
+                chart_w,
+                area.width.saturating_sub(2),
+            )
+        } else {
+            let ref_char = if app.theme.ascii { '-' } else { '┄' };
+            let hr_label = if app.theme.ascii { "* HR" } else { "● HR" };
+            let p_label = if app.theme.ascii {
+                "^ P(Sleep)"
+            } else {
+                "▲ P(Sleep)"
+            };
+            let mut spans = vec![
+                Span::styled(hr_label, app.theme.sparkline_curve()),
+                Span::styled("  ", app.theme.muted()),
+                Span::styled(p_label, app.theme.sparkline_sleep_ref()),
+            ];
+            if let Some(qw) = entry.warmup_mu_hr {
+                spans.push(Span::styled("  ", app.theme.muted()));
+                spans.push(Span::styled(
+                    format!("{ref_char} QW:{qw:.0}"),
+                    app.theme.sparkline_qw_ref(),
+                ));
+            }
+            if let Some(sl) = entry.sleep_mu_hr
+                && area.width >= 52
+            {
+                spans.push(Span::styled("  ", app.theme.muted()));
+                spans.push(Span::styled(
+                    format!("{ref_char} Sleep:{sl:.0}"),
+                    sleep_ref_style,
+                ));
+            }
+            spans.push(Span::styled("  ", app.theme.muted()));
+            if area.width >= 66 {
+                spans.push(Span::styled("[O] Onset ", app.theme.warning()));
+                spans.push(Span::styled("[T] Trigger ", app.theme.danger()));
+                spans.push(Span::styled("[M] Manual", app.theme.success()));
+            } else {
+                spans.push(Span::styled("[O] ", app.theme.warning()));
+                spans.push(Span::styled("[T] ", app.theme.danger()));
+                spans.push(Span::styled("[M]", app.theme.success()));
+            }
+            Line::from(spans)
+        };
+        buf.set_line(area.x + 1, legend_y, &line, area.width.saturating_sub(2));
+    }
+
+    chart_w
+}
+
+fn build_inspect_readout_line<'a>(
+    app: &TuiApp,
+    epochs: &[crate::sleep_engine::Epoch],
+    col: u16,
+    t_start: i64,
+    t_end: i64,
+    chart_w: u16,
+    avail_w: u16,
+) -> Line<'a> {
+    let col_ts = column_to_time(col, t_start, t_end, chart_w, app.theme.ascii);
+    let step_ms = if chart_w > 1 && t_end > t_start {
+        (t_end - t_start) / i64::from(chart_w - 1)
+    } else {
+        0
+    };
+    let tolerance_ms = (step_ms / 2).max(HISTORY_MAX_GAP_MS / 2);
+
+    let mut has_any_epoch = false;
+    let mut best_hr: Option<(i64, f64)> = None;
+    let mut best_p: Option<(i64, f64)> = None;
+
+    for ep in epochs {
+        if ep.ts_ms < t_start || ep.ts_ms > t_end {
+            continue;
+        }
+        let dist = (ep.ts_ms - col_ts).abs();
+        if dist > tolerance_ms {
+            continue;
+        }
+        has_any_epoch = true;
+        if is_valid_hr_bpm(ep.features.hr_bpm_60s)
+            && best_hr.is_none_or(|(best_d, _)| dist < best_d)
+        {
+            best_hr = Some((dist, ep.features.hr_bpm_60s));
+        }
+        if ep.p_sleep.is_finite() && best_p.is_none_or(|(best_d, _)| dist < best_d) {
+            best_p = Some((dist, ep.p_sleep.clamp(0.0, 1.0)));
+        }
+    }
+
+    let hms = format_local_hhmmss(col_ts).unwrap_or_else(|| "00:00:00".to_string());
+    let hr_str = best_hr.map_or_else(|| "--".to_string(), |(_, v)| format!("{v:.0}"));
+    let p_str = best_p.map_or_else(|| "--".to_string(), |(_, p)| format!("{:.0}", p * 100.0));
+    let is_gap = !has_any_epoch;
+
+    let mut spans = vec![Span::styled(format!("@ {hms}"), app.theme.primary())];
+    if avail_w < 36 {
+        if is_gap {
+            spans.push(Span::styled(" -- (gap)", app.theme.warning()));
+        } else {
+            spans.push(Span::styled(
+                format!(" {hr_str}bpm"),
+                app.theme.sparkline_curve(),
+            ));
+            spans.push(Span::styled(
+                format!(" {p_str}%"),
+                app.theme.sparkline_sleep_ref(),
+            ));
+        }
+        return Line::from(spans);
+    }
+
+    let sep = if is_gap && avail_w < 44 { " " } else { "  " };
+    spans.push(Span::styled(format!("{sep}HR: "), app.theme.muted()));
+    spans.push(Span::styled(
+        format!("{hr_str} bpm"),
+        if best_hr.is_some() {
+            app.theme.sparkline_curve()
+        } else {
+            app.theme.muted()
+        },
+    ));
+    spans.push(Span::styled(format!("{sep}P(Sleep): "), app.theme.muted()));
+    spans.push(Span::styled(
+        format!("{p_str}%"),
+        if best_p.is_some() {
+            app.theme.sparkline_sleep_ref()
+        } else {
+            app.theme.muted()
+        },
+    ));
+    if is_gap {
+        spans.push(Span::styled(format!("{sep}(gap)"), app.theme.warning()));
+    }
+    Line::from(spans)
+}
+
+fn format_local_hhmmss(ts_ms: i64) -> Option<String> {
+    Local
+        .timestamp_millis_opt(ts_ms)
+        .earliest()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+}
+
+fn format_local_hhmm(ts_ms: i64) -> Option<String> {
+    Local
+        .timestamp_millis_opt(ts_ms)
+        .earliest()
+        .map(|dt| dt.format("%H:%M").to_string())
 }
 
 fn format_duration_compact(sec: i64) -> String {

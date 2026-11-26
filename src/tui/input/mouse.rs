@@ -42,6 +42,10 @@ impl TuiApp {
                         None
                     }
                     ClickTarget::SelectSession(idx) => self.select_history_session(idx),
+                    ClickTarget::HistoryChartCol(col) => {
+                        self.history_inspect.set_col(col);
+                        None
+                    }
                     ClickTarget::HistoryFeedback => self.open_history_feedback_modal(),
                     ClickTarget::HistoryExport => self.open_history_export_modal(),
                     ClickTarget::HistoryDelete => self.open_history_delete_modal(),
@@ -137,6 +141,14 @@ impl TuiApp {
                     ClickTarget::EndSession => self.end_active_session(),
                     ClickTarget::Consume => None,
                 }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(ClickTarget::HistoryChartCol(col)) =
+                    self.hit_map.click_at(mouse.column, mouse.row)
+                {
+                    self.history_inspect.set_col(col);
+                }
+                None
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let target = self.hit_map.scroll_at(mouse.column, mouse.row)?;

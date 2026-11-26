@@ -30,6 +30,7 @@ pub(crate) enum ClickTarget {
     WearablesUnenroll,
     SelectWearable(usize),
     SelectSession(usize),
+    HistoryChartCol(u16),
     HistoryFeedback,
     HistoryExport,
     HistoryDelete,

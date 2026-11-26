@@ -220,6 +220,16 @@ pub(crate) fn render_footer(app: &TuiApp, area: Rect, buf: &mut Buffer, hit_map:
                     );
                     writer.push_action("[u]", " Unenroll", can_act, ClickTarget::WearablesUnenroll);
                 }
+                Tab::History if app.is_history_chart_inspecting() => {
+                    let scrub_hint = if app.theme.ascii {
+                        "[<-/->/h/l]"
+                    } else {
+                        "[←/→/h/l]"
+                    };
+                    writer.push_hint(scrub_hint, " Scrub");
+                    writer.push_hint("[Home/End]", " Bounds");
+                    writer.push_hint("[Esc/Enter]", " Exit");
+                }
                 Tab::History => {
                     let can_act = app.can_act_on_selected_session();
                     writer.push_action("[f]", " Feedback", can_act, ClickTarget::HistoryFeedback);

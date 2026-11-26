@@ -44,6 +44,7 @@ impl TuiApp {
         self.op_feedback = None;
         self.session_deletion_in_progress = false;
         self.discovered_wearables.clear();
+        self.history_inspect.sync_rendered_width(0);
         if self.modal != ModalState::Help {
             self.close_modal();
         }
@@ -242,6 +243,7 @@ impl TuiApp {
                     if closed_detail.epochs.len() < closed_detail.session.epochs_count as usize {
                         // Force RefreshSessions -> SessionsUpdated to load complete epochs.
                         self.selected_session_detail = None;
+                        self.history_inspect.clear();
                     } else {
                         self.selected_session_detail = Some(*closed_detail);
                     }
@@ -349,6 +351,7 @@ impl TuiApp {
                 if self.history_sessions.is_empty() {
                     self.selected_session_idx = 0;
                     self.selected_session_detail = None;
+                    self.history_inspect.clear();
                 } else if let Some(prev_id) = prev_selected_id
                     && let Some(new_idx) =
                         self.history_sessions.iter().position(|s| s.id == prev_id)
@@ -358,6 +361,7 @@ impl TuiApp {
                         != Some(&prev_id)
                     {
                         self.selected_session_detail = None;
+                        self.history_inspect.clear();
                         if self.daemon_connected {
                             return Some(TuiCommand::SessionGet { id: prev_id });
                         }
@@ -368,6 +372,7 @@ impl TuiApp {
                         .min(self.history_sessions.len().saturating_sub(1));
                     let target_id = self.history_sessions[self.selected_session_idx].id.clone();
                     self.selected_session_detail = None;
+                    self.history_inspect.clear();
                     if self.daemon_connected {
                         return Some(TuiCommand::SessionGet { id: target_id });
                     }
@@ -375,6 +380,7 @@ impl TuiApp {
                     self.selected_session_idx = 0;
                     let target_id = self.history_sessions[0].id.clone();
                     self.selected_session_detail = None;
+                    self.history_inspect.clear();
                     if self.daemon_connected {
                         return Some(TuiCommand::SessionGet { id: target_id });
                     }

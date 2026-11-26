@@ -6,6 +6,7 @@ use super::app::{
     ModalState, SoftRebaselineField, Tab, TuiApp, UnenrollButton,
 };
 use super::event::TuiCommand;
+use super::trace::time_to_column;
 use crate::calibration::FeedbackVerdict;
 
 mod modal;
@@ -32,6 +33,34 @@ impl TuiApp {
         // 2. Handle active modals
         if self.modal != ModalState::None {
             return self.handle_modal_key(key);
+        }
+
+        // 2b. History Epoch chart inspect mode overrides horizontal tab-switching keys
+        if self.is_history_chart_inspecting() {
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.history_inspect.step(-1);
+                    return None;
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.history_inspect.step(1);
+                    return None;
+                }
+                KeyCode::Home => {
+                    self.history_inspect.set_col(0);
+                    return None;
+                }
+                KeyCode::End => {
+                    let max_col = self.history_inspect.chart_width.saturating_sub(1);
+                    self.history_inspect.set_col(max_col);
+                    return None;
+                }
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.history_inspect.clear();
+                    return None;
+                }
+                _ => {}
+            }
         }
 
         // 3. Global hotkeys when no modal is open
@@ -97,6 +126,7 @@ impl TuiApp {
         if self.active_tab == target {
             return None;
         }
+        self.history_inspect.clear();
         self.active_tab = target;
         if target == Tab::History && self.daemon_connected {
             Some(TuiCommand::RefreshSessions)
@@ -150,6 +180,10 @@ impl TuiApp {
                 _ => None,
             },
             Tab::History => match key.code {
+                KeyCode::Enter | KeyCode::Char('i') => {
+                    self.enter_history_chart_inspect();
+                    None
+                }
                 KeyCode::Char('f') if self.can_act_on_selected_session() => {
                     self.open_history_feedback_modal()
                 }
@@ -181,6 +215,9 @@ impl TuiApp {
 
     pub(super) fn select_history_session(&mut self, idx: usize) -> Option<TuiCommand> {
         let sid = self.history_sessions.get(idx)?.id.clone();
+        if self.selected_session_idx != idx {
+            self.history_inspect.clear();
+        }
         self.selected_session_idx = idx;
         if self
             .selected_session_detail
@@ -195,6 +232,35 @@ impl TuiApp {
         } else {
             Some(TuiCommand::SessionGet { id: sid })
         }
+    }
+
+    pub(super) fn enter_history_chart_inspect(&mut self) {
+        let chart_w = self.history_inspect.chart_width;
+        if self.is_history_chart_inspecting() || chart_w == 0 {
+            return;
+        }
+        let Some(entry) = self.history_sessions.get(self.selected_session_idx) else {
+            return;
+        };
+        let has_epochs = self
+            .selected_session_detail
+            .as_ref()
+            .is_some_and(|d| d.session.id == entry.id && !d.epochs.is_empty());
+        if !has_epochs {
+            return;
+        }
+        let t_start = entry.start_ts_ms;
+        let t_end = entry.end_ts_ms;
+        let ascii = self.theme.ascii;
+        let in_window = |ts: i64| ts >= t_start && ts <= t_end;
+        let init_col = if let Some(ts) = entry.sleeping_ts_ms.filter(|&t| in_window(t)) {
+            time_to_column(ts, t_start, t_end, chart_w, ascii)
+        } else if let Some(ts) = entry.onset_confirmed_ts_ms.filter(|&t| in_window(t)) {
+            time_to_column(ts, t_start, t_end, chart_w, ascii)
+        } else {
+            (chart_w / 2).min(chart_w.saturating_sub(1))
+        };
+        self.history_inspect.set_col(init_col);
     }
 
     pub(super) fn toggle_diagnostics(&mut self) -> Option<TuiCommand> {
