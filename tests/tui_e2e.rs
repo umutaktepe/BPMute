@@ -4311,36 +4311,41 @@ fn test_dashboard_standby_badge_live_telemetry_rendering() {
         end: ClockTime::new(8, 0).unwrap(),
     };
 
-    let build_test_app = |no_color: bool, ascii: bool| {
-        let mut app = TuiApp::new(false, no_color, ascii);
-        app.daemon_connected = true;
-        app.daemon_status = Some(make_daemon_status(schedule.clone()));
-        app.monitoring_state = MonitoringState::Standby;
-        app.latest_bpm = Some(68.0);
-        app.contact_ok = true;
-        app.sparkline_data.quiet_wake_baseline = Some(72.0);
-        app.sparkline_data.sleeping_hr = Some(58.0);
-        app.enrolled_wearables = vec![make_wearable(
-            "w-1",
-            "AA:BB:CC:11:22:33",
-            Some("Polar H10"),
-            StreamStatus::Streaming,
-            Some(85),
-            Some("Chest"),
-        )];
-        app.sparkline_data.push_sample(HrSampleEvent {
-            bpm: 68.0,
-            rr_ms: vec![],
-            contact_status: ContactStatus::Contact,
-            wearable_id: "w-1".into(),
-            session_id: None,
-            ts_ms: 1_700_000_000_000,
-        });
-        app
-    };
+    let build_test_app =
+        |no_color: bool, ascii: bool, schedule_cfg: ScheduleConfig, armed: bool| {
+            let mut app = TuiApp::new(false, no_color, ascii);
+            app.daemon_connected = true;
+            let mut status = make_daemon_status(schedule_cfg);
+            status.monitoring_state = MonitoringState::Standby;
+            status.armed = armed;
+            app.daemon_status = Some(status);
+            app.monitoring_state = MonitoringState::Standby;
+            app.armed = armed;
+            app.latest_bpm = Some(68.0);
+            app.contact_ok = true;
+            app.sparkline_data.quiet_wake_baseline = Some(72.0);
+            app.sparkline_data.sleeping_hr = Some(58.0);
+            app.enrolled_wearables = vec![make_wearable(
+                "w-1",
+                "AA:BB:CC:11:22:33",
+                Some("Polar H10"),
+                StreamStatus::Streaming,
+                Some(85),
+                Some("Chest"),
+            )];
+            app.sparkline_data.push_sample(HrSampleEvent {
+                bpm: 68.0,
+                rr_ms: vec![],
+                contact_status: ContactStatus::Contact,
+                wearable_id: "w-1".into(),
+                session_id: None,
+                ts_ms: 1_700_000_000_000,
+            });
+            app
+        };
 
-    // 1. Standard mode (80x24 baseline and 60x18 compact)
-    let mut app = build_test_app(false, false);
+    // 1. Outside Active Hours (active_hours_enabled=true, armed=false): [STANDBY - Arms at 23:00]
+    let mut app = build_test_app(false, false, schedule.clone(), false);
     render_canonical_viewports(&mut app, |buf, w, h| {
         let out = buffer_to_string(buf);
         assert!(
@@ -4363,8 +4368,8 @@ fn test_dashboard_standby_badge_live_telemetry_rendering() {
         }
     });
 
-    // 2. ASCII and NO_COLOR mode across both 80x24 and 60x18
-    let mut app_ascii = build_test_app(true, true);
+    // 2. ASCII and NO_COLOR mode outside Active Hours across 80x24 and 60x18
+    let mut app_ascii = build_test_app(true, true, schedule.clone(), false);
     render_canonical_viewports(&mut app_ascii, |buf_ascii, w, h| {
         let out_ascii = buffer_to_string(buf_ascii);
         assert!(
@@ -4399,6 +4404,45 @@ fn test_dashboard_standby_badge_live_telemetry_rendering() {
             }
         }
     });
+
+    // 3. Post-sleep Standby inside Active Hours (armed=true) and 24/7 mode (active_hours_enabled=false)
+    let schedule_24_7 = ScheduleConfig {
+        active_hours_enabled: false,
+        ..schedule.clone()
+    };
+    for (label, sched_case) in [
+        ("inside_active_hours", schedule.clone()),
+        ("24_7_mode", schedule_24_7),
+    ] {
+        for (no_color, ascii) in [(false, false), (true, true)] {
+            let mut post_app = build_test_app(no_color, ascii, sched_case.clone(), true);
+            render_canonical_viewports(&mut post_app, |buf, w, h| {
+                let out = buffer_to_string(buf);
+                if ascii {
+                    assert!(
+                        out.is_ascii(),
+                        "{label} must be strictly ASCII at {w}x{h} in:\n{out}"
+                    );
+                }
+                assert!(
+                    find_text_coords(buf, "State: Standby").is_some(),
+                    "{label}: expected State: Standby at {w}x{h} in:\n{out}"
+                );
+                assert!(
+                    find_text_coords(buf, "[STANDBY - Session ended]").is_some(),
+                    "{label}: expected [STANDBY - Session ended] at {w}x{h} in:\n{out}"
+                );
+                assert!(
+                    find_text_coords(buf, "[STANDBY - Arms at").is_none(),
+                    "{label}: must not show Arms at in post-sleep Standby at {w}x{h} in:\n{out}"
+                );
+                assert!(
+                    find_text_coords(buf, "68 BPM").is_some(),
+                    "{label}: expected live BPM at {w}x{h} in:\n{out}"
+                );
+            });
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -4507,6 +4551,199 @@ async fn test_real_socket_tui_bridge_standby_and_live_telemetry_e2e() {
         find_text_coords(&buf, "65 BPM").is_some(),
         "expected 65 BPM in:\n{out}"
     );
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_tui_bridge_post_sleep_standby_session_ended_e2e() {
+    use bpmute::daemon::WearableEvent;
+    use bpmute::ipc::IpcClient;
+    use bpmute::sleep_engine::{ContactStatus, HrPacket, StreamState};
+    use bpmute::storage::WearableDescriptor;
+    use chrono::{Local, TimeZone};
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+
+    // 23:00 Local time inside [22:00, 08:00) Active Hours
+    let local_23h = Local.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let start_utc = local_23h.with_timezone(&Utc);
+    let t0 = start_utc.timestamp_millis();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    loaded.config.schedule.active_hours_enabled = true;
+    loaded.config.schedule.start = bpmute::config::ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = bpmute::config::ClockTime::new(8, 0).unwrap();
+
+    let (source, w_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let desc = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:66".to_string(),
+        address_type: "public".to_string(),
+        alias: Some("PostSleep Strap".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+    daemon
+        .core()
+        .persistence
+        .upsert_wearable(desc.clone(), t0)
+        .await
+        .unwrap();
+
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.daemon_connected && !a.enrolled_wearables.is_empty()
+    })
+    .await;
+
+    w_tx.send(WearableEvent::StreamState {
+        wearable: desc.clone(),
+        state: StreamState {
+            status: StreamStatus::Streaming,
+            ts_ms: t0,
+        },
+    })
+    .await
+    .unwrap();
+
+    // Warmup (500s) + sleep descent (700s) -> Sleeping
+    common::daemon::send_synthetic_wave_stream(
+        &w_tx,
+        &desc,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t0 + 1000,
+            count_sec: 500,
+            base_bpm: 68.0,
+            bpm_amplitude: 2.6,
+            contact: ContactStatus::Contact,
+        },
+    )
+    .await;
+    tokio::time::advance(std::time::Duration::from_secs(500)).await;
+
+    common::daemon::send_sleep_descent_stream(&w_tx, &desc, t0 + 501 * 1000, 700, 68.0, 58.0).await;
+    tokio::time::advance(std::time::Duration::from_secs(700)).await;
+
+    common::tui::wait_for_app_state_with_budget(
+        &mut app,
+        &mut event_rx,
+        Some(&cmd_tx),
+        5000,
+        |a| a.monitoring_state == MonitoringState::Sleeping,
+    )
+    .await;
+
+    // 25 min sustained wakefulness inside Active Hours -> post-sleep Standby (armed=true)
+    common::daemon::send_synthetic_wave_stream(
+        &w_tx,
+        &desc,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t0 + 1201 * 1000,
+            count_sec: 1500,
+            base_bpm: 80.0,
+            bpm_amplitude: 2.6,
+            contact: ContactStatus::Contact,
+        },
+    )
+    .await;
+    tokio::time::advance(std::time::Duration::from_secs(1500)).await;
+
+    // Stream live HR while in post-sleep Standby
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc.clone(),
+        packet: HrPacket {
+            ts_ms: t0 + 2701 * 1000,
+            bpm: 74.0,
+            rr_ms: vec![810.0],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    common::tui::wait_for_app_state_with_budget(
+        &mut app,
+        &mut event_rx,
+        Some(&cmd_tx),
+        5000,
+        |a| {
+            a.monitoring_state == MonitoringState::Standby
+                && a.armed
+                && a.latest_bpm == Some(74.0)
+                && a.history_sessions.len() == 1
+        },
+    )
+    .await;
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let out = buffer_to_string(&buf);
+    assert!(
+        find_text_coords(&buf, "[STANDBY - Session ended]").is_some(),
+        "expected [STANDBY - Session ended] inside Active Hours in:\n{out}"
+    );
+    assert!(
+        find_text_coords(&buf, "74 BPM").is_some(),
+        "expected live 74 BPM in:\n{out}"
+    );
+
+    // Advance past 08:00 (outside Active Hours) and send a packet -> switches to [STANDBY - Arms at 22:00]
+    let remaining_to_0805 = (9 * 3600 + 5 * 60) - 2701;
+    tokio::time::advance(std::time::Duration::from_secs(remaining_to_0805 as u64)).await;
+    w_tx.send(WearableEvent::HrPacket {
+        wearable: desc,
+        packet: HrPacket {
+            ts_ms: t0 + (9 * 3600 + 5 * 60) * 1000,
+            bpm: 72.0,
+            rr_ms: vec![833.0],
+            contact_status: ContactStatus::Contact,
+        },
+    })
+    .await
+    .unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.monitoring_state == MonitoringState::Standby && !a.armed
+    })
+    .await;
+
+    terminal
+        .draw(|f| app.render(f.area(), f.buffer_mut()))
+        .unwrap();
+    let buf_out = terminal.backend().buffer().clone();
+    let out_after = buffer_to_string(&buf_out);
+    assert!(
+        find_text_coords(&buf_out, "[STANDBY - Arms at 22:00]").is_some(),
+        "expected [STANDBY - Arms at 22:00] after crossing window end in:\n{out_after}"
+    );
+
+    // Confirm SQLite still has only 1 session (no phantom second session)
+    let mut rpc = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let list = rpc
+        .request("session.list", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(list["total_count"], 1);
 
     let _ = shutdown_tx.send(true);
     let _ = bridge_task.await;

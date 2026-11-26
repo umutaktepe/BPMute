@@ -258,7 +258,10 @@ async fn run_status<WOut: Write, WErr: Write>(
                     status.paused,
                     status.dry_run
                 );
-                if status.monitoring_state == MonitoringState::Standby {
+                if status.monitoring_state == MonitoringState::Standby
+                    && status.schedule.active_hours_enabled
+                    && !status.armed
+                {
                     let _ = writeln!(stdout, "active_hours_arms_at: {}", status.schedule.start);
                 }
                 if let Some(until) = status.paused_until {

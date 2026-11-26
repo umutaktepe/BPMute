@@ -165,7 +165,11 @@ impl MonitoringContext {
             if !prev_within && within_active {
                 self.transition_active_hours_entered(ts_ms).await;
             } else if prev_within && !within_active {
+                let was_standby = self.engine.state() == DetectorState::Standby;
                 self.transition_active_hours_expired(ts_ms).await;
+                if was_standby {
+                    self.core.notify_standby_active_hours_expired();
+                }
             }
         }
     }

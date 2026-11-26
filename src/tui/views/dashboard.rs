@@ -192,10 +192,14 @@ fn render_sleep_state_card(app: &TuiApp, area: Rect, buf: &mut Buffer) {
     let p_pct = (p_sleep * 100.0).round() as u16;
 
     let line1 = if app.monitoring_state == MonitoringState::Standby {
-        let arm_time = active_hours_config(app)
-            .map(|ah| ah.start.to_string())
-            .unwrap_or_else(|| crate::config::ScheduleConfig::default().start.to_string());
-        let badge = format!("[STANDBY - Arms at {arm_time}]");
+        let badge = if let Some(ah) = active_hours_config(app)
+            && ah.active_hours_enabled
+            && !app.armed
+        {
+            format!("[STANDBY - Arms at {}]", ah.start)
+        } else {
+            "[STANDBY - Session ended]".to_string()
+        };
         let display_badge = if inner.width > badge.len() as u16 {
             format!(" {badge}")
         } else {

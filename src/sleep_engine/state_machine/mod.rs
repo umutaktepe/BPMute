@@ -380,7 +380,12 @@ impl SleepEngine {
                     self.resolve_active_gap(ts_ms, true, outputs);
                 }
             }
-            StreamStatus::SignalLost | StreamStatus::Disconnected => {
+            StreamStatus::SignalLost => {
+                if self.state != DetectorState::Standby {
+                    self.begin_or_tighten_gap(ts_ms, MEDIUM_GAP_MAX_MS);
+                }
+            }
+            StreamStatus::Disconnected => {
                 if self.state == DetectorState::Standby {
                     self.exit_standby_to_idle(ts_ms, "stream disconnected during standby", outputs);
                 } else {
@@ -692,26 +697,6 @@ impl SleepEngine {
         }
 
         if let Some(reason) = split_reason {
-            self.split_session_or_transition_to_standby(
-                ts_ms,
-                reason,
-                "post-sleep wakefulness session split",
-                outputs,
-            );
-        }
-    }
-
-    fn split_session_or_transition_to_standby(
-        &mut self,
-        ts_ms: i64,
-        reason: SessionEndReason,
-        split_desc: &str,
-        outputs: &mut Vec<EngineOutput>,
-    ) {
-        if self.within_active_hours {
-            self.close_session(ts_ms, reason, outputs);
-            self.open_session(ts_ms, split_desc, outputs);
-        } else {
             self.close_session_to_standby(ts_ms, reason, outputs);
         }
     }
@@ -823,10 +808,9 @@ impl SleepEngine {
                 if let (Some(hr), Some(z_hr)) = (self.last_hr_bpm_60s, self.last_z_hr)
                     && self.has_wake_rebound(hr, z_hr, self.hmm.probs()[STATE_SLEEP_NREM])
                 {
-                    self.split_session_or_transition_to_standby(
+                    self.close_session_to_standby(
                         ts_ms,
                         SessionEndReason::DesktopWakeRebound,
-                        "desktop wake rebound session split",
                         outputs,
                     );
                 }

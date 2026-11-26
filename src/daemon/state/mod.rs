@@ -813,6 +813,24 @@ impl DaemonCore {
         }
     }
 
+    /// Synchronizes Active Hours tracking and emits `StateChanged` when `Standby` exits Active Hours.
+    pub fn notify_standby_active_hours_expired(&self) {
+        let status_opt = {
+            let mut guard = self.inner.lock().expect("daemon state mutex poisoned");
+            if guard.loaded_config.config.schedule.active_hours_enabled
+                && guard.last_within_active_hours != Some(false)
+            {
+                guard.last_within_active_hours = Some(false);
+                Some(self.build_status_locked(&guard))
+            } else {
+                None
+            }
+        };
+        if let Some(status) = status_opt {
+            self.publish_state_changed(&status);
+        }
+    }
+
     pub(super) fn publish_alerts_changed(&self, alerts: Vec<DaemonAlert>) {
         if let Ok(val) = serde_json::to_value(AlertChangedEvent { alerts }) {
             self.broker.publish_control("AlertChanged", val);

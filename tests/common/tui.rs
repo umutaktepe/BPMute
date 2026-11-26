@@ -364,15 +364,16 @@ pub fn is_non_blank_braille(ch: char) -> bool {
     ('\u{2801}'..='\u{28FF}').contains(&ch)
 }
 
-pub async fn wait_for_app_state_with_cmds<F>(
+pub async fn wait_for_app_state_with_budget<F>(
     app: &mut TuiApp,
     event_rx: &mut mpsc::Receiver<TuiEvent>,
     cmd_tx: Option<&mpsc::Sender<TuiCommand>>,
+    max_events: usize,
     mut pred: F,
 ) where
     F: FnMut(&TuiApp) -> bool,
 {
-    for _ in 0..256 {
+    for _ in 0..max_events {
         if pred(app) {
             return;
         }
@@ -387,7 +388,7 @@ pub async fn wait_for_app_state_with_cmds<F>(
         }
     }
     panic!(
-        "TUI app did not reach expected state within event budget (256 events). Final state: tab={:?}, modal={:?}, sel_session_idx={}, sessions={:?}, sel_session_detail={:?}",
+        "TUI app did not reach expected state within event budget ({max_events} events). Final state: tab={:?}, modal={:?}, sel_session_idx={}, sessions={:?}, sel_session_detail={:?}",
         app.active_tab,
         app.modal,
         app.selected_session_idx,
@@ -397,6 +398,17 @@ pub async fn wait_for_app_state_with_cmds<F>(
             .collect::<Vec<_>>(),
         app.selected_session_detail.as_ref().map(|d| &d.session.id),
     );
+}
+
+pub async fn wait_for_app_state_with_cmds<F>(
+    app: &mut TuiApp,
+    event_rx: &mut mpsc::Receiver<TuiEvent>,
+    cmd_tx: Option<&mpsc::Sender<TuiCommand>>,
+    pred: F,
+) where
+    F: FnMut(&TuiApp) -> bool,
+{
+    wait_for_app_state_with_budget(app, event_rx, cmd_tx, 256, pred).await;
 }
 
 pub async fn wait_for_app_state<F>(

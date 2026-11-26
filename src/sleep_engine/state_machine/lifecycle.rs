@@ -34,7 +34,9 @@ impl SleepEngine {
         reason: SessionEndReason,
     ) -> Vec<EngineOutput> {
         let mut outputs = Vec::new();
-        if self.state != DetectorState::Idle {
+        if self.state == DetectorState::Standby {
+            self.exit_standby_to_idle(ts_ms, "standby ended", &mut outputs);
+        } else if self.state != DetectorState::Idle {
             self.close_session(ts_ms, reason, &mut outputs);
         }
         outputs
@@ -484,7 +486,13 @@ impl SleepEngine {
             (DetectorState::Standby, SessionEndReason::ActiveHoursExpired) => {
                 "active hours expired"
             }
-            (DetectorState::Standby, _) => "monitoring session closed outside active hours",
+            (DetectorState::Standby, SessionEndReason::SustainedWakefulness) => {
+                "sustained post-sleep wakefulness"
+            }
+            (DetectorState::Standby, SessionEndReason::DesktopWakeRebound) => {
+                "desktop wake rebound"
+            }
+            (DetectorState::Standby, _) => "monitoring session closed to standby",
             (DetectorState::Idle, _) => "monitoring session closed",
             _ => "session closed",
         };

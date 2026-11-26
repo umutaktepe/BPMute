@@ -88,6 +88,36 @@ pub async fn send_synthetic_wave_stream(
     }
 }
 
+/// Streams a synthetic 1 Hz sleep-onset heart-rate descent with RR intervals into `wearable_tx`.
+pub async fn send_sleep_descent_stream(
+    wearable_tx: &mpsc::Sender<WearableEvent>,
+    desc: &WearableDescriptor,
+    start_ts_ms: i64,
+    count_sec: usize,
+    wake_bpm: f64,
+    sleep_bpm: f64,
+) {
+    for sec in 0..count_sec {
+        let ts_ms = start_ts_ms + (sec as i64) * 1000;
+        let mins = sec as f64 / 60.0;
+        let target = (wake_bpm - 0.8 * mins).max(sleep_bpm);
+        let bpm = target + 0.35 * (sec as f64 * 0.4).sin();
+        let rr_ms = vec![60_000.0 / bpm + 26.0 * (sec as f64 * 1.5).sin()];
+        wearable_tx
+            .send(WearableEvent::HrPacket {
+                wearable: desc.clone(),
+                packet: HrPacket {
+                    ts_ms,
+                    bpm,
+                    rr_ms,
+                    contact_status: ContactStatus::Contact,
+                },
+            })
+            .await
+            .unwrap();
+    }
+}
+
 /// Streams a synthetic `EngineEvent` slice shifted by `base_ts` into `wearable_tx`.
 pub async fn send_trace_slice(
     wearable_tx: &mpsc::Sender<WearableEvent>,

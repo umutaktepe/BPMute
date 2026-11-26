@@ -875,3 +875,157 @@ async fn status_cli_displays_standby_state_arming_time_and_json_state() {
 
     daemon.shutdown().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn status_cli_omits_active_hours_arms_at_in_post_sleep_standby() {
+    use common::daemon::TestWearableSource;
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_cli_test_env(&temp);
+    let mut loaded =
+        LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    // Start in 24/7 mode (active_hours_enabled = false)
+    loaded.config.schedule.active_hours_enabled = false;
+    loaded.config.schedule.start = bpmute::config::ClockTime::new(22, 0).unwrap();
+    loaded.config.schedule.end = bpmute::config::ClockTime::new(8, 0).unwrap();
+
+    // 23:00 Local time (inside [22:00, 08:00) once Active Hours is enabled)
+    let local_23h = Local.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
+    let start_utc = local_23h.with_timezone(&Utc);
+    let t0 = start_utc.timestamp_millis();
+    let clock = Arc::new(VirtualClock::starting_at(start_utc));
+    let (source, wearable_tx) = TestWearableSource::new();
+
+    let daemon = DaemonHandle::spawn(
+        DaemonOptions::for_testing(paths.clone(), loaded, Arc::new(env.clone()), clock)
+            .with_wearable_source(Arc::new(source)),
+    )
+    .await
+    .unwrap();
+
+    let wearable = WearableDescriptor {
+        mac: "AA:BB:CC:DD:EE:88".to_string(),
+        address_type: "random".to_string(),
+        alias: Some("Post-Sleep Watch".to_string()),
+        advertised_name: Some("Polar H10".to_string()),
+        supports_rr: true,
+        supports_contact: true,
+    };
+
+    let mut sub = IpcClient::connect(&paths.socket_path).await.unwrap();
+    sub.request("daemon.subscribe", serde_json::json!({}))
+        .await
+        .unwrap();
+    let _snap = sub.next_event().await.unwrap();
+
+    wearable_tx
+        .send(WearableEvent::StreamState {
+            wearable: wearable.clone(),
+            state: StreamState {
+                ts_ms: t0,
+                status: StreamStatus::Streaming,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Warmup (500s) + sleep descent (700s) -> Sleeping
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &wearable,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t0 + 1000,
+            count_sec: 500,
+            base_bpm: 68.0,
+            bpm_amplitude: 2.6,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
+    tokio::time::advance(std::time::Duration::from_secs(500)).await;
+
+    common::daemon::send_sleep_descent_stream(
+        &wearable_tx,
+        &wearable,
+        t0 + 501 * 1000,
+        700,
+        68.0,
+        58.0,
+    )
+    .await;
+    tokio::time::advance(std::time::Duration::from_secs(700)).await;
+
+    // 25 min sustained wakefulness -> post-sleep Standby in 24/7 mode
+    common::daemon::send_synthetic_wave_stream(
+        &wearable_tx,
+        &wearable,
+        common::daemon::SyntheticStreamParams {
+            start_ts_ms: t0 + 1201 * 1000,
+            count_sec: 1500,
+            base_bpm: 80.0,
+            bpm_amplitude: 2.6,
+            contact: bpmute::sleep_engine::ContactStatus::Contact,
+        },
+    )
+    .await;
+    tokio::time::advance(std::time::Duration::from_secs(1500)).await;
+
+    let mut reached_standby = false;
+    for _ in 0..5000 {
+        let ev = sub.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Standby" {
+            reached_standby = true;
+            break;
+        }
+    }
+    assert!(reached_standby, "daemon must transition to Standby");
+
+    // 1) 24/7 mode post-sleep Standby: omits active_hours_arms_at
+    let (code, text_24_7, err) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(text_24_7.contains("state: Standby"), "got: {text_24_7}");
+    assert!(text_24_7.contains("armed: true"), "got: {text_24_7}");
+    assert!(
+        !text_24_7.contains("active_hours_arms_at:"),
+        "24/7 post-sleep Standby must omit active_hours_arms_at:\n{text_24_7}"
+    );
+
+    // 2) Enable Active Hours while still inside [22:00, 08:00): still omits active_hours_arms_at
+    let mut cfg_client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    cfg_client
+        .request(
+            "config.update",
+            serde_json::json!({
+                "schedule": {
+                    "active_hours_enabled": true,
+                    "start": "22:00",
+                    "end": "08:00"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let (code, text_inside, err) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(text_inside.contains("state: Standby"), "got: {text_inside}");
+    assert!(text_inside.contains("armed: true"), "got: {text_inside}");
+    assert!(
+        !text_inside.contains("active_hours_arms_at:"),
+        "inside Active Hours post-sleep Standby must omit active_hours_arms_at:\n{text_inside}"
+    );
+
+    // 3) Advance past 08:00 (outside Active Hours): retains active_hours_arms_at: 22:00
+    tokio::time::advance(std::time::Duration::from_secs(9 * 3600)).await;
+    let (code, text_outside, err) = run_inproc_cli(&["bpmute", "status"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    assert!(
+        text_outside.contains("state: Standby"),
+        "got: {text_outside}"
+    );
+    assert!(
+        text_outside.contains("active_hours_arms_at: 22:00"),
+        "outside Active Hours Standby must retain active_hours_arms_at:\n{text_outside}"
+    );
+
+    daemon.shutdown().await;
+}

@@ -943,7 +943,7 @@ fn slice4_tiered_gaps_and_post_sleep_1_to_1_session_splitting() {
     assert_eq!(eng_timeout.gap_started_ms(), None);
     assert_eq!(eng_timeout.gap_deadline_ms(), None);
 
-    // Post-sleep 1:1 split on sustained wakefulness (>= 10 min with P(SleepNREM) < 0.30)
+    // Post-sleep SustainedWakefulness closes session directly into Standby without opening session 2
     let mut eng_split = default_engine();
     eng_split.handle_event(EngineEvent::StreamState(StreamState {
         ts_ms: 0,
@@ -973,9 +973,15 @@ fn slice4_tiered_gaps_and_post_sleep_1_to_1_session_splitting() {
         o,
         EngineOutput::SessionEnded(s) if s.session_index == 1 && s.end_reason == SessionEndReason::SustainedWakefulness
     )));
-    assert_eq!(eng_split.current_session_index(), Some(2));
+    assert_eq!(eng_split.state(), DetectorState::Standby);
+    assert_eq!(eng_split.current_session_index(), Some(1));
+    assert!(
+        !split_out
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SessionStarted { .. }))
+    );
 
-    // Path B: DesktopActivity + HR rebound splits session immediately
+    // Path B: DesktopActivity + HR rebound closes session directly into Standby without opening session 2
     let mut eng_desk = default_engine();
     eng_desk.handle_event(EngineEvent::StreamState(StreamState {
         ts_ms: 0,
@@ -1008,7 +1014,13 @@ fn slice4_tiered_gaps_and_post_sleep_1_to_1_session_splitting() {
         o,
         EngineOutput::SessionEnded(s) if s.session_index == 1 && s.end_reason == SessionEndReason::DesktopWakeRebound
     )));
-    assert_eq!(eng_desk.current_session_index(), Some(2));
+    assert_eq!(eng_desk.state(), DetectorState::Standby);
+    assert_eq!(eng_desk.current_session_index(), Some(1));
+    assert!(
+        !rebound_out
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SessionStarted { .. }))
+    );
 
     // Post-filter feed_epoch_features matches Epoch stream seamlessly
     let mut eng_direct = default_engine();
@@ -1234,7 +1246,8 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
         }
     }
 
-    // Mid-night wake + second onset (1:1 Monitoring Session split)
+    // Mid-night wake without disconnect enters Standby and prevents phantom second session;
+    // reconnecting after disconnect re-arms and detects a second onset in session 2.
     let split_trace = generate_paired_trace(
         505,
         Phenotype::typical(),
@@ -1245,7 +1258,7 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
             StageKind::PostSleepWake {
                 duration_sec: 1440,
                 elevation_bpm: 12.0,
-            }, // 24 min elevated wake -> splits session 1 and enters session 2
+            }, // 24 min elevated wake -> closes session 1 into Standby
             StageKind::QuietWake { duration_sec: 900 },
             StageKind::N1Onset { duration_sec: 360 },
             StageKind::N2Sleep { duration_sec: 900 },
@@ -1255,14 +1268,80 @@ fn tier1_sleep_positives_paired_parity_and_slow_gradual_descent() {
         run_trace_collecting_confirmed(&split_trace.bpm_rr, CalibrationPriors::cold_start());
     assert_eq!(
         conf_split.len(),
-        2,
-        "mid-night wake + second onset must produce 2 confirmed onsets across 2 sessions"
+        1,
+        "continuous stream after post-sleep Standby must not auto-open a second session"
     );
     assert!(out_split.iter().any(|o| matches!(
         o,
         EngineOutput::SessionEnded(s)
             if s.session_index == 1 && s.end_reason == SessionEndReason::SustainedWakefulness
     )));
+    assert!(!out_split.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionStarted {
+            session_index: 2,
+            ..
+        }
+    )));
+
+    // Re-arming by disconnecting and reconnecting after post-sleep Standby detects the second onset.
+    let mut eng_rearm = SleepEngine::new(EngineConfig {
+        detection: DetectionConfig::default(),
+        priors: CalibrationPriors::cold_start(),
+        wearable_floor: WearableFloor::default(),
+    });
+    let mut conf_rearm = Vec::new();
+    let mut rearmed = false;
+    for ev in &split_trace.bpm_rr {
+        let outs = eng_rearm.handle_event(ev.clone());
+        let mut expire_ts = None;
+        let mut wake_close_ts = None;
+        for o in &outs {
+            match o {
+                EngineOutput::StateChanged {
+                    ts_ms,
+                    to: DetectorState::Confirmed,
+                    ..
+                } => {
+                    conf_rearm.push(*ts_ms);
+                    expire_ts = Some(*ts_ms);
+                }
+                EngineOutput::SessionEnded(s)
+                    if s.end_reason == SessionEndReason::SustainedWakefulness =>
+                {
+                    wake_close_ts = Some(s.end_ts_ms);
+                }
+                _ => {}
+            }
+        }
+        if let Some(ts_ms) = expire_ts {
+            let _ = eng_rearm.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+                ts_ms,
+                outcome: GraceResult::Expired,
+            }));
+        }
+        if let Some(end_ts) = wake_close_ts
+            && !rearmed
+        {
+            rearmed = true;
+            assert_eq!(eng_rearm.state(), DetectorState::Standby);
+            let _ = eng_rearm.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+                ts_ms: end_ts + 500,
+                reason: StreamDisconnectReason::Remote,
+            }));
+            assert_eq!(eng_rearm.state(), DetectorState::Idle);
+            let _ = eng_rearm.handle_event(EngineEvent::StreamState(StreamState {
+                ts_ms: end_ts + 900,
+                status: StreamStatus::Streaming,
+            }));
+            assert_eq!(eng_rearm.state(), DetectorState::Warmup);
+        }
+    }
+    assert_eq!(
+        conf_rearm.len(),
+        2,
+        "disconnect + reconnect after post-sleep Standby must re-arm and detect session 2 onset"
+    );
 }
 
 #[test]
@@ -2767,6 +2846,162 @@ fn post_sleep_wakefulness_outside_active_hours_transitions_to_standby_without_ne
             ..
         }
     )));
+}
+
+#[test]
+fn post_sleep_wakefulness_inside_active_hours_enters_standby_and_rearms_only_on_reconnect_or_window_start()
+ {
+    let mut eng = default_engine();
+    eng.set_active_hours(true);
+
+    let _ = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: 0,
+        status: StreamStatus::Streaming,
+    }));
+    let _ = push_calm_wake(&mut eng, 1, 600, 68.0, true);
+    let (out_c1, tc_sec) = push_sleep_until_state(
+        &mut eng,
+        601,
+        1500,
+        68.0,
+        56.0,
+        true,
+        DetectorState::Confirmed,
+    );
+    let tc1 = confirmed_ts(&out_c1).expect("Confirmed");
+    let _ = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: tc1 + 30_000,
+        outcome: GraceResult::Expired,
+    }));
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+
+    // 25 min sustained wakefulness while still inside Active Hours (or 24/7 mode).
+    let wake_start = tc_sec + 35;
+    let wake_end = wake_start + 1500;
+    let wake_out = push_calm_wake(&mut eng, wake_start, wake_end, 82.0, true);
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert_eq!(eng.current_session_index(), Some(1));
+    assert!(wake_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.session_index == 1 && s.end_reason == SessionEndReason::SustainedWakefulness
+    )));
+    assert!(
+        !wake_out
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SessionStarted { .. })),
+        "post-sleep Standby must not open a second session"
+    );
+
+    // Streaming sleep-like HR while in post-sleep Standby emits no epochs and never triggers onset.
+    let standby_end = wake_end + 1800;
+    let standby_out = push_sleep(&mut eng, wake_end + 1, standby_end, 52.0, 48.0, true);
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(!standby_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::EpochEmitted(_) | EngineOutput::SessionStarted { .. }
+    )));
+
+    // Brief SignalLost during Standby must stay in Standby (not re-arm on next valid packet).
+    let sig_lost_out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: (standby_end + 1) * 1000,
+        status: StreamStatus::SignalLost,
+    }));
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(sig_lost_out.is_empty());
+    let resume_out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: (standby_end + 5) * 1000,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(resume_out.is_empty());
+
+    // Disconnecting transitions cleanly to Idle without emitting a duplicate SessionEnded.
+    let dc_out = eng.handle_event(EngineEvent::StreamDisconnected(StreamDisconnected {
+        ts_ms: (standby_end + 10) * 1000,
+        reason: StreamDisconnectReason::Remote,
+    }));
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert!(
+        !dc_out
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SessionEnded(_)))
+    );
+
+    // Reconnecting opens session #2 in Warmup.
+    let s2_start = standby_end + 15;
+    let reconn_out = eng.handle_event(EngineEvent::StreamState(StreamState {
+        ts_ms: s2_start * 1000,
+        status: StreamStatus::Streaming,
+    }));
+    assert_eq!(eng.state(), DetectorState::Warmup);
+    assert_eq!(eng.current_session_index(), Some(2));
+    assert!(reconn_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionStarted {
+            session_index: 2,
+            ..
+        }
+    )));
+
+    // DesktopWakeRebound inside Active Hours also transitions directly to Standby.
+    let _ = push_calm_wake(&mut eng, s2_start + 1, s2_start + 600, 68.0, true);
+    let (out_c2, tc2_sec) = push_sleep_until_state(
+        &mut eng,
+        s2_start + 601,
+        s2_start + 1500,
+        68.0,
+        56.0,
+        true,
+        DetectorState::Confirmed,
+    );
+    let tc2 = confirmed_ts(&out_c2).expect("Confirmed session 2");
+    let _ = eng.handle_event(EngineEvent::GraceOutcome(GraceOutcome {
+        ts_ms: tc2 + 30_000,
+        outcome: GraceResult::Expired,
+    }));
+    assert_eq!(eng.state(), DetectorState::Sleeping);
+    eng.handle_event(EngineEvent::DesktopActivity(DesktopActivity {
+        ts_ms: (tc2_sec + 35) * 1000,
+        kind: DesktopActivityKind::UserInput,
+    }));
+    let reb_out = push_calm_wake(&mut eng, tc2_sec + 36, tc2_sec + 240, 86.0, true);
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(reb_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s)
+            if s.session_index == 2 && s.end_reason == SessionEndReason::DesktopWakeRebound
+    )));
+
+    // Entering the next Active Hours window opens session #3 from post-sleep Standby.
+    let s3_start_ms = (tc2_sec + 300) * 1000;
+    let next_win_out = eng.open_session_from_standby(s3_start_ms, "active hours started");
+    assert_eq!(eng.state(), DetectorState::Warmup);
+    assert_eq!(eng.current_session_index(), Some(3));
+    assert!(next_win_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionStarted {
+            session_index: 3,
+            ..
+        }
+    )));
+
+    // Returning to Standby and calling force_close_session must not re-emit SessionEnded #3.
+    eng.set_active_hours(false);
+    let exp_out = eng.close_active_hours_expired(s3_start_ms + 5_000);
+    assert_eq!(eng.state(), DetectorState::Standby);
+    assert!(exp_out.iter().any(|o| matches!(
+        o,
+        EngineOutput::SessionEnded(s) if s.session_index == 3
+    )));
+    let force_out = eng.force_close_session(s3_start_ms + 10_000, SessionEndReason::StreamEnded);
+    assert_eq!(eng.state(), DetectorState::Idle);
+    assert!(
+        !force_out
+            .iter()
+            .any(|o| matches!(o, EngineOutput::SessionEnded(_))),
+        "force_close_session in Standby must not emit duplicate SessionEnded"
+    );
 }
 
 fn run_n1_descent_with_transient_var_and_check_baseline(
