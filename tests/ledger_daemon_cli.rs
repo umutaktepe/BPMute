@@ -1146,13 +1146,7 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
     common::daemon::send_synthetic_wave_stream(
         &wearable_tx,
         &wearable_a,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: base_ts + 1_000,
-            count_sec: 500,
-            base_bpm: 65.0,
-            bpm_amplitude: 2.2,
-            contact: ContactStatus::Contact,
-        },
+        common::daemon::SyntheticStreamParams::warmup(base_ts + 1_000),
     )
     .await;
 
@@ -1171,13 +1165,7 @@ async fn switching_wearables_mid_stream_attributes_closed_session_to_previous_we
     common::daemon::send_synthetic_wave_stream(
         &wearable_tx,
         &wearable_b,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: t_b + 1_000,
-            count_sec: 500,
-            base_bpm: 64.0,
-            bpm_amplitude: 2.2,
-            contact: ContactStatus::Contact,
-        },
+        common::daemon::SyntheticStreamParams::warmup(t_b + 1_000),
     )
     .await;
     drop(wearable_tx);

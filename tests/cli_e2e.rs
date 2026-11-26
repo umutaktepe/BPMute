@@ -729,24 +729,7 @@ async fn test_sessions_end_cli_gap_gated_and_preconditions() {
     assert!(err_streaming.contains("streaming"));
 
     // Complete Warmup into Monitoring so manual closure persists session #1
-    common::daemon::send_synthetic_wave_stream(
-        &wearable_tx,
-        &wearable,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: t0 + 2_000,
-            count_sec: 500,
-            base_bpm: 66.0,
-            bpm_amplitude: 2.2,
-            contact: bpmute::sleep_engine::ContactStatus::Contact,
-        },
-    )
-    .await;
-    loop {
-        let ev = sub.next_event().await.unwrap();
-        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
-            break;
-        }
-    }
+    common::daemon::complete_warmup_and_wait(&wearable_tx, &wearable, &mut sub, t0 + 2_000).await;
 
     // 5. Disconnect wearable at t_dc (start gap)
     let t_dc = t0 + 510_000;
@@ -996,13 +979,7 @@ async fn status_cli_omits_active_hours_arms_at_in_post_sleep_standby() {
     common::daemon::send_synthetic_wave_stream(
         &wearable_tx,
         &wearable,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: t0 + 1000,
-            count_sec: 500,
-            base_bpm: 68.0,
-            bpm_amplitude: 2.6,
-            contact: bpmute::sleep_engine::ContactStatus::Contact,
-        },
+        common::daemon::SyntheticStreamParams::warmup(t0 + 1000),
     )
     .await;
     tokio::time::advance(std::time::Duration::from_secs(500)).await;

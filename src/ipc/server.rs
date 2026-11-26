@@ -29,16 +29,26 @@ pub async fn handle_connection(
 
     let (resp_tx, mut resp_rx) = mpsc::channel::<ResponseEnvelope>(32);
     let (sub_watch_tx, mut sub_watch_rx) = watch::channel::<Option<Arc<SubscriberQueue>>>(None);
+    let mut writer_shutdown_rx = shutdown_rx.clone();
 
     let writer_task = tokio::spawn(async move {
         loop {
+            if *writer_shutdown_rx.borrow() {
+                break;
+            }
             let active_queue = sub_watch_rx.borrow().clone();
             tokio::select! {
                 biased;
+                _ = wait_for_shutdown(&mut writer_shutdown_rx) => break,
                 maybe_resp = resp_rx.recv() => {
                     match maybe_resp {
                         Some(resp) => {
-                            if !write_server_response(&mut write_half, &resp, client_id).await {
+                            let ok = tokio::select! {
+                                biased;
+                                _ = wait_for_shutdown(&mut writer_shutdown_rx) => false,
+                                res = write_server_response(&mut write_half, &resp, client_id) => res,
+                            };
+                            if !ok {
                                 break;
                             }
                         }
@@ -56,7 +66,12 @@ pub async fn handle_connection(
                         None => std::future::pending::<PushEventEnvelope>().await,
                     }
                 } => {
-                    if !write_server_push(&mut write_half, &event, client_id).await {
+                    let ok = tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut writer_shutdown_rx) => false,
+                        res = write_server_push(&mut write_half, &event, client_id) => res,
+                    };
+                    if !ok {
                         break;
                     }
                 }
@@ -228,6 +243,14 @@ async fn process_line(
     }
 }
 
+async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    while !*shutdown_rx.borrow() {
+        if shutdown_rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 async fn write_server_response<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     resp: &ResponseEnvelope,
@@ -338,5 +361,90 @@ mod tests {
 
         line.clear();
         assert_eq!(buf_reader.read_line(&mut line).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn handle_connection_exits_promptly_on_shutdown_with_full_subscriber_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        use crate::actions::{FakeActionExecutor, FakeNotifier};
+        use crate::config::{CliOverrides, LoadedConfig};
+        use crate::daemon::state::{DaemonCoreInit, NoopEnrollmentDriver};
+        use crate::daemon::{NullWearableSource, SystemClock};
+        use crate::idle::FakeIdleProbe;
+        use crate::ipc::pubsub::EventBroker;
+        use crate::paths::{MapEnv, ResolvedPaths};
+        use crate::storage::{PersistenceWorker, db_path_in_data_dir, lock_path_in_data_dir};
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ResolvedPaths {
+            config_file: temp.path().join("cfg/config.toml"),
+            data_dir: temp.path().join("data"),
+            socket_path: temp.path().join("rt/bpmute.sock"),
+        };
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let env = Arc::new(MapEnv::new());
+        let loaded =
+            LoadedConfig::load(&paths.config_file, env.as_ref(), &CliOverrides::default()).unwrap();
+        let (worker, persistence, initial_calibration) = PersistenceWorker::spawn(
+            &db_path_in_data_dir(&paths.data_dir),
+            &lock_path_in_data_dir(&paths.data_dir),
+            1_000,
+        )
+        .unwrap();
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let core = Arc::new(DaemonCore::new(DaemonCoreInit {
+            paths,
+            loaded_config: loaded,
+            env,
+            cli_overrides: CliOverrides::default(),
+            clock: Arc::new(SystemClock),
+            broker: Arc::new(EventBroker::default()),
+            shutdown_rx: shutdown_rx.clone(),
+            persistence,
+            initial_calibration,
+            action_executor: Arc::new(FakeActionExecutor::new()),
+            notifier: Arc::new(FakeNotifier::new()),
+            idle_probe: Arc::new(FakeIdleProbe::default()),
+            enrollment_driver: Arc::new(NoopEnrollmentDriver),
+            wearable_source: Arc::new(NullWearableSource),
+            engine_ctrl_tx: ctrl_tx,
+        }));
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let handle_task = tokio::spawn(handle_connection(
+            server_stream,
+            Arc::clone(&core),
+            shutdown_rx,
+        ));
+
+        let (client_read, mut client_write) = client_stream.into_split();
+        let mut client_buf = BufReader::new(client_read);
+        client_write
+            .write_all(b"{\"id\":1,\"v\":1,\"op\":\"daemon.subscribe\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut ack = String::new();
+        client_buf.read_line(&mut ack).await.unwrap();
+        assert!(
+            ack.contains("\"ok\":true"),
+            "unexpected subscribe ack: {ack}"
+        );
+
+        // Fill subscriber queue and kernel socket send buffer without reading from client_buf.
+        let payload = json!({ "padding": "x".repeat(4096) });
+        for _ in 0..512 {
+            core.broker.publish_control("AlertChanged", payload.clone());
+        }
+        tokio::task::yield_now().await;
+
+        shutdown_tx.send(true).unwrap();
+        handle_task.await.unwrap();
+
+        drop(client_buf);
+        drop(client_write);
+        drop(core);
+        worker.shutdown_async().await;
     }
 }

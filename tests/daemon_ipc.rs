@@ -865,26 +865,14 @@ async fn test_all_nighter_monitoring_expires_at_window_end_with_active_hours_exp
         .unwrap()
         .to_string();
 
-    // Stream 500 seconds (~33 clean epochs) of calm wake HR (~75 bpm) to transition Warmup -> Monitoring
-    common::daemon::send_synthetic_wave_stream(
+    // Stream 500 seconds (~33 clean epochs) of calm wake HR to transition Warmup -> Monitoring
+    common::daemon::complete_warmup_and_wait(
         &wearable_tx,
         &desc,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: start_utc.timestamp_millis() + 1000,
-            count_sec: 500,
-            base_bpm: 75.0,
-            bpm_amplitude: 2.6,
-            contact: bpmute::sleep_engine::ContactStatus::Contact,
-        },
+        &mut client,
+        start_utc.timestamp_millis() + 1000,
     )
     .await;
-
-    let state_mon = client
-        .next_matching_event("StateChanged", 600)
-        .await
-        .unwrap()
-        .expect("StateChanged to Monitoring");
-    assert_eq!(state_mon.data["monitoring_state"], "Monitoring");
 
     // Advance 9 hours from 23:00 to 08:00:01 (exiting Active Hours!)
     let exit_secs = 9 * 3600 + 1;
@@ -1455,26 +1443,8 @@ async fn drive_daemon_to_sleeping(
         .unwrap()
         .to_string();
 
-    common::daemon::send_synthetic_wave_stream(
-        wearable_tx,
-        desc,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: start_ts_ms + 1000,
-            count_sec: 500,
-            base_bpm: 68.0,
-            bpm_amplitude: 2.6,
-            contact: bpmute::sleep_engine::ContactStatus::Contact,
-        },
-    )
-    .await;
+    common::daemon::complete_warmup_and_wait(wearable_tx, desc, client, start_ts_ms + 1000).await;
     tokio::time::advance(Duration::from_secs(500)).await;
-
-    let state_mon = client
-        .next_matching_event("StateChanged", 600)
-        .await
-        .unwrap()
-        .expect("StateChanged to Monitoring");
-    assert_eq!(state_mon.data["monitoring_state"], "Monitoring");
 
     common::daemon::send_sleep_descent_stream(
         wearable_tx,

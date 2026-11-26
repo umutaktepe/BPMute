@@ -114,33 +114,6 @@ impl TestHarness {
     }
 }
 
-async fn complete_warmup_stream(
-    feed_tx: &mpsc::Sender<WearableEvent>,
-    wearable: &WearableDescriptor,
-    sub_client: &mut IpcClient,
-    start_ts_ms: i64,
-) -> i64 {
-    common::daemon::send_synthetic_wave_stream(
-        feed_tx,
-        wearable,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms,
-            count_sec: 500,
-            base_bpm: 68.0,
-            bpm_amplitude: 2.4,
-            contact: bpmute::sleep_engine::ContactStatus::Contact,
-        },
-    )
-    .await;
-    loop {
-        let ev = sub_client.next_event().await.unwrap();
-        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
-            break;
-        }
-    }
-    start_ts_ms + 500_000
-}
-
 #[tokio::test]
 async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() {
     let start_utc = Utc.with_ymd_and_hms(2026, 11, 19, 23, 0, 0).unwrap();
@@ -261,7 +234,8 @@ async fn virtual_time_wearable_source_stream_monitoring_and_session_recording() 
 
     // 5. Complete Warmup into Monitoring, then feed Disconnected and close the stream source
     let t_after_warmup =
-        complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 6000).await;
+        common::daemon::complete_warmup_and_wait(&feed_tx, &wearable, &mut sub_client, t0 + 6000)
+            .await;
     feed_tx
         .send(WearableEvent::StreamState {
             wearable: wearable.clone(),
@@ -346,7 +320,9 @@ async fn virtual_time_sustained_disconnection_gap_timeout_closes_session() {
     assert_eq!(sessions[0]["status"].as_str(), Some("active"));
 
     // Complete Warmup into Monitoring before disconnecting
-    let t_mon = complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 2000).await;
+    let t_mon =
+        common::daemon::complete_warmup_and_wait(&feed_tx, &wearable, &mut sub_client, t0 + 2000)
+            .await;
     tokio::time::advance(std::time::Duration::from_secs(502)).await;
 
     // Disconnect at t_mon + 1000 ms. Do NOT drop feed_tx!
@@ -449,7 +425,9 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     };
 
     // Complete Warmup into Monitoring so session 1 persists on GapExceeded.
-    let w1_end = complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 2_000).await;
+    let w1_end =
+        common::daemon::complete_warmup_and_wait(&feed_tx, &wearable, &mut sub_client, t0 + 2_000)
+            .await;
     tokio::time::advance(Duration::from_secs(501)).await;
 
     // 2. Explicit Remote disconnect at w1_end -> deadline = w1_end + 120_001 via StateChanged, daemon.status, and Snapshot.
@@ -617,7 +595,13 @@ async fn virtual_time_tiered_disconnect_deadlines_tightening_and_status_hydratio
     };
     assert_ne!(session_2_id, session_1_id);
 
-    let w2_end = complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t_s2 + 1_000).await;
+    let w2_end = common::daemon::complete_warmup_and_wait(
+        &feed_tx,
+        &wearable,
+        &mut sub_client,
+        t_s2 + 1_000,
+    )
+    .await;
     tokio::time::advance(Duration::from_secs(501)).await;
     feed_tx
         .send(WearableEvent::StreamDisconnected {
@@ -755,7 +739,8 @@ async fn virtual_time_gap_gated_manual_session_closure_and_rejections() {
 
     // Complete Warmup into Monitoring before disconnecting
     let t_after_warmup =
-        complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 20_000).await;
+        common::daemon::complete_warmup_and_wait(&feed_tx, &wearable, &mut sub_client, t0 + 20_000)
+            .await;
 
     // Feed a few trailing raw packets that do not form a complete 15-s epoch
     let t_trailing = t_after_warmup;
@@ -914,7 +899,8 @@ async fn virtual_time_manual_session_closure_aborts_active_grace_without_penalty
 
     // Complete Warmup into Monitoring before triggering grace / manual closure
     let t_after_warmup =
-        complete_warmup_stream(&feed_tx, &wearable, &mut sub_client, t0 + 10_000).await;
+        common::daemon::complete_warmup_and_wait(&feed_tx, &wearable, &mut sub_client, t0 + 10_000)
+            .await;
 
     // 2. Start Grace Period via test trigger
     let trig_res = client

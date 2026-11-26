@@ -14,7 +14,13 @@ for arg in "$@"; do
   build_args+=("$arg")
 done
 
-# Pre-compile before arming the 30 s hang-detection timeout so build time never triggers false 124s.
+timeout_sec="${BPMUTE_TEST_TIMEOUT:-30}"
+if ! [[ "$timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: BPMUTE_TEST_TIMEOUT must be a positive integer (got: '$timeout_sec')" >&2
+  exit 2
+fi
+
+# Pre-compile before arming the hang-detection timeout so build time never triggers false 124s.
 cargo test --no-run "${build_args[@]}"
 
-exec timeout 30 cargo test "$@"
+exec timeout "$timeout_sec" cargo test "$@"

@@ -4187,13 +4187,7 @@ async fn test_real_socket_tui_bridge_session_close_countdown_and_end_session_flo
     common::daemon::send_synthetic_wave_stream(
         &w_tx,
         &desc,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: t_resume + 1_000,
-            count_sec: 500,
-            base_bpm: 66.0,
-            bpm_amplitude: 2.2,
-            contact: ContactStatus::Contact,
-        },
+        common::daemon::SyntheticStreamParams::warmup(t_resume + 1_000),
     )
     .await;
     wait_for_app_state_with_budget(&mut app2, &mut event_rx2, Some(&cmd_tx2), 2000, |a| {
@@ -4647,13 +4641,7 @@ async fn test_real_socket_tui_bridge_post_sleep_standby_session_ended_e2e() {
     common::daemon::send_synthetic_wave_stream(
         &w_tx,
         &desc,
-        common::daemon::SyntheticStreamParams {
-            start_ts_ms: t0 + 1000,
-            count_sec: 500,
-            base_bpm: 68.0,
-            bpm_amplitude: 2.6,
-            contact: ContactStatus::Contact,
-        },
+        common::daemon::SyntheticStreamParams::warmup(t0 + 1000),
     )
     .await;
     tokio::time::advance(std::time::Duration::from_secs(500)).await;

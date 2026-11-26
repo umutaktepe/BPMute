@@ -411,6 +411,8 @@ impl MonitoringContext {
                             self.epoch_seq = 0;
                             self.raw_seq = 0;
                             self.pending_raw.clear();
+                            // Sync DaemonCore before publishing SessionStarted so follow-up status queries
+                            // (and ordered IPC consumers expecting StateChanged(Warmup) first) see Warmup.
                             self.core.sync_detector_and_deadline(
                                 self.engine.state(),
                                 self.active_session_id.clone(),

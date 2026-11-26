@@ -107,10 +107,52 @@ if ! grep -REq 'parse_hr_measurement\(' src/bluetooth; then
   exit 1
 fi
 
-if ! grep -REq '"WearablesUpdated"' src/daemon/state || ! grep -REq '"WearablesUpdated"' src/tui; then
-  echo "error: WearablesUpdated IPC control event must stay wired between daemon and TUI" >&2
-  exit 1
-fi
+python3 - <<'PY'
+import glob, re, sys
+
+daemon_events = set()
+for path in sorted(glob.glob("src/daemon/**/*.rs", recursive=True)):
+    stripped = "\n".join(
+        l.split("//", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()
+    )
+    for m in re.finditer(r'\bpublish_(?:control|stream)\(\s*"([^"]+)"', stripped):
+        daemon_events.add(m.group(1))
+
+tui_client = "\n".join(
+    l.split("//", 1)[0] for l in open("src/tui/client.rs", encoding="utf-8").read().splitlines()
+)
+tui_events = set(re.findall(r'^\s*"([A-Z][A-Za-z0-9]+)"\s*=>', tui_client, flags=re.M))
+allowlist = set()
+missing_tui = sorted(daemon_events - tui_events - allowlist)
+if missing_tui:
+    sys.exit(
+        f"error: daemon push event(s) {missing_tui} missing match arm in src/tui/client.rs"
+    )
+
+ipc_mod = "\n".join(
+    l.split("//", 1)[0] for l in open("src/ipc/mod.rs", encoding="utf-8").read().splitlines()
+)
+other_ipc_consumers = {}
+for path in sorted(glob.glob("src/**/*.rs", recursive=True) + glob.glob("tests/**/*.rs", recursive=True)):
+    if path.startswith("src/ipc/"):
+        continue
+    other_ipc_consumers[path] = open(path, encoding="utf-8").read()
+
+for m in re.finditer(r'(?m)^pub use\s+([^;]+);', ipc_mod):
+    stmt = m.group(1)
+    inner = stmt.split("{", 1)[1].rsplit("}", 1)[0] if "{" in stmt else stmt.rsplit("::", 1)[-1]
+    syms = [s.strip().split(" as ")[-1] for s in inner.split(",") if s.strip()]
+    for sym in syms:
+        if sym.endswith("Params") or sym.endswith("Response"):
+            sys.exit(
+                f"error: request/response DTO {sym} must stay in src/ipc/protocol.rs rather than re-exporting from src/ipc/mod.rs (CODING_STANDARDS.md)"
+            )
+        pat = re.compile(rf'(?:crate|bpmute)::ipc::(?:[^{{;]*\{{[^}}]*\b{re.escape(sym)}\b|\b{re.escape(sym)}\b)')
+        if not any(pat.search(txt) for txt in other_ipc_consumers.values()):
+            sys.exit(
+                f"error: unused crate-root re-export {sym} in src/ipc/mod.rs; remove or import via ipc::protocol (CODING_STANDARDS.md)"
+            )
+PY
 
 python3 - <<'PY'
 import glob, re, sys

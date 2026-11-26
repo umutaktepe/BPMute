@@ -6,6 +6,7 @@
 use tokio::sync::{mpsc, watch};
 
 use bpmute::daemon::{WearableEvent, WearableSource};
+use bpmute::ipc::IpcClient;
 use bpmute::sleep_engine::{ContactStatus, EngineEvent, HrPacket};
 use bpmute::storage::WearableDescriptor;
 
@@ -46,6 +47,19 @@ pub struct SyntheticStreamParams {
     pub contact: ContactStatus,
 }
 
+impl SyntheticStreamParams {
+    /// Preset synthetic 1 Hz wake stream that completes cold-start `Warmup` (~500s / 33 epochs).
+    pub fn warmup(start_ts_ms: i64) -> Self {
+        Self {
+            start_ts_ms,
+            count_sec: 500,
+            base_bpm: 68.0,
+            bpm_amplitude: 2.4,
+            contact: ContactStatus::Contact,
+        }
+    }
+}
+
 impl Default for SyntheticStreamParams {
     fn default() -> Self {
         Self {
@@ -56,6 +70,30 @@ impl Default for SyntheticStreamParams {
             contact: ContactStatus::Contact,
         }
     }
+}
+
+/// Streams ~500s of synthetic wake HR and waits for `StateChanged` -> `Monitoring`.
+///
+/// Returns the next second timestamp (`start_ts_ms + 500_000`) for chained stream segments.
+pub async fn complete_warmup_and_wait(
+    wearable_tx: &mpsc::Sender<WearableEvent>,
+    desc: &WearableDescriptor,
+    sub_client: &mut IpcClient,
+    start_ts_ms: i64,
+) -> i64 {
+    send_synthetic_wave_stream(
+        wearable_tx,
+        desc,
+        SyntheticStreamParams::warmup(start_ts_ms),
+    )
+    .await;
+    loop {
+        let ev = sub_client.next_event().await.unwrap();
+        if ev.event == "StateChanged" && ev.data["monitoring_state"] == "Monitoring" {
+            break;
+        }
+    }
+    start_ts_ms + 500_000
 }
 
 /// Streams synthetic heart-rate packets at 1 Hz with biological wave variation.
