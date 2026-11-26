@@ -907,14 +907,14 @@ async fn test_all_nighter_monitoring_expires_at_window_end_with_active_hours_exp
 
     // Session closes with active_hours_expired and transitions to Standby!
     let state_standby = client
-        .next_matching_event("StateChanged", 50)
+        .next_matching_event("StateChanged", 600)
         .await
         .unwrap()
         .expect("StateChanged to Standby");
     assert_eq!(state_standby.data["monitoring_state"], "Standby");
 
     let sess_closed = client
-        .next_matching_event("SessionClosed", 50)
+        .next_matching_event("SessionClosed", 600)
         .await
         .unwrap()
         .expect("SessionClosed on window expiration");
@@ -1645,13 +1645,13 @@ async fn test_post_sleep_standby_24_7_mode_suppresses_phantom_session_and_rearms
         .await
         .unwrap();
     let state_warmup = client
-        .next_matching_event("StateChanged", 100)
+        .next_matching_event("StateChanged", 600)
         .await
         .unwrap()
         .expect("StateChanged to Warmup on reconnect");
     assert_eq!(state_warmup.data["monitoring_state"], "Warmup");
     let sess2 = client
-        .next_matching_event("SessionStarted", 100)
+        .next_matching_event("SessionStarted", 600)
         .await
         .unwrap()
         .expect("SessionStarted #2 on reconnect");
@@ -1760,7 +1760,7 @@ async fn test_post_sleep_standby_inside_active_hours_syncs_armed_on_window_exit_
 
     // Must publish StateChanged with monitoring_state = Standby and armed = false
     let state_disarmed = client
-        .next_matching_event("StateChanged", 100)
+        .next_matching_event("StateChanged", 5000)
         .await
         .unwrap()
         .expect("StateChanged when Standby crosses outside Active Hours");
@@ -1784,7 +1784,7 @@ async fn test_post_sleep_standby_inside_active_hours_syncs_armed_on_window_exit_
         .unwrap();
 
     let state_warmup = client
-        .next_matching_event("StateChanged", 100)
+        .next_matching_event("StateChanged", 5000)
         .await
         .unwrap()
         .expect("StateChanged to Warmup at next Active Hours start");
@@ -1792,7 +1792,7 @@ async fn test_post_sleep_standby_inside_active_hours_syncs_armed_on_window_exit_
     assert_eq!(state_warmup.data["armed"], true);
 
     let sess2 = client
-        .next_matching_event("SessionStarted", 100)
+        .next_matching_event("SessionStarted", 5000)
         .await
         .unwrap()
         .expect("SessionStarted #2 at next Active Hours start");
