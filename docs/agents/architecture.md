@@ -22,7 +22,7 @@ TuiApp (src/tui/app.rs)
 
 ## TUI Submodule Layout
 
-- **`src/tui/views/`**: Tab and chrome rendering (`dashboard.rs`, `history.rs`, `wearables.rs`, `settings.rs`, `footer.rs`, `history_modals.rs`, `wearables_modals.rs`).
+- **`src/tui/views/`**: Tab and chrome rendering (`dashboard.rs`, `history.rs`, `history_chart.rs`, `history_modals.rs`, `wearables.rs`, `settings.rs`, `footer.rs`, `wearables_modals.rs`).
 - **`src/tui/input/`**: Keyboard and mouse event routers (`mod.rs`, `mouse.rs`).
 - **`src/tui/app_ipc.rs`**: Incoming daemon IPC event handling and `TuiApp` state synchronization.
 - **`src/tui/client_commands.rs`**: Outgoing `TuiCommand` translation into socket RPC requests.

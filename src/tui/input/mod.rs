@@ -358,7 +358,7 @@ impl TuiApp {
                 .and_then(|ts| {
                     chrono::Local
                         .timestamp_millis_opt(ts)
-                        .single()
+                        .earliest()
                         .map(|dt| dt.format("%H:%M").to_string())
                 })
                 .unwrap_or_default();

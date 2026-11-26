@@ -194,6 +194,15 @@ if re.search(r'\bwrite_ndjson_line\(', ipc_server):
         "error: unbounded write_ndjson_line(...) forbidden in src/ipc/server.rs; use write_bounded_ndjson_line(..., MAX_FRAME_BYTES)"
     )
 
+for path in sorted(glob.glob("src/**/*.rs", recursive=True)):
+    stripped = "\n".join(
+        l.split("//", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()
+    )
+    if re.search(r'\.timestamp_millis_opt\([^)]*\)\s*\.single\s*\(', stripped, flags=re.S):
+        sys.exit(
+            f"error: .timestamp_millis_opt(...).single() forbidden in {path}; use .earliest() or match LocalResult so DST fall-back hours never drop timestamps"
+        )
+
 for path in sorted(glob.glob("src/daemon/**/*.rs", recursive=True)):
     stripped = "\n".join(
         l.split("//", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()

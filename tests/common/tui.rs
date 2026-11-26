@@ -682,6 +682,34 @@ pub fn render_dashboard_braille_cols(
     (cols, start_col, chart_right, buffer_to_string(buf))
 }
 
+/// Resolves the horizontal plot column bounds and vertical plot row bounds for a rendered History Epoch chart.
+pub fn history_chart_plot_bounds(
+    buf: &Buffer,
+    top_bpm_label: &str,
+    bot_bpm_label: &str,
+) -> (u16, u16, u16, u16) {
+    let (top_bpm_x, top_row) = find_text_coords(buf, top_bpm_label).unwrap();
+    let (_, bot_row) = find_text_coords(buf, bot_bpm_label).unwrap();
+    let (p100_x, _) = find_text_coords(buf, "100%").unwrap();
+    let chart_left = top_bpm_x + 6;
+    let chart_right = p100_x - 2;
+    (chart_left, chart_right, top_row, bot_row)
+}
+
+/// Returns all column x-coordinates in `[chart_left, chart_right]` whose full plot height carries `Modifier::REVERSED`.
+pub fn reversed_chart_cols(
+    buf: &Buffer,
+    chart_left: u16,
+    chart_right: u16,
+    top_row: u16,
+    bot_row: u16,
+) -> Vec<u16> {
+    use ratatui::style::Modifier;
+    (chart_left..=chart_right)
+        .filter(|&x| (top_row..=bot_row).all(|y| buf[(x, y)].modifier.contains(Modifier::REVERSED)))
+        .collect()
+}
+
 /// Canonical TUI test viewport dimensions: standard 80x24 baseline and compact 60x18 boundary.
 pub const CANONICAL_VIEWPORTS: [(u16, u16); 2] = [(80, 24), (60, 18)];
 
