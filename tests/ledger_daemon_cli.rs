@@ -1720,7 +1720,6 @@ async fn cli_sessions_feedback_single_field_clear_online_offline_and_conflicts()
         .single()
         .unwrap();
     let start_ts = start_local.timestamp_millis();
-    let end_ts = start_ts + 40 * 15_000;
 
     let sid = {
         let db_file = db_path_in_data_dir(&paths.data_dir);
@@ -1739,34 +1738,7 @@ async fn cli_sessions_feedback_single_field_clear_online_offline_and_conflicts()
                 start_ts - 10_000,
             )
             .unwrap();
-        let sid = store
-            .open_session(&OpenSessionRequest {
-                wearable_id: wid,
-                start_ts_ms: start_ts,
-                detection_sensitivity: Sensitivity::Balanced,
-            })
-            .unwrap();
-        for seq in 0..40u32 {
-            let ts_ms = start_ts + i64::from(seq + 1) * 15_000;
-            let ep = sample_epoch(ts_ms, 56.0, 0.4, DetectorState::Monitoring);
-            store
-                .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
-                .unwrap();
-        }
-        let mut summary = common::make_session_summary(1, start_ts, end_ts, true);
-        summary.epochs_count = 40;
-        store
-            .close_session_and_recompute(
-                &CloseSessionRequest {
-                    session_id: sid.clone(),
-                    summary,
-                    trigger_power_action: PowerAction::None,
-                    rapid_resume_within_5m: false,
-                },
-                end_ts,
-            )
-            .unwrap();
-        sid
+        common::storage::seed_closed_session_with_epochs(&mut store, &wid, 1, start_ts, 40, 56.0)
     };
 
     // 1. Conflicting flags must fail clap validation

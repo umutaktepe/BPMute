@@ -492,7 +492,10 @@ impl RealSocketTuiHarness {
                         .collect();
                     let raw_refs: Vec<(u32, &HrPacket)> =
                         raw.iter().map(|(seq, pkt)| (*seq, pkt)).collect();
-                    store.append_epoch_and_raw(&sid, None, &raw_refs).unwrap();
+                    let ep = make_test_epoch((i + 1) as u64, start_ts + 15_000, 62.0, 0.2, 64.0);
+                    store
+                        .append_epoch_and_raw(&sid, Some((0, &ep)), &raw_refs)
+                        .unwrap();
                 }
                 store
                     .close_session_and_recompute(

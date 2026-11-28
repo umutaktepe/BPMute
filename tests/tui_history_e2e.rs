@@ -10,7 +10,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 use bpmute::calibration::{
     BoundaryReason, CalibrationBoundaryRecord, FeedbackVerdict, SessionFeedbackRecord,
@@ -27,7 +27,7 @@ use bpmute::sleep_engine::{
     StreamStatus,
 };
 use bpmute::storage::{SessionFullDetail, SessionStatus, WearableInfo};
-use bpmute::tui::{IpcEvent, ModalState, Tab, TuiApp, TuiCommand, TuiEvent, TuiIpcBridge};
+use bpmute::tui::{IpcEvent, ModalState, Tab, TuiApp, TuiCommand, TuiEvent};
 
 #[test]
 fn test_history_tab_master_detail_chart_and_boundary_dividers() {
@@ -1208,8 +1208,7 @@ async fn test_real_socket_history_feedback_and_unenroll_delete_sessions_e2e() {
 #[tokio::test(start_paused = true)]
 async fn test_real_socket_history_feedback_clears_verdict_while_preserving_onset_and_hr() {
     use bpmute::storage::{
-        CloseSessionRequest, LedgerStore, OpenSessionRequest, SetFeedbackRequest,
-        db_path_in_data_dir, lock_path_in_data_dir,
+        LedgerStore, SetFeedbackRequest, db_path_in_data_dir, lock_path_in_data_dir,
     };
 
     let temp = TempDir::new().unwrap();
@@ -1219,10 +1218,7 @@ async fn test_real_socket_history_feedback_clears_verdict_while_preserving_onset
         .single()
         .unwrap();
     let start_ts = start_dt.timestamp_millis();
-    let epoch_count = 40u32; // 10 minutes
-    let end_ts = start_ts + i64::from(epoch_count) * 15_000;
     let pruned_start = start_ts - 7_200_000;
-    let pruned_end = pruned_start + 600_000;
 
     let (sid, pruned_sid) = {
         let db_file = db_path_in_data_dir(&paths.data_dir);
@@ -1243,25 +1239,14 @@ async fn test_real_socket_history_feedback_clears_verdict_while_preserving_onset
             .unwrap();
 
         // Older session with pruned epochs (epochs_count == 0) but existing manual onset
-        let pruned_sid = store
-            .open_session(&OpenSessionRequest {
-                wearable_id: wid.clone(),
-                start_ts_ms: pruned_start,
-                detection_sensitivity: Sensitivity::Balanced,
-            })
-            .unwrap();
-        let pruned_summary = make_session_summary(1, pruned_start, pruned_end, false);
-        store
-            .close_session_and_recompute(
-                &CloseSessionRequest {
-                    session_id: pruned_sid.clone(),
-                    summary: pruned_summary,
-                    trigger_power_action: PowerAction::None,
-                    rapid_resume_within_5m: false,
-                },
-                pruned_end,
-            )
-            .unwrap();
+        let pruned_sid = common::storage::seed_closed_session_with_epochs(
+            &mut store,
+            &wid,
+            1,
+            pruned_start,
+            0,
+            56.0,
+        );
         store
             .set_feedback_and_recompute(
                 &SetFeedbackRequest {
@@ -1271,38 +1256,14 @@ async fn test_real_socket_history_feedback_clears_verdict_while_preserving_onset
                     avg_sleep_hr: PatchField::Set(52.0),
                     clear_all: false,
                 },
-                pruned_end + 1_000,
+                pruned_start + 601_000,
             )
             .unwrap();
 
         // Newer session with retained epochs
-        let sid = store
-            .open_session(&OpenSessionRequest {
-                wearable_id: wid,
-                start_ts_ms: start_ts,
-                detection_sensitivity: Sensitivity::Balanced,
-            })
-            .unwrap();
-        for seq in 0..epoch_count {
-            let ts_ms = start_ts + i64::from(seq + 1) * 15_000;
-            let ep = make_test_epoch(1, ts_ms, 56.0, 0.4, 65.0);
-            store
-                .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
-                .unwrap();
-        }
-        let mut summary = make_session_summary(2, start_ts, end_ts, true);
-        summary.epochs_count = epoch_count as usize;
-        store
-            .close_session_and_recompute(
-                &CloseSessionRequest {
-                    session_id: sid.clone(),
-                    summary,
-                    trigger_power_action: PowerAction::None,
-                    rapid_resume_within_5m: false,
-                },
-                end_ts,
-            )
-            .unwrap();
+        let sid = common::storage::seed_closed_session_with_epochs(
+            &mut store, &wid, 2, start_ts, 40, 56.0,
+        );
         (sid, pruned_sid)
     };
 
@@ -1926,13 +1887,8 @@ async fn test_real_socket_history_live_session_started_and_closed_e2e() {
         .await
         .unwrap();
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
     wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
         a.daemon_connected && !a.enrolled_wearables.is_empty()
     })
@@ -2086,13 +2042,8 @@ async fn test_real_socket_history_live_15s_epoch_updates_advance_session_and_cha
         .await
         .unwrap();
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
     wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
         a.daemon_connected && !a.enrolled_wearables.is_empty()
     })

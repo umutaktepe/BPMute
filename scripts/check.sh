@@ -87,6 +87,11 @@ if grep -En 'Command::new\("dbus-daemon"\)' tests/*.rs; then
   exit 1
 fi
 
+if grep -En 'TuiIpcBridge::new\(' tests/*.rs; then
+  echo "error: raw TuiIpcBridge::new(...) forbidden in tests/*.rs; reuse tests/common/tui.rs::spawn_tui_bridge_session* (docs/agents/testing.md)" >&2
+  exit 1
+fi
+
 if grep -En 'let[[:space:]]+_[[:space:]]*=[[:space:]]*(adapter|device|mgr|proxy)\.' src/bluetooth/*.rs; then
   echo "error: silent let _ = on BlueZ D-Bus proxy calls is forbidden in src/bluetooth/; log or propagate errors" >&2
   exit 1
@@ -165,6 +170,20 @@ for idx, line in enumerate(proto_lines):
             sys.exit(
                 f"error: #[serde(deny_unknown_fields)] type at src/ipc/protocol.rs:{idx + 1} must also derive Serialize"
             )
+
+for path, require_default in (("src/ipc/protocol.rs", True), ("src/config/patch.rs", False)):
+    lines = open(path, encoding="utf-8").read().splitlines()
+    for idx, line in enumerate(lines):
+        if re.search(r'^\s*pub\s+[a-z0-9_]+\s*:\s*PatchField<', line):
+            attrs = "\n".join(lines[max(0, idx - 4) : idx])
+            if 'skip_serializing_if = "PatchField::is_unchanged"' not in attrs:
+                sys.exit(
+                    f"error: PatchField field at {path}:{idx + 1} must carry skip_serializing_if = \"PatchField::is_unchanged\" (docs/agents/testing.md)"
+                )
+            if require_default and not re.search(r'#\[serde\([^)]*\bdefault\b', attrs):
+                sys.exit(
+                    f"error: PatchField field at {path}:{idx + 1} must carry #[serde(default, ...)] so omitted keys deserialize as Unchanged"
+                )
 
 files = sorted(set(glob.glob("src/tui/**/*.rs", recursive=True) + glob.glob("src/cli/commands/*.rs")))
 for path in files:

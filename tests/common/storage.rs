@@ -166,3 +166,44 @@ pub fn seed_wearable_and_closed_session(
         .unwrap();
     (wid, sid)
 }
+
+/// Seeds a closed `Monitoring Session` with `epoch_count` synthetic 15 s `Epochs` on an existing Wearable.
+pub fn seed_closed_session_with_epochs(
+    store: &mut LedgerStore,
+    wearable_id: &str,
+    session_index: u64,
+    start_ts_ms: i64,
+    epoch_count: u32,
+    hr_bpm: f64,
+) -> String {
+    let end_ts_ms = start_ts_ms + i64::from(epoch_count.max(40)) * 15_000;
+    let sid = store
+        .open_session(&OpenSessionRequest {
+            wearable_id: wearable_id.to_string(),
+            start_ts_ms,
+            detection_sensitivity: Sensitivity::Balanced,
+        })
+        .unwrap();
+    for seq in 0..epoch_count {
+        let ts_ms = start_ts_ms + i64::from(seq + 1) * 15_000;
+        let ep = sample_epoch(ts_ms, hr_bpm, 0.4, DetectorState::Monitoring);
+        store
+            .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
+            .unwrap();
+    }
+    let mut summary =
+        super::make_session_summary(session_index, start_ts_ms, end_ts_ms, epoch_count > 0);
+    summary.epochs_count = epoch_count as usize;
+    store
+        .close_session_and_recompute(
+            &CloseSessionRequest {
+                session_id: sid.clone(),
+                summary,
+                trigger_power_action: PowerAction::None,
+                rapid_resume_within_5m: false,
+            },
+            end_ts_ms,
+        )
+        .unwrap();
+    sid
+}

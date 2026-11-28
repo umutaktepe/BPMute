@@ -959,16 +959,8 @@ async fn connect_tui_app_to_daemon(
     tokio::sync::watch::Sender<bool>,
     tokio::task::JoinHandle<()>,
 ) {
-    use bpmute::tui::{TuiApp, TuiIpcBridge};
-    use tokio::sync::{mpsc, watch};
-
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(socket_path, event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        common::tui::spawn_tui_bridge_session_with_cmds(&socket_path);
     tokio::time::timeout(Duration::from_secs(3), async {
         while !app.daemon_connected {
             if let Some(ev) = event_rx.recv().await {

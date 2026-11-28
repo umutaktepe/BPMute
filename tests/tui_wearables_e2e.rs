@@ -9,7 +9,7 @@ use crossterm::event::KeyCode;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use bpmute::actions::traits::BoxFuture;
 use bpmute::bluetooth::agent::AgentAuthRequest;
@@ -24,8 +24,8 @@ use bpmute::ipc::protocol::{
 use bpmute::paths::MapEnv;
 use bpmute::sleep_engine::{ContactStatus, HrPacket, StreamState, StreamStatus};
 use bpmute::tui::{
-    ModalState, PairingPromptModalState, Tab, TuiApp, TuiCommand, TuiEvent, TuiIpcBridge,
-    UnenrollButton, detect_systemd_service_installed,
+    ModalState, PairingPromptModalState, Tab, TuiApp, TuiCommand, TuiEvent, UnenrollButton,
+    detect_systemd_service_installed,
 };
 
 #[test]
@@ -229,13 +229,8 @@ async fn test_real_socket_agent1_pairing_prompt_during_enroll_select_e2e() {
             uuids: vec![],
         }]);
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
     wait_for_app_state(&mut app, &mut event_rx, |a| a.daemon_connected).await;
 
     // Switch to Wearables tab, press 'e' to start scan
@@ -338,13 +333,8 @@ async fn test_real_socket_wearable_stream_status_and_disconnect_updates_live_tui
         .await
         .unwrap();
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session(&paths.socket_path);
     wait_for_app_state(&mut app, &mut event_rx, |a| {
         a.daemon_connected && !a.enrolled_wearables.is_empty()
     })
@@ -991,13 +981,8 @@ async fn test_real_socket_mouse_enrollment_and_agent1_pairing_e2e() {
             uuids: vec![],
         }]);
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
     wait_for_app_state(&mut app, &mut event_rx, |a| a.daemon_connected).await;
 
     let mut terminal = Terminal::new(TestBackend::new(90, 24)).unwrap();

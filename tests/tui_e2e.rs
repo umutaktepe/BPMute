@@ -13,7 +13,7 @@ use ratatui::buffer::Buffer;
 use ratatui::style::Color;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use bpmute::actions::fake::FakeActionExecutor;
 use bpmute::actions::traits::{ActionExecutor, GracePhase, PowerActionResult};
@@ -36,7 +36,7 @@ use bpmute::sleep_engine::{
 use bpmute::storage::SessionStatus;
 use bpmute::tui::{
     GraceState, IpcEvent, ModalState, PairingPromptModalState, Tab, Theme, TuiApp, TuiCommand,
-    TuiEvent, TuiIpcBridge, UnenrollButton,
+    TuiEvent, UnenrollButton,
 };
 
 #[tokio::test(start_paused = true)]
@@ -763,13 +763,8 @@ async fn test_real_socket_grace_cancel_snooze_calibration_mpris_and_inhibited_al
         .await
         .unwrap();
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
     wait_for_app_state(&mut app, &mut event_rx, |a| {
         a.daemon_connected && a.sparkline_data.sleeping_hr.is_some()
     })
@@ -849,13 +844,8 @@ async fn test_real_socket_daemon_offline_grace_reset_and_restart_reconnect_e2e()
     let temp = TempDir::new().unwrap();
     let (paths, env) = make_test_paths(&temp);
 
-    let (event_tx, mut event_rx) = mpsc::channel(256);
-    let (_cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bridge = TuiIpcBridge::new(paths.socket_path.clone(), event_tx, cmd_rx, shutdown_rx);
-    let bridge_task = tokio::spawn(bridge.run());
-
-    let mut app = TuiApp::new(false, false, false);
+    let (mut app, mut event_rx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session(&paths.socket_path);
     assert!(!app.daemon_connected);
 
     // 1. Spawn daemon #1 while TUI is already running offline
