@@ -1880,10 +1880,9 @@ fn test_mouse_modal_footer_actions_and_orientation_hint_ignores() {
         app.handle_event(mouse_left_click(f_enter_col + 1, f_enter_row)),
         Some(TuiCommand::SessionSetFeedback {
             session_id: "s-1".into(),
-            verdict: Some(FeedbackVerdict::FalsePositive),
-            onset_hhmm: None,
-            avg_sleep_hr: Some(56.0),
-            clear: false,
+            verdict: bpmute::config::PatchField::Set(FeedbackVerdict::FalsePositive),
+            onset_hhmm: bpmute::config::PatchField::Clear,
+            avg_sleep_hr: bpmute::config::PatchField::Set(56.0),
         })
     );
     assert_eq!(app.modal, ModalState::None);

@@ -2117,3 +2117,189 @@ async fn incomplete_warmup_sessions_are_visible_live_and_discarded_on_all_closur
     assert_eq!(store.list_sessions(10, 0).unwrap().total_count, 2);
     assert_eq!(store.get_calibration_state().unwrap(), baseline_cal);
 }
+
+#[tokio::test(start_paused = true)]
+async fn session_set_feedback_field_level_clear_preserves_other_fields_and_recomputes_calibration()
+{
+    use bpmute::calibration::{CalibrationState, FeedbackVerdict};
+    use bpmute::config::{PowerAction, Sensitivity};
+    use bpmute::storage::{
+        CloseSessionRequest, LedgerStore, OpenSessionRequest, SessionFullDetail,
+        db_path_in_data_dir, lock_path_in_data_dir,
+    };
+    use chrono::TimeZone;
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let (paths, env) = common::tui::make_test_paths(&temp);
+    let start_local = chrono::Local
+        .with_ymd_and_hms(2026, 11, 24, 23, 0, 0)
+        .single()
+        .unwrap();
+    let start_ts = start_local.timestamp_millis();
+    let epoch_count = 40u32;
+    let end_ts = start_ts + i64::from(epoch_count) * 15_000;
+
+    let sid = {
+        let db_file = db_path_in_data_dir(&paths.data_dir);
+        let db_lock = lock_path_in_data_dir(&paths.data_dir);
+        let mut store = LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &WearableDescriptor {
+                    mac: "AA:BB:CC:DD:EE:99".into(),
+                    address_type: "public".into(),
+                    alias: Some("Band".into()),
+                    advertised_name: None,
+                    supports_rr: true,
+                    supports_contact: true,
+                },
+                start_ts - 10_000,
+            )
+            .unwrap();
+        let sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: start_ts,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        for seq in 0..epoch_count {
+            let ts_ms = start_ts + i64::from(seq + 1) * 15_000;
+            let ep = common::tui::make_test_epoch(1, ts_ms, 56.0, 0.4, 65.0);
+            store
+                .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
+                .unwrap();
+        }
+        let mut summary = common::make_session_summary(1, start_ts, end_ts, true);
+        summary.epochs_count = epoch_count as usize;
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                end_ts,
+            )
+            .unwrap();
+        sid
+    };
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = std::sync::Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        std::sync::Arc::new(env),
+        clock,
+    ))
+    .await
+    .unwrap();
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+
+    // 1. Set verdict + onset + avg_sleep_hr
+    let set_resp: SessionFullDetail = serde_json::from_value(
+        client
+            .request(
+                "session.set_feedback",
+                json!({
+                    "session_id": sid,
+                    "verdict": "missed_sleep",
+                    "onset_hhmm": "23:05",
+                    "avg_sleep_hr": 53.0
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let fb1 = set_resp.feedback.as_ref().unwrap();
+    assert_eq!(fb1.verdict, Some(FeedbackVerdict::MissedSleep));
+    assert!(fb1.manual_onset_ts_ms.is_some());
+    assert_eq!(fb1.manual_avg_sleep_hr, Some(53.0));
+
+    let cal1: CalibrationState = serde_json::from_value(
+        client
+            .request("calibration.status", json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cal1.dwell_adjust_sec, -15);
+    assert_eq!(cal1.valid_sessions, 1);
+
+    // 2. Clear only `verdict` via JSON null while omitting onset_hhmm and avg_sleep_hr
+    let clear_verdict_resp: SessionFullDetail = serde_json::from_value(
+        client
+            .request(
+                "session.set_feedback",
+                json!({
+                    "session_id": sid,
+                    "verdict": null
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let fb2 = clear_verdict_resp
+        .feedback
+        .as_ref()
+        .expect("feedback row must remain for onset and avg_sleep_hr");
+    assert_eq!(fb2.verdict, None);
+    assert_eq!(fb2.manual_onset_ts_ms, fb1.manual_onset_ts_ms);
+    assert_eq!(fb2.manual_avg_sleep_hr, Some(53.0));
+
+    let cal2: CalibrationState = serde_json::from_value(
+        client
+            .request("calibration.status", json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cal2.dwell_adjust_sec, 0,
+        "clearing MissedSleep must remove its -15s dwell adjustment"
+    );
+    assert!(
+        cal2.tau_p_sleep_offset > cal1.tau_p_sleep_offset,
+        "clearing MissedSleep must remove ETA_MISSED_TAU (-0.010): cal1={}, cal2={}",
+        cal1.tau_p_sleep_offset,
+        cal2.tau_p_sleep_offset
+    );
+    assert_eq!(cal2.valid_sessions, 1);
+    assert!(cal2.mu_sleep.is_some());
+
+    // 3. Clear remaining fields individually -> removes feedback row and resets calibration
+    let clear_rest_resp: SessionFullDetail = serde_json::from_value(
+        client
+            .request(
+                "session.set_feedback",
+                json!({
+                    "session_id": sid,
+                    "onset_hhmm": null,
+                    "avg_sleep_hr": null
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(clear_rest_resp.feedback.is_none());
+
+    let cal3: CalibrationState = serde_json::from_value(
+        client
+            .request("calibration.status", json!({}))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cal3.valid_sessions, 0);
+    assert_eq!(cal3.tau_p_sleep_offset, 0.0);
+    assert_eq!(cal3.mu_sleep, None);
+
+    drop(client);
+    daemon.shutdown().await;
+}

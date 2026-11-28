@@ -197,18 +197,28 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
         SessionsCommand::Feedback {
             id,
             verdict,
+            clear_verdict,
             onset,
+            clear_onset,
             avg_sleep_hr,
+            clear_avg_sleep_hr,
             clear,
         } => {
             if id.trim().is_empty() {
                 let _ = writeln!(stderr, "error: session ID must not be empty");
                 return ExitCode::UsageOrConfigError;
             }
-            if !clear && verdict.is_none() && onset.is_none() && avg_sleep_hr.is_none() {
+            if !clear
+                && !clear_verdict
+                && !clear_onset
+                && !clear_avg_sleep_hr
+                && verdict.is_none()
+                && onset.is_none()
+                && avg_sleep_hr.is_none()
+            {
                 let _ = writeln!(
                     stderr,
-                    "error: specify at least one of --verdict, --onset, --avg-sleep-hr, or --clear"
+                    "error: specify at least one of --verdict, --onset, --avg-sleep-hr, --clear-verdict, --clear-onset, --clear-avg-sleep-hr, or --clear"
                 );
                 return ExitCode::UsageOrConfigError;
             }
@@ -219,25 +229,19 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
                 return ExitCode::UsageOrConfigError;
             }
 
+            let verdict_patch = resolve_feedback_patch(verdict, clear_verdict, clear);
+            let onset_patch = resolve_feedback_patch(onset, clear_onset, clear);
+            let avg_sleep_hr_patch =
+                resolve_feedback_patch(avg_sleep_hr, clear_avg_sleep_hr, clear);
+
             match connect_online_or_offline(paths, stderr).await {
                 Ok(OnlineOrOffline::Online(mut client)) => {
-                    let params = if clear {
-                        SetFeedbackParams {
-                            session_id: id.clone(),
-                            verdict: PatchField::Unchanged,
-                            onset_hhmm: PatchField::Unchanged,
-                            avg_sleep_hr: PatchField::Unchanged,
-                            clear: true,
-                        }
-                    } else {
-                        SetFeedbackParams {
-                            session_id: id.clone(),
-                            verdict: verdict.map_or(PatchField::Unchanged, PatchField::Set),
-                            onset_hhmm: onset.map_or(PatchField::Unchanged, PatchField::Set),
-                            avg_sleep_hr: avg_sleep_hr
-                                .map_or(PatchField::Unchanged, PatchField::Set),
-                            clear: false,
-                        }
+                    let params = SetFeedbackParams {
+                        session_id: id.clone(),
+                        verdict: verdict_patch,
+                        onset_hhmm: onset_patch,
+                        avg_sleep_hr: avg_sleep_hr_patch,
+                        clear,
                     };
                     match ipc_request_params::<_, SessionFullDetail, _>(
                         &mut client,
@@ -271,9 +275,9 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
                     };
                     let req = SetFeedbackRequest {
                         session_id_or_prefix: id,
-                        verdict: verdict.map_or(PatchField::Unchanged, PatchField::Set),
-                        onset_hhmm: onset.map_or(PatchField::Unchanged, PatchField::Set),
-                        avg_sleep_hr: avg_sleep_hr.map_or(PatchField::Unchanged, PatchField::Set),
+                        verdict: verdict_patch,
+                        onset_hhmm: onset_patch,
+                        avg_sleep_hr: avg_sleep_hr_patch,
                         clear_all: clear,
                     };
                     let now_ms = Utc::now().timestamp_millis();
@@ -469,5 +473,15 @@ pub(crate) async fn run_sessions<WOut: Write, WErr: Write>(
             }
             ExitCode::Success
         }
+    }
+}
+
+fn resolve_feedback_patch<T>(set: Option<T>, clear_field: bool, clear_all: bool) -> PatchField<T> {
+    if clear_all {
+        PatchField::Unchanged
+    } else if clear_field {
+        PatchField::Clear
+    } else {
+        set.map_or(PatchField::Unchanged, PatchField::Set)
     }
 }

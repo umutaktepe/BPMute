@@ -215,19 +215,28 @@ pub enum SessionsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Record or clear feedback (`--verdict`, `--onset`, `--avg-sleep-hr`, or `--clear`) on a closed session.
+    /// Record or clear feedback (`--verdict`, `--onset`, `--avg-sleep-hr`, `--clear-*`, or `--clear`) on a closed session.
     Feedback {
         /// Session UUIDv7 or unambiguous ID prefix.
         id: String,
         /// Feedback verdict (`false_positive`, `missed_sleep`, or `anomalous_exclude`).
-        #[arg(long, value_enum, conflicts_with = "clear")]
+        #[arg(long, value_enum, conflicts_with_all = ["clear", "clear_verdict"])]
         verdict: Option<FeedbackVerdict>,
+        /// Clear stored feedback verdict for this session.
+        #[arg(long, conflicts_with_all = ["clear", "verdict"])]
+        clear_verdict: bool,
         /// Wearable-app reported sleep-onset local time (`HH:MM`).
-        #[arg(long, value_name = "HH:MM", conflicts_with = "clear")]
+        #[arg(long, value_name = "HH:MM", conflicts_with_all = ["clear", "clear_onset"])]
         onset: Option<ClockTime>,
+        /// Clear stored manual sleep-onset override for this session.
+        #[arg(long, conflicts_with_all = ["clear", "onset"])]
+        clear_onset: bool,
         /// Wearable-app reported overnight average sleeping HR (`30..=140` bpm).
-        #[arg(long, value_name = "BPM", conflicts_with = "clear")]
+        #[arg(long, value_name = "BPM", conflicts_with_all = ["clear", "clear_avg_sleep_hr"])]
         avg_sleep_hr: Option<f64>,
+        /// Clear stored manual average sleeping HR override for this session.
+        #[arg(long, conflicts_with_all = ["clear", "avg_sleep_hr"])]
+        clear_avg_sleep_hr: bool,
         /// Clear all stored feedback overrides for this session.
         #[arg(long)]
         clear: bool,

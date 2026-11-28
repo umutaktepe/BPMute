@@ -1710,3 +1710,251 @@ async fn legacy_db_without_pre_candidate_columns_migrates_cleanly() {
     assert_eq!(detail.session.pre_candidate_sigma_hr, None);
     assert_eq!(detail.session.pre_candidate_ln_rmssd, None);
 }
+
+#[tokio::test(start_paused = true)]
+async fn cli_sessions_feedback_single_field_clear_online_offline_and_conflicts() {
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = common::tui::make_test_paths(&temp);
+    let start_local = Local
+        .with_ymd_and_hms(2026, 11, 24, 23, 0, 0)
+        .single()
+        .unwrap();
+    let start_ts = start_local.timestamp_millis();
+    let end_ts = start_ts + 40 * 15_000;
+
+    let sid = {
+        let db_file = db_path_in_data_dir(&paths.data_dir);
+        let db_lock = lock_path_in_data_dir(&paths.data_dir);
+        let mut store = LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &WearableDescriptor {
+                    mac: "AA:BB:CC:DD:EE:77".into(),
+                    address_type: "public".into(),
+                    alias: Some("CLI Band".into()),
+                    advertised_name: None,
+                    supports_rr: true,
+                    supports_contact: true,
+                },
+                start_ts - 10_000,
+            )
+            .unwrap();
+        let sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: start_ts,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        for seq in 0..40u32 {
+            let ts_ms = start_ts + i64::from(seq + 1) * 15_000;
+            let ep = sample_epoch(ts_ms, 56.0, 0.4, DetectorState::Monitoring);
+            store
+                .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
+                .unwrap();
+        }
+        let mut summary = common::make_session_summary(1, start_ts, end_ts, true);
+        summary.epochs_count = 40;
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                end_ts,
+            )
+            .unwrap();
+        sid
+    };
+
+    // 1. Conflicting flags must fail clap validation
+    assert!(
+        Cli::try_parse_from([
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--verdict",
+            "missed_sleep",
+            "--clear-verdict"
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--onset",
+            "23:05",
+            "--clear-onset"
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--avg-sleep-hr",
+            "54.5",
+            "--clear-avg-sleep-hr"
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--clear",
+            "--clear-verdict"
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--clear",
+            "--clear-onset"
+        ])
+        .is_err()
+    );
+    assert!(
+        Cli::try_parse_from([
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--clear",
+            "--clear-avg-sleep-hr"
+        ])
+        .is_err()
+    );
+
+    let (code, _, no_flag_err) =
+        run_inproc_cli(&["bpmute", "sessions", "feedback", &sid], &env).await;
+    assert_eq!(code, ExitCode::UsageOrConfigError);
+    assert!(
+        no_flag_err.contains("--clear-verdict"),
+        "expected missing-flag error to mention --clear-verdict, got: {no_flag_err}"
+    );
+
+    // 2. Online CLI: set all 3 fields, then clear verdict and avg_sleep_hr one by one
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env.clone()),
+        clock,
+    ))
+    .await
+    .unwrap();
+
+    let (code, _, err) = run_inproc_cli(
+        &[
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--verdict",
+            "missed_sleep",
+            "--onset",
+            "23:05",
+            "--avg-sleep-hr",
+            "54.5",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, _, err) = run_inproc_cli(
+        &["bpmute", "sessions", "feedback", &sid, "--clear-verdict"],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, show_out, err) =
+        run_inproc_cli(&["bpmute", "sessions", "show", &sid, "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let show_json: Value = serde_json::from_str(&show_out).unwrap();
+    assert_eq!(show_json["feedback"]["verdict"], Value::Null);
+    assert!(show_json["feedback"]["manual_onset_ts_ms"].is_i64());
+    assert_eq!(show_json["feedback"]["manual_avg_sleep_hr"], 54.5);
+
+    let (code, _, err) = run_inproc_cli(
+        &[
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--clear-avg-sleep-hr",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, show_out, err) =
+        run_inproc_cli(&["bpmute", "sessions", "show", &sid, "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let show_json: Value = serde_json::from_str(&show_out).unwrap();
+    assert_eq!(show_json["feedback"]["verdict"], Value::Null);
+    assert!(show_json["feedback"]["manual_onset_ts_ms"].is_i64());
+    assert_eq!(show_json["feedback"]["manual_avg_sleep_hr"], Value::Null);
+
+    // 3. Offline CLI: set verdict while onset exists, clear onset, then clear verdict -> row removed
+    daemon.shutdown().await;
+
+    let (code, _, err) = run_inproc_cli(
+        &[
+            "bpmute",
+            "sessions",
+            "feedback",
+            &sid,
+            "--verdict",
+            "false_positive",
+        ],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, _, err) = run_inproc_cli(
+        &["bpmute", "sessions", "feedback", &sid, "--clear-onset"],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, show_out, err) =
+        run_inproc_cli(&["bpmute", "sessions", "show", &sid, "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let show_json: Value = serde_json::from_str(&show_out).unwrap();
+    assert_eq!(show_json["feedback"]["verdict"], "false_positive");
+    assert_eq!(show_json["feedback"]["manual_onset_ts_ms"], Value::Null);
+
+    let (code, _, err) = run_inproc_cli(
+        &["bpmute", "sessions", "feedback", &sid, "--clear-verdict"],
+        &env,
+    )
+    .await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+
+    let (code, show_out, err) =
+        run_inproc_cli(&["bpmute", "sessions", "show", &sid, "--json"], &env).await;
+    assert_eq!(code, ExitCode::Success, "stderr: {err}");
+    let show_json: Value = serde_json::from_str(&show_out).unwrap();
+    assert_eq!(show_json["feedback"], Value::Null);
+}

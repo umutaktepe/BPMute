@@ -8,7 +8,6 @@ use super::client::{
 };
 use super::event::{IpcEvent, TuiCommand, TuiEvent};
 use crate::calibration::CalibrationState;
-use crate::config::PatchField;
 use crate::ipc::protocol::{
     AlertDismissParams, CalibrationSetBoundaryParams, ConfigSnapshotPayload, DaemonStatus,
     DataHardWipeParams, DiscoveredWearable, EnrollSelectParams, EnrollSelectResponse,
@@ -235,24 +234,13 @@ pub(super) async fn execute_command(
             verdict,
             onset_hhmm,
             avg_sleep_hr,
-            clear,
         } => {
-            let params = if clear {
-                SetFeedbackParams {
-                    session_id: session_id.clone(),
-                    verdict: PatchField::Unchanged,
-                    onset_hhmm: PatchField::Unchanged,
-                    avg_sleep_hr: PatchField::Unchanged,
-                    clear: true,
-                }
-            } else {
-                SetFeedbackParams {
-                    session_id: session_id.clone(),
-                    verdict: verdict.map_or(PatchField::Unchanged, PatchField::Set),
-                    onset_hhmm: onset_hhmm.map_or(PatchField::Unchanged, PatchField::Set),
-                    avg_sleep_hr: avg_sleep_hr.map_or(PatchField::Unchanged, PatchField::Set),
-                    clear: false,
-                }
+            let params = SetFeedbackParams {
+                session_id: session_id.clone(),
+                verdict,
+                onset_hhmm,
+                avg_sleep_hr,
+                clear: false,
             };
             let resp = send_typed_op_request(
                 req_tx,

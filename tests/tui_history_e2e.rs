@@ -16,7 +16,7 @@ use bpmute::calibration::{
     BoundaryReason, CalibrationBoundaryRecord, FeedbackVerdict, SessionFeedbackRecord,
     SessionLedgerRecord,
 };
-use bpmute::config::{CliOverrides, ClockTime, LoadedConfig, PowerAction, Sensitivity};
+use bpmute::config::{CliOverrides, ClockTime, LoadedConfig, PatchField, PowerAction, Sensitivity};
 use bpmute::daemon::{
     DaemonHandle, DaemonOptions, VirtualClock, WearableDescriptor, WearableEvent,
 };
@@ -342,11 +342,10 @@ fn test_history_session_modals_and_mutating_guards() {
         submit_cmd,
         Some(TuiCommand::SessionSetFeedback {
             ref session_id,
-            verdict: Some(FeedbackVerdict::FalsePositive),
-            onset_hhmm: Some(ct),
-            avg_sleep_hr: Some(58.5),
-            clear: false,
-        }) if session_id == "sess-closed" && ct == expected_clock
+            verdict: PatchField::Set(FeedbackVerdict::FalsePositive),
+            onset_hhmm: PatchField::Set(ct),
+            avg_sleep_hr: PatchField::Set(hr),
+        }) if session_id == "sess-closed" && ct == expected_clock && (hr - 58.5).abs() < f64::EPSILON
     ));
     assert_eq!(app.modal, ModalState::None);
 
@@ -798,15 +797,15 @@ fn test_mouse_history_feedback_modal_and_backdrop() {
         app.handle_event(mouse_left_click(sub_col2 + 2, sub_row2)),
         Some(TuiCommand::SessionSetFeedback {
             session_id: "sess-fb-1".into(),
-            verdict: Some(FeedbackVerdict::FalsePositive),
-            onset_hhmm: Some(valid_hhmm.parse().unwrap()),
-            avg_sleep_hr: Some(57.5),
-            clear: false,
+            verdict: PatchField::Set(FeedbackVerdict::FalsePositive),
+            onset_hhmm: PatchField::Set(valid_hhmm.parse().unwrap()),
+            avg_sleep_hr: PatchField::Set(57.5),
         })
     );
     assert_eq!(app.modal, ModalState::None);
 
-    // 8. Pruned epochs session: clicking Wearable Onset does NOT focus Onset; clicking [ Cancel ] closes
+    // 8. Pruned epochs session: clicking Wearable Onset does NOT focus Onset;
+    //    submitting preserves pruned onset as Unchanged while clearing Verdict and Avg Sleep HR
     app.selected_session_idx = 1;
     app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
     terminal
@@ -820,10 +819,15 @@ fn test_mouse_history_feedback_modal_and_backdrop() {
     );
     assert!(!app.is_input_focused());
 
-    let (canc_col, canc_row) = find_text_coords(terminal.backend().buffer(), "[ Cancel ]").unwrap();
+    let (sub_col3, sub_row3) = find_text_coords(terminal.backend().buffer(), "[ Submit ]").unwrap();
     assert_eq!(
-        app.handle_event(mouse_left_click(canc_col + 2, canc_row)),
-        None
+        app.handle_event(mouse_left_click(sub_col3 + 2, sub_row3)),
+        Some(TuiCommand::SessionSetFeedback {
+            session_id: "sess-fb-pruned".into(),
+            verdict: PatchField::Clear,
+            onset_hhmm: PatchField::Unchanged,
+            avg_sleep_hr: PatchField::Clear,
+        })
     );
     assert_eq!(app.modal, ModalState::None);
 }
@@ -1199,6 +1203,304 @@ async fn test_real_socket_history_feedback_and_unenroll_delete_sessions_e2e() {
     assert!(h.app.selected_session_detail.is_none());
 
     h.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_real_socket_history_feedback_clears_verdict_while_preserving_onset_and_hr() {
+    use bpmute::storage::{
+        CloseSessionRequest, LedgerStore, OpenSessionRequest, SetFeedbackRequest,
+        db_path_in_data_dir, lock_path_in_data_dir,
+    };
+
+    let temp = TempDir::new().unwrap();
+    let (paths, env) = make_test_paths(&temp);
+    let start_dt = chrono::Local
+        .with_ymd_and_hms(2026, 11, 24, 23, 0, 0)
+        .single()
+        .unwrap();
+    let start_ts = start_dt.timestamp_millis();
+    let epoch_count = 40u32; // 10 minutes
+    let end_ts = start_ts + i64::from(epoch_count) * 15_000;
+    let pruned_start = start_ts - 7_200_000;
+    let pruned_end = pruned_start + 600_000;
+
+    let (sid, pruned_sid) = {
+        let db_file = db_path_in_data_dir(&paths.data_dir);
+        let db_lock = lock_path_in_data_dir(&paths.data_dir);
+        let mut store = LedgerStore::open_read_write(&db_file, &db_lock).unwrap();
+        let wid = store
+            .upsert_wearable(
+                &WearableDescriptor {
+                    mac: "AA:BB:CC:DD:EE:19".into(),
+                    address_type: "public".into(),
+                    alias: Some("Band".into()),
+                    advertised_name: None,
+                    supports_rr: true,
+                    supports_contact: true,
+                },
+                pruned_start - 10_000,
+            )
+            .unwrap();
+
+        // Older session with pruned epochs (epochs_count == 0) but existing manual onset
+        let pruned_sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid.clone(),
+                start_ts_ms: pruned_start,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        let pruned_summary = make_session_summary(1, pruned_start, pruned_end, false);
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: pruned_sid.clone(),
+                    summary: pruned_summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                pruned_end,
+            )
+            .unwrap();
+        store
+            .set_feedback_and_recompute(
+                &SetFeedbackRequest {
+                    session_id_or_prefix: pruned_sid.clone(),
+                    verdict: PatchField::Set(FeedbackVerdict::MissedSleep),
+                    onset_hhmm: PatchField::Set(ClockTime::new(21, 5).unwrap()),
+                    avg_sleep_hr: PatchField::Set(52.0),
+                    clear_all: false,
+                },
+                pruned_end + 1_000,
+            )
+            .unwrap();
+
+        // Newer session with retained epochs
+        let sid = store
+            .open_session(&OpenSessionRequest {
+                wearable_id: wid,
+                start_ts_ms: start_ts,
+                detection_sensitivity: Sensitivity::Balanced,
+            })
+            .unwrap();
+        for seq in 0..epoch_count {
+            let ts_ms = start_ts + i64::from(seq + 1) * 15_000;
+            let ep = make_test_epoch(1, ts_ms, 56.0, 0.4, 65.0);
+            store
+                .append_epoch_and_raw(&sid, Some((seq, &ep)), &[])
+                .unwrap();
+        }
+        let mut summary = make_session_summary(2, start_ts, end_ts, true);
+        summary.epochs_count = epoch_count as usize;
+        store
+            .close_session_and_recompute(
+                &CloseSessionRequest {
+                    session_id: sid.clone(),
+                    summary,
+                    trigger_power_action: PowerAction::None,
+                    rapid_resume_within_5m: false,
+                },
+                end_ts,
+            )
+            .unwrap();
+        (sid, pruned_sid)
+    };
+
+    let loaded = LoadedConfig::load(&paths.config_file, &env, &CliOverrides::default()).unwrap();
+    let clock = Arc::new(VirtualClock::starting_at(Utc::now()));
+    let daemon = DaemonHandle::spawn(DaemonOptions::for_testing(
+        paths.clone(),
+        loaded,
+        Arc::new(env),
+        clock,
+    ))
+    .await
+    .unwrap();
+
+    let (mut app, mut event_rx, cmd_tx, shutdown_tx, bridge_task) =
+        spawn_tui_bridge_session_with_cmds(&paths.socket_path);
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.daemon_connected && a.history_sessions.len() == 2 && a.selected_session_detail.is_some()
+    })
+    .await;
+
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('2'))));
+
+    // 1. Save MissedSleep + Onset (23:05) + Avg Sleep HR (54.5)
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Right)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    for c in "23:05".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    for c in "54.5".chars() {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Char(c))));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    let cmd_set = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("FeedbackModal should emit SessionSetFeedback");
+    cmd_tx.send(cmd_set).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions
+            .first()
+            .and_then(|s| s.feedback.as_ref())
+            .is_some_and(|f| {
+                f.verdict == Some(FeedbackVerdict::MissedSleep)
+                    && f.manual_onset_ts_ms.is_some()
+                    && f.manual_avg_sleep_hr == Some(54.5)
+            })
+    })
+    .await;
+
+    // 2. Reopen modal, switch Verdict to None while keeping Onset and Avg Sleep HR, submit
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    let cmd_clear_verdict = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("FeedbackModal should emit SessionSetFeedback when clearing verdict");
+    cmd_tx.send(cmd_clear_verdict).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions
+            .first()
+            .and_then(|s| s.feedback.as_ref())
+            .is_some_and(|f| {
+                f.verdict.is_none()
+                    && f.manual_onset_ts_ms.is_some()
+                    && f.manual_avg_sleep_hr == Some(54.5)
+            })
+    })
+    .await;
+
+    let mut client = IpcClient::connect(&paths.socket_path).await.unwrap();
+    let detail: SessionFullDetail = serde_json::from_value(
+        client
+            .request("session.get", json!({ "id": sid }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let fb = detail
+        .feedback
+        .as_ref()
+        .expect("feedback row must still exist with onset and avg_sleep_hr");
+    assert_eq!(fb.verdict, None, "verdict should be cleared to None");
+    assert!(
+        fb.manual_onset_ts_ms.is_some(),
+        "manual_onset_ts_ms must stay preserved"
+    );
+    assert_eq!(
+        fb.manual_avg_sleep_hr,
+        Some(54.5),
+        "manual_avg_sleep_hr must stay preserved"
+    );
+
+    // 3. Reopen modal, empty Avg Sleep HR while keeping Onset, submit -> clears only Avg Sleep HR
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    for _ in 0..4 {
+        app.handle_event(TuiEvent::Key(key(KeyCode::Backspace)));
+    }
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab)));
+    let cmd_clear_hr = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("FeedbackModal should emit SessionSetFeedback when clearing avg_sleep_hr");
+    cmd_tx.send(cmd_clear_hr).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions
+            .first()
+            .and_then(|s| s.feedback.as_ref())
+            .is_some_and(|f| {
+                f.verdict.is_none()
+                    && f.manual_onset_ts_ms.is_some()
+                    && f.manual_avg_sleep_hr.is_none()
+            })
+    })
+    .await;
+
+    let detail2: SessionFullDetail = serde_json::from_value(
+        client
+            .request("session.get", json!({ "id": sid }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let fb2 = detail2
+        .feedback
+        .as_ref()
+        .expect("feedback row must still exist with onset");
+    assert_eq!(fb2.verdict, None);
+    assert!(
+        fb2.manual_onset_ts_ms.is_some(),
+        "manual_onset_ts_ms must stay preserved"
+    );
+    assert_eq!(
+        fb2.manual_avg_sleep_hr, None,
+        "manual_avg_sleep_hr should be cleared"
+    );
+
+    // 4. Select older pruned session, clear Verdict to None -> preserves pruned manual_onset_ts_ms over real socket
+    let sel_cmd = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Char('j'))))
+        .expect("selecting row 1 should request SessionGet");
+    cmd_tx.send(sel_cmd).await.unwrap();
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.selected_session_idx == 1
+            && a.selected_session_detail
+                .as_ref()
+                .is_some_and(|d| d.session.id == pruned_sid)
+    })
+    .await;
+
+    app.handle_event(TuiEvent::Key(key(KeyCode::Char('f'))));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Left)));
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab))); // Verdict -> SleepHr (skips pruned Onset)
+    app.handle_event(TuiEvent::Key(key(KeyCode::Tab))); // SleepHr -> Submit
+    let cmd_pruned_clear = app
+        .handle_event(TuiEvent::Key(key(KeyCode::Enter)))
+        .expect("FeedbackModal should emit SessionSetFeedback on pruned session");
+    cmd_tx.send(cmd_pruned_clear).await.unwrap();
+
+    wait_for_app_state_with_cmds(&mut app, &mut event_rx, Some(&cmd_tx), |a| {
+        a.history_sessions
+            .get(1)
+            .and_then(|s| s.feedback.as_ref())
+            .is_some_and(|f| f.verdict.is_none())
+    })
+    .await;
+
+    let pruned_detail: SessionFullDetail = serde_json::from_value(
+        client
+            .request("session.get", json!({ "id": pruned_sid }))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let pruned_fb = pruned_detail
+        .feedback
+        .as_ref()
+        .expect("pruned session feedback must preserve manual_onset_ts_ms and avg_sleep_hr");
+    assert_eq!(pruned_fb.verdict, None);
+    assert!(
+        pruned_fb.manual_onset_ts_ms.is_some(),
+        "pruned manual_onset_ts_ms must stay unchanged over real socket"
+    );
+    assert_eq!(pruned_fb.manual_avg_sleep_hr, Some(52.0));
+
+    let _ = shutdown_tx.send(true);
+    let _ = bridge_task.await;
+    daemon.shutdown().await;
 }
 
 #[test]
@@ -2211,10 +2513,9 @@ fn test_feedback_modal_canonicalizes_short_hour_rejects_short_minute_and_accepts
         cmd,
         Some(TuiCommand::SessionSetFeedback {
             session_id: "s-morning".to_string(),
-            verdict: None,
-            onset_hhmm: Some(ClockTime::new(9, 30).unwrap()),
-            avg_sleep_hr: Some(135.0),
-            clear: false,
+            verdict: PatchField::Clear,
+            onset_hhmm: PatchField::Set(ClockTime::new(9, 30).unwrap()),
+            avg_sleep_hr: PatchField::Set(135.0),
         })
     );
 }

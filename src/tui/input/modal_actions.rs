@@ -8,7 +8,7 @@ use super::super::event::TuiCommand;
 use super::super::hit_map::UnenrollCheckbox;
 use super::step_index;
 use crate::calibration::{FeedbackVerdict, parse_optional_sleep_hr_input, resolve_onset_hhmm_ms};
-use crate::config::{ClockTime, ConfigPatch, SchedulePatch};
+use crate::config::{ClockTime, ConfigPatch, PatchField, SchedulePatch};
 use crate::ipc::protocol::{EnrollAuthResponseParams, PauseMode, PauseParams};
 use crate::replay::TraceFormat;
 
@@ -772,13 +772,15 @@ impl ModalState {
         };
 
         let verdict = match verdict_idx {
-            1 => Some(FeedbackVerdict::FalsePositive),
-            2 => Some(FeedbackVerdict::MissedSleep),
-            3 => Some(FeedbackVerdict::AnomalousExclude),
-            _ => None,
+            1 => PatchField::Set(FeedbackVerdict::FalsePositive),
+            2 => PatchField::Set(FeedbackVerdict::MissedSleep),
+            3 => PatchField::Set(FeedbackVerdict::AnomalousExclude),
+            _ => PatchField::Clear,
         };
 
-        let onset_hhmm = if !epochs_pruned && !onset_hhmm_input.trim().is_empty() {
+        let onset_hhmm = if *epochs_pruned {
+            PatchField::Unchanged
+        } else if !onset_hhmm_input.trim().is_empty() {
             let clock_time = match parse_onset_clock_time(onset_hhmm_input) {
                 Ok(ct) => ct,
                 Err(err) => return Some(Err(err)),
@@ -793,25 +795,23 @@ impl ModalState {
                     "Sleep-onset time must fall within session window ({start_hhmm}–{end_hhmm})"
                 )));
             }
-            Some(clock_time)
+            PatchField::Set(clock_time)
         } else {
-            None
+            PatchField::Clear
         };
 
         let avg_sleep_hr =
             match parse_optional_sleep_hr_input(avg_sleep_hr_input, "Average sleeping HR") {
-                Ok(hr) => hr,
+                Ok(Some(hr)) => PatchField::Set(hr),
+                Ok(None) => PatchField::Clear,
                 Err(err) => return Some(Err(err)),
             };
-
-        let clear = verdict.is_none() && onset_hhmm.is_none() && avg_sleep_hr.is_none();
 
         Some(Ok(TuiCommand::SessionSetFeedback {
             session_id: session_id.clone(),
             verdict,
             onset_hhmm,
             avg_sleep_hr,
-            clear,
         }))
     }
 }
